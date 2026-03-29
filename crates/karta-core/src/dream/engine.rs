@@ -1,0 +1,651 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use chrono::Utc;
+use tracing::{debug, info};
+use uuid::Uuid;
+
+use crate::config::DreamConfig;
+use crate::error::Result;
+use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
+use crate::note::{MemoryNote, Provenance};
+use crate::store::{GraphStore, VectorStore};
+
+use super::types::{DreamRecord, DreamRun, DreamType};
+
+pub struct DreamEngine {
+    vector_store: Arc<dyn VectorStore>,
+    graph_store: Arc<dyn GraphStore>,
+    llm: Arc<dyn LlmProvider>,
+    config: DreamConfig,
+}
+
+impl DreamEngine {
+    pub fn new(
+        vector_store: Arc<dyn VectorStore>,
+        graph_store: Arc<dyn GraphStore>,
+        llm: Arc<dyn LlmProvider>,
+        config: DreamConfig,
+    ) -> Self {
+        Self {
+            vector_store,
+            graph_store,
+            llm,
+            config,
+        }
+    }
+
+    pub async fn run(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+    ) -> Result<DreamRun> {
+        let run_id = Uuid::new_v4().to_string();
+        let started_at = Utc::now();
+        let mut total_tokens: u64 = 0;
+        let mut dreams: Vec<DreamRecord> = Vec::new();
+
+        // Expire stale foresight signals
+        let expired = self.graph_store.expire_foresights(Utc::now()).await?;
+        if expired > 0 {
+            debug!(expired = expired, "Expired foresight signals");
+        }
+
+        // Get dream cursor for incremental processing
+        let cursor = self.graph_store.get_dream_cursor().await?;
+
+        // Get all non-dream notes, filtered by cursor for incremental runs
+        let all_notes: Vec<MemoryNote> = self
+            .vector_store
+            .get_all()
+            .await?
+            .into_iter()
+            .filter(|n| !n.is_dream())
+            .collect();
+
+        let notes_to_process: Vec<&MemoryNote> = match cursor {
+            Some(cursor_time) => {
+                // Include notes created/updated after cursor AND their linked neighbors
+                let mut relevant_ids: HashSet<String> = HashSet::new();
+
+                for note in &all_notes {
+                    if note.created_at > cursor_time || note.updated_at > cursor_time {
+                        relevant_ids.insert(note.id.clone());
+                        let links = self.graph_store.get_links(&note.id).await?;
+                        relevant_ids.extend(links);
+                    }
+                }
+
+                all_notes
+                    .iter()
+                    .filter(|n| relevant_ids.contains(&n.id))
+                    .collect()
+            }
+            None => all_notes.iter().collect(),
+        };
+
+        let note_count = notes_to_process.len();
+        info!(notes = note_count, "Starting dream pass");
+
+        if notes_to_process.is_empty() {
+            info!("No notes to dream about");
+            return Ok(DreamRun {
+                id: run_id,
+                scope_type: scope_type.to_string(),
+                scope_id: scope_id.to_string(),
+                started_at,
+                completed_at: Some(Utc::now()),
+                notes_inspected: 0,
+                dreams_attempted: 0,
+                dreams_written: 0,
+                dreams: Vec::new(),
+                total_tokens_used: 0,
+            });
+        }
+
+        // Build clusters from link graph
+        let clusters = self.build_clusters(&notes_to_process).await?;
+        debug!(clusters = clusters.len(), "Built clusters");
+
+        let enabled: Vec<DreamType> = self
+            .config
+            .enabled_types
+            .iter()
+            .filter_map(|s| DreamType::from_str(s))
+            .collect();
+
+        // Per-cluster dreams (with dedup)
+        for cluster in &clusters {
+            if enabled.contains(&DreamType::Consolidation) && cluster.len() >= 3 {
+                let (dream, tokens) = self.dream_consolidation(cluster).await?;
+                total_tokens += tokens;
+                if dream.would_write && !self.is_duplicate_dream(&dream).await? {
+                    self.persist_dream(&dream).await?;
+                }
+                dreams.push(dream);
+            }
+
+            if enabled.contains(&DreamType::Deduction) && cluster.len() >= 2 {
+                let (dream, tokens) = self.dream_deduction(cluster).await?;
+                total_tokens += tokens;
+                if dream.would_write && !self.is_duplicate_dream(&dream).await? {
+                    self.persist_dream(&dream).await?;
+                }
+                dreams.push(dream);
+            }
+
+            if enabled.contains(&DreamType::Contradiction) && cluster.len() >= 2 {
+                let (dream, tokens) = self.dream_contradiction(cluster).await?;
+                total_tokens += tokens;
+                if dream.would_write && !self.is_duplicate_dream(&dream).await? {
+                    self.persist_dream(&dream).await?;
+                }
+                dreams.push(dream);
+            }
+        }
+
+        // Cross-cluster dreams — run across sliding windows, not just first N
+        let max = self.config.max_notes_per_prompt;
+
+        if enabled.contains(&DreamType::Induction) && notes_to_process.len() >= 4 {
+            // Run induction across multiple windows of notes
+            for chunk in notes_to_process.chunks(max) {
+                if chunk.len() < 4 {
+                    continue;
+                }
+                let (dream, tokens) = self.dream_induction(chunk).await?;
+                total_tokens += tokens;
+                if dream.would_write && !self.is_duplicate_dream(&dream).await? {
+                    self.persist_dream(&dream).await?;
+                }
+                dreams.push(dream);
+            }
+        }
+
+        if enabled.contains(&DreamType::Abduction) && notes_to_process.len() >= 3 {
+            for chunk in notes_to_process.chunks(max) {
+                if chunk.len() < 3 {
+                    continue;
+                }
+                let (dream, tokens) = self.dream_abduction(chunk).await?;
+                total_tokens += tokens;
+                if dream.would_write && !self.is_duplicate_dream(&dream).await? {
+                    self.persist_dream(&dream).await?;
+                }
+                dreams.push(dream);
+            }
+        }
+
+        // Update dream cursor
+        self.graph_store.set_dream_cursor(Utc::now()).await?;
+
+        let dreams_written = dreams.iter().filter(|d| d.would_write).count();
+
+        let run = DreamRun {
+            id: run_id,
+            scope_type: scope_type.to_string(),
+            scope_id: scope_id.to_string(),
+            started_at,
+            completed_at: Some(Utc::now()),
+            notes_inspected: note_count,
+            dreams_attempted: dreams.len(),
+            dreams_written,
+            dreams,
+            total_tokens_used: total_tokens,
+        };
+
+        // Record the run in graph store
+        self.graph_store.record_dream_run(&run).await?;
+
+        info!(
+            attempted = run.dreams_attempted,
+            written = run.dreams_written,
+            tokens = total_tokens,
+            "Dream pass complete"
+        );
+
+        Ok(run)
+    }
+
+    // --- Cluster building ---
+
+    async fn build_clusters<'a>(
+        &self,
+        notes: &[&'a MemoryNote],
+    ) -> Result<Vec<Vec<&'a MemoryNote>>> {
+        // Union-find over the link graph
+        let mut parent: HashMap<String, String> = HashMap::new();
+
+        for note in notes {
+            parent.insert(note.id.clone(), note.id.clone());
+        }
+
+        fn find(parent: &mut HashMap<String, String>, id: &str) -> String {
+            let p = parent.get(id).cloned().unwrap_or_else(|| id.to_string());
+            if p == id {
+                return id.to_string();
+            }
+            let root = find(parent, &p);
+            parent.insert(id.to_string(), root.clone());
+            root
+        }
+
+        fn union(parent: &mut HashMap<String, String>, a: &str, b: &str) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent.insert(ra, rb.to_string());
+            }
+        }
+
+        for note in notes {
+            let links = self.graph_store.get_links(&note.id).await?;
+            for link_id in &links {
+                if parent.contains_key(link_id) {
+                    union(&mut parent, &note.id, link_id);
+                }
+            }
+        }
+
+        // Group by root
+        let mut clusters: HashMap<String, Vec<&'a MemoryNote>> = HashMap::new();
+        for note in notes {
+            let root = find(&mut parent, &note.id);
+            clusters.entry(root).or_default().push(note);
+        }
+
+        // Only return clusters with 2+ notes
+        Ok(clusters
+            .into_values()
+            .filter(|c| c.len() >= 2)
+            .collect())
+    }
+
+    // --- Dream types ---
+
+    fn format_notes(notes: &[&MemoryNote]) -> String {
+        notes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                format!(
+                    "[{}] ID: {}\nContent: {}\nContext: {}",
+                    i + 1,
+                    &n.id[..8.min(n.id.len())],
+                    n.content,
+                    n.context
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    async fn run_dream_prompt(
+        &self,
+        prompt: &str,
+    ) -> Result<(serde_json::Value, u64)> {
+        let messages = vec![ChatMessage {
+            role: Role::User,
+            content: prompt.to_string(),
+        }];
+
+        let config = GenConfig {
+            max_tokens: 2000,
+            ..Default::default()
+        };
+
+        let response = self.llm.chat(&messages, &config).await?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response.content).unwrap_or_default();
+
+        Ok((parsed, response.tokens_used))
+    }
+
+    async fn dream_deduction(&self, notes: &[&MemoryNote]) -> Result<(DreamRecord, u64)> {
+        let capped: Vec<&MemoryNote> = notes
+            .iter()
+            .take(self.config.max_notes_per_prompt)
+            .copied()
+            .collect();
+        let notes_text = Self::format_notes(&capped);
+        let prompt = Prompts::dream_deduction(&notes_text);
+
+        let (parsed, tokens) = self.run_dream_prompt(&prompt).await?;
+
+        let reasoning = parsed["reasoning"].as_str().unwrap_or("").to_string();
+        let conclusion = parsed["conclusion"].as_str().map(String::from);
+        let confidence = parsed["confidence"].as_f64().unwrap_or(0.0) as f32;
+        let would_write = conclusion.is_some() && confidence >= self.config.write_threshold;
+
+        Ok((
+            DreamRecord {
+                id: Uuid::new_v4().to_string(),
+                dream_type: DreamType::Deduction,
+                source_note_ids: capped.iter().map(|n| n.id.clone()).collect(),
+                reasoning,
+                dream_content: conclusion.unwrap_or_else(|| "(no deduction possible)".into()),
+                confidence,
+                would_write,
+                written_note_id: None,
+                created_at: Utc::now(),
+            },
+            tokens,
+        ))
+    }
+
+    async fn dream_induction(&self, notes: &[&MemoryNote]) -> Result<(DreamRecord, u64)> {
+        let notes_text = Self::format_notes(notes);
+        let prompt = Prompts::dream_induction(&notes_text);
+
+        let (parsed, tokens) = self.run_dream_prompt(&prompt).await?;
+
+        let reasoning = parsed["reasoning"].as_str().unwrap_or("").to_string();
+        let generalisation = parsed["generalisation"].as_str().map(String::from);
+        let confidence = parsed["confidence"].as_f64().unwrap_or(0.0) as f32;
+        let would_write = generalisation.is_some() && confidence >= self.config.write_threshold;
+
+        Ok((
+            DreamRecord {
+                id: Uuid::new_v4().to_string(),
+                dream_type: DreamType::Induction,
+                source_note_ids: notes.iter().map(|n| n.id.clone()).collect(),
+                reasoning,
+                dream_content: generalisation.unwrap_or_else(|| "(no pattern found)".into()),
+                confidence,
+                would_write,
+                written_note_id: None,
+                created_at: Utc::now(),
+            },
+            tokens,
+        ))
+    }
+
+    async fn dream_abduction(&self, notes: &[&MemoryNote]) -> Result<(DreamRecord, u64)> {
+        let notes_text = Self::format_notes(notes);
+        let prompt = Prompts::dream_abduction(&notes_text);
+
+        let (parsed, tokens) = self.run_dream_prompt(&prompt).await?;
+
+        let reasoning = parsed["reasoning"].as_str().unwrap_or("").to_string();
+        let hypothesis = parsed["hypothesis"].as_str().map(String::from);
+        let confidence = parsed["confidence"].as_f64().unwrap_or(0.0) as f32;
+        let would_write = hypothesis.is_some() && confidence >= self.config.write_threshold;
+
+        let dream_id = Uuid::new_v4().to_string();
+
+        // Emit foresight signal from hypothesis if it's forward-looking
+        if let Some(ref h) = hypothesis {
+            if would_write {
+                let fs = crate::note::ForesightSignal::new(
+                    h.clone(),
+                    dream_id.clone(),
+                    None,
+                );
+                let _ = self.graph_store.upsert_foresight(&fs).await;
+            }
+        }
+
+        Ok((
+            DreamRecord {
+                id: dream_id,
+                dream_type: DreamType::Abduction,
+                source_note_ids: notes.iter().map(|n| n.id.clone()).collect(),
+                reasoning,
+                dream_content: hypothesis
+                    .map(|h| format!("[HYPOTHESIS] {}", h))
+                    .unwrap_or_else(|| "(no gap identified)".into()),
+                confidence,
+                would_write,
+                written_note_id: None,
+                created_at: Utc::now(),
+            },
+            tokens,
+        ))
+    }
+
+    async fn dream_consolidation(&self, notes: &[&MemoryNote]) -> Result<(DreamRecord, u64)> {
+        let capped: Vec<&MemoryNote> = notes
+            .iter()
+            .take(self.config.max_notes_per_prompt)
+            .copied()
+            .collect();
+        let notes_text = Self::format_notes(&capped);
+        let prompt = Prompts::dream_consolidation(&notes_text);
+
+        let (parsed, tokens) = self.run_dream_prompt(&prompt).await?;
+
+        let reasoning = parsed["reasoning"].as_str().unwrap_or("").to_string();
+        let peer_card = parsed["peerCard"].as_str().map(String::from);
+        let entity_id = parsed["entityId"].as_str().map(String::from);
+        let confidence = parsed["confidence"].as_f64().unwrap_or(0.0) as f32;
+        let would_write = peer_card.is_some() && confidence >= self.config.write_threshold;
+
+        let dream_id = Uuid::new_v4().to_string();
+
+        // Create or update entity profile if we have an entity ID and a valid peer card
+        if would_write {
+            if let (Some(entity), Some(card)) = (&entity_id, &peer_card) {
+                if let Err(e) = self.upsert_profile(entity, card, &dream_id, &capped).await {
+                    debug!(error = %e, "Failed to upsert profile (non-fatal)");
+                }
+            }
+        }
+
+        Ok((
+            DreamRecord {
+                id: dream_id,
+                dream_type: DreamType::Consolidation,
+                source_note_ids: capped.iter().map(|n| n.id.clone()).collect(),
+                reasoning,
+                dream_content: peer_card.unwrap_or_else(|| "(consolidation failed)".into()),
+                confidence,
+                would_write,
+                written_note_id: None,
+                created_at: Utc::now(),
+            },
+            tokens,
+        ))
+    }
+
+    /// Create or incrementally update an entity profile from a consolidation dream.
+    async fn upsert_profile(
+        &self,
+        entity_id: &str,
+        peer_card: &str,
+        dream_id: &str,
+        source_notes: &[&MemoryNote],
+    ) -> Result<()> {
+        let existing_profile_note_id = self.graph_store.get_profile_note_id(entity_id).await?;
+
+        let profile_content = if let Some(ref existing_id) = existing_profile_note_id {
+            // Merge with existing profile
+            if let Some(existing_note) = self.vector_store.get(existing_id).await? {
+                let merge_prompt = Prompts::profile_merge(&existing_note.content, peer_card);
+                let messages = vec![ChatMessage {
+                    role: Role::User,
+                    content: merge_prompt,
+                }];
+                let config = GenConfig::default();
+                let response = self.llm.chat(&messages, &config).await?;
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&response.content).unwrap_or_default();
+                parsed["updatedProfile"]
+                    .as_str()
+                    .unwrap_or(peer_card)
+                    .to_string()
+            } else {
+                peer_card.to_string()
+            }
+        } else {
+            peer_card.to_string()
+        };
+
+        // Create or update the profile note
+        let profile_note_id = existing_profile_note_id.unwrap_or_else(|| dream_id.to_string());
+        let embedding = self.llm.embed(&[&profile_content]).await?;
+
+        let note = MemoryNote {
+            id: profile_note_id.clone(),
+            content: profile_content,
+            context: format!("Entity profile for {}", entity_id),
+            keywords: vec![entity_id.to_string(), "profile".to_string()],
+            tags: vec!["profile".to_string()],
+            links: Vec::new(),
+            embedding: embedding.into_iter().next().unwrap_or_default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            evolution_history: Vec::new(),
+            provenance: Provenance::Profile {
+                entity_id: entity_id.to_string(),
+            },
+            confidence: 1.0,
+            status: crate::note::NoteStatus::Active,
+            last_accessed_at: Utc::now(),
+        };
+
+        self.vector_store.upsert(&note).await?;
+        self.graph_store
+            .upsert_profile(entity_id, &profile_note_id)
+            .await?;
+
+        // Link profile to source notes
+        for source in source_notes {
+            self.graph_store
+                .add_link(&profile_note_id, &source.id, "profile source")
+                .await?;
+        }
+
+        debug!(entity = entity_id, note_id = %profile_note_id, "Upserted entity profile");
+        Ok(())
+    }
+
+    async fn dream_contradiction(&self, notes: &[&MemoryNote]) -> Result<(DreamRecord, u64)> {
+        let capped: Vec<&MemoryNote> = notes
+            .iter()
+            .take(self.config.max_notes_per_prompt)
+            .copied()
+            .collect();
+        let notes_text = Self::format_notes(&capped);
+        let prompt = Prompts::dream_contradiction(&notes_text);
+
+        let (parsed, tokens) = self.run_dream_prompt(&prompt).await?;
+
+        let reasoning = parsed["reasoning"].as_str().unwrap_or("").to_string();
+        let contradiction = parsed["contradiction"].as_str().map(String::from);
+        let severity = parsed["severity"].as_str().unwrap_or("none").to_string();
+        let confidence = parsed["confidence"].as_f64().unwrap_or(0.0) as f32;
+        let is_real = contradiction.is_some() && severity != "none";
+        let would_write = is_real && confidence >= self.config.write_threshold;
+
+        Ok((
+            DreamRecord {
+                id: Uuid::new_v4().to_string(),
+                dream_type: DreamType::Contradiction,
+                source_note_ids: capped.iter().map(|n| n.id.clone()).collect(),
+                reasoning,
+                dream_content: contradiction
+                    .map(|c| format!("[{}] {}", severity.to_uppercase(), c))
+                    .unwrap_or_else(|| "(no contradiction)".into()),
+                confidence: if is_real { confidence } else { 0.0 },
+                would_write,
+                written_note_id: None,
+                created_at: Utc::now(),
+            },
+            tokens,
+        ))
+    }
+
+    // --- Deduplication ---
+
+    /// Check if a substantially similar dream already exists in the graph.
+    /// Uses embedding similarity against existing dream notes of the same type.
+    async fn is_duplicate_dream(&self, dream: &DreamRecord) -> Result<bool> {
+        let embeddings = self.llm.embed(&[&dream.dream_content]).await?;
+        let embedding = match embeddings.into_iter().next() {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+
+        let candidates = self
+            .vector_store
+            .find_similar(&embedding, 5, &[])
+            .await?;
+
+        for (note, score) in &candidates {
+            // High similarity + same dream type = duplicate
+            if *score > 0.85 && note.is_dream() {
+                if let Provenance::Dream { dream_type, .. } = &note.provenance {
+                    if dream_type == dream.dream_type.as_str() {
+                        debug!(
+                            dream_type = dream.dream_type.as_str(),
+                            existing_id = %note.id,
+                            similarity = score,
+                            "Skipping duplicate dream"
+                        );
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    // --- Persist dream as a note ---
+
+    async fn persist_dream(&self, dream: &DreamRecord) -> Result<()> {
+        let embedding_text = &dream.dream_content;
+        let embeddings = self.llm.embed(&[embedding_text]).await?;
+        let embedding = embeddings.into_iter().next().unwrap_or_default();
+
+        let note = MemoryNote {
+            id: dream.id.clone(),
+            content: dream.dream_content.clone(),
+            context: format!(
+                "[{} dream, confidence {:.2}] {}",
+                dream.dream_type.as_str(),
+                dream.confidence,
+                &dream.reasoning[..dream.reasoning.len().min(200)]
+            ),
+            keywords: vec![
+                dream.dream_type.as_str().to_string(),
+                "dream".to_string(),
+                "inference".to_string(),
+            ],
+            tags: vec![
+                "dream".to_string(),
+                dream.dream_type.as_str().to_string(),
+            ],
+            links: Vec::new(), // Links added below
+            embedding,
+            created_at: dream.created_at,
+            updated_at: dream.created_at,
+            evolution_history: Vec::new(),
+            provenance: Provenance::Dream {
+                dream_type: dream.dream_type.as_str().to_string(),
+                source_note_ids: dream.source_note_ids.clone(),
+                confidence: dream.confidence,
+            },
+            confidence: dream.confidence,
+            status: crate::note::NoteStatus::Active,
+            last_accessed_at: dream.created_at,
+        };
+
+        self.vector_store.upsert(&note).await?;
+
+        // Link dream to source notes
+        for source_id in &dream.source_note_ids {
+            self.graph_store
+                .add_link(&dream.id, source_id, &format!("{} dream", dream.dream_type.as_str()))
+                .await?;
+        }
+
+        debug!(
+            dream_type = dream.dream_type.as_str(),
+            dream_id = %dream.id,
+            "Persisted dream as note"
+        );
+
+        Ok(())
+    }
+}

@@ -1,0 +1,46 @@
+# Rust
+/target
+Cargo.lock
+
+# Project data
+.karta/
+.amem-data/
+
+# Environment & secrets
+.env
+.env.local
+!.env.example
+
+# Node (legacy PoC)
+node_modules/
+
+# Claude Code / Agent tooling
+.claude/
+CLAUDE.md
+SKILL.md
+skill-lock.json
+skills-lock.json
+SKILL.md
+.agents/
+
+# Test results
+.results/
+*.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Benchmark datasets (downloaded, not committed)
+data/*.parquet
+data/*.json
+data/*_raw.json
+
+# Legacy PoC artifacts
+*.html

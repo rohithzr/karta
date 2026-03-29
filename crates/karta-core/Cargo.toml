@@ -1,0 +1,55 @@
+[package]
+name = "karta-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agentic memory system that thinks, not just stores"
+
+[features]
+default = ["lance", "sqlite", "openai"]
+lance = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
+sqlite = ["dep:rusqlite"]
+openai = ["dep:async-openai"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# IDs and time
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# HTTP client (for reranker APIs)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Logging
+tracing = "0.1"
+
+# Env
+dotenvy = "0.15"
+
+# Vector store: LanceDB
+lancedb = { version = "0.27", optional = true }
+arrow-array = { version = "57", optional = true }
+arrow-schema = { version = "57", optional = true }
+
+# Graph store: SQLite
+rusqlite = { version = "0.35", features = ["bundled"], optional = true }
+
+# LLM: OpenAI-compatible
+async-openai = { version = "0.27", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+uuid = { version = "1", features = ["v4"] }

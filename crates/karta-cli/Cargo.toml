@@ -1,0 +1,12 @@
+[package]
+name = "karta-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for Karta memory system"
+
+[dependencies]
+karta-core = { path = "../karta-core" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
