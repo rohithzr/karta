@@ -64,6 +64,38 @@ impl ReadEngine {
         (1.0 - w) * similarity + w * recency
     }
 
+    /// Detect if a query is asking about temporal ordering or event sequences.
+    fn is_temporal_query(query: &str) -> bool {
+        let q = query.to_lowercase();
+        q.contains("order") || q.contains("sequence") || q.contains("timeline")
+            || q.contains("chronolog") || q.contains("first") || q.contains("before")
+            || q.contains("after") || q.contains("when did") || q.contains("how did")
+            || q.contains("progression") || q.contains("evolve") || q.contains("changed over")
+            || q.contains("steps") || q.contains("history of")
+    }
+
+    /// Drill into an episode: fetch constituent notes, filter active, sort chronologically.
+    async fn episode_drilldown(&self, episode_id: &str) -> Result<Vec<MemoryNote>> {
+        let note_ids = self.graph_store.get_notes_for_episode(episode_id).await?;
+        if note_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let id_refs: Vec<&str> = note_ids.iter().map(|s| s.as_str()).collect();
+        let mut notes: Vec<MemoryNote> = self
+            .vector_store
+            .get_many(&id_refs)
+            .await?
+            .into_iter()
+            .filter(|n| n.is_active())
+            .collect();
+
+        // Chronological order — the key fix for event ordering
+        notes.sort_by_key(|n| n.created_at);
+        notes.truncate(self.config.max_notes_per_episode);
+        Ok(notes)
+    }
+
     /// BFS traversal through the link graph up to max_depth hops.
     /// Each hop applies a decay factor to the weight.
     /// Returns deduplicated notes sorted by traversal weight.
@@ -116,15 +148,21 @@ impl ReadEngine {
         Ok(weighted_notes.into_iter().map(|(n, _)| n).collect())
     }
 
-    /// Embed query, find top-K, apply temporal scoring, follow links one hop.
+    /// Embed query, find top-K with two-level episode retrieval, apply temporal scoring, follow links.
     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         info!("Searching: \"{}\"", query);
 
         let embeddings = self.llm.embed(&[query]).await?;
         let query_embedding = embeddings.into_iter().next().unwrap_or_default();
 
-        // Fetch more than top_k to allow re-ranking by recency
-        let fetch_k = (top_k * 2).max(10);
+        let is_temporal = Self::is_temporal_query(query);
+
+        // Fetch more than top_k to allow re-ranking and episode discovery
+        let fetch_k = if is_temporal {
+            (top_k * 4).max(20)
+        } else {
+            (top_k * 2).max(10)
+        };
         let direct = self
             .vector_store
             .find_similar(&query_embedding, fetch_k, &[])
@@ -139,45 +177,137 @@ impl ReadEngine {
             .map(|f| f.source_note_id)
             .collect();
 
-        // Re-rank with temporal blending + foresight boost, filter non-Active
-        let foresight_boost = self.config.foresight_boost;
-        let mut scored: Vec<(MemoryNote, f32)> = direct
-            .into_iter()
-            .filter(|(note, _)| note.is_active())
-            .map(|(note, sim)| {
-                let mut final_score = self.blended_score(sim, &note);
-                if active_foresight_note_ids.contains(&note.id) {
-                    final_score += foresight_boost;
+        // --- Entity profile auto-include ---
+        // Match query against known entity profiles and inject them into results
+        let mut profile_note_ids: HashSet<String> = HashSet::new();
+        let mut profile_results: Vec<SearchResult> = Vec::new();
+        let query_lower = query.to_lowercase();
+
+        let profiles = self.graph_store.get_all_profiles().await?;
+        for (entity_id, note_id) in &profiles {
+            let tokens: Vec<&str> = entity_id
+                .split(|c: char| c.is_whitespace() || c == '-' || c == '_')
+                .filter(|t| t.len() >= 3)
+                .collect();
+            let matched = tokens.iter().any(|t| query_lower.contains(&t.to_lowercase()));
+            if matched {
+                if let Some(note) = self.vector_store.get(note_id).await? {
+                    if note.is_active() {
+                        let link_count = self.graph_store.get_link_count(note_id).await?;
+                        let graph_bonus = self.config.graph_weight * (1.0 + link_count as f32).ln();
+                        let score = 1.0 + graph_bonus;
+                        profile_note_ids.insert(note_id.clone());
+                        debug!(entity_id = %entity_id, score = score, "Profile auto-include");
+                        profile_results.push(SearchResult {
+                            note,
+                            score,
+                            linked_notes: Vec::new(),
+                        });
+                    }
                 }
-                (note, final_score)
-            })
-            .collect();
+            }
+        }
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
+        // --- Two-level episode retrieval ---
+        // Partition ANN hits into episode narratives vs regular notes
+        let mut episode_hits: Vec<(String, f32)> = Vec::new(); // (episode_id, score)
+        let mut flat_hits: Vec<(MemoryNote, f32)> = Vec::new();
 
-        let mut results = Vec::with_capacity(scored.len());
+        let foresight_boost = self.config.foresight_boost;
+
+        for (note, sim) in direct {
+            if !note.is_active() || profile_note_ids.contains(&note.id) {
+                continue;
+            }
+            let mut final_score = self.blended_score(sim, &note);
+
+            // Graph-aware scoring: notes with more links score higher (PageRank-lite)
+            let link_count = self.graph_store.get_link_count(&note.id).await?;
+            let graph_bonus = self.config.graph_weight * (1.0 + link_count as f32).ln();
+            final_score += graph_bonus;
+
+            if active_foresight_note_ids.contains(&note.id) {
+                final_score += foresight_boost;
+            }
+
+            if self.config.episode_retrieval_enabled {
+                if let Provenance::Episode { ref episode_id } = note.provenance {
+                    if final_score >= self.config.episode_drilldown_min_score {
+                        episode_hits.push((episode_id.clone(), final_score));
+                        continue; // Only skip flat if we're drilling down
+                    }
+                    // Below threshold: fall through to flat_hits — narrative may still be useful
+                }
+            }
+
+            flat_hits.push((note, final_score));
+        }
+
+        // Sort episodes by score descending
+        episode_hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let max_drilldowns = if is_temporal {
+            self.config.max_episode_drilldowns * 2
+        } else {
+            self.config.max_episode_drilldowns
+        };
+        episode_hits.truncate(max_drilldowns);
+
+        // Drill into episodes — collect chronologically ordered notes
+        let mut episode_note_ids = HashSet::new();
+        let mut episode_results: Vec<SearchResult> = Vec::new();
+
+        for (episode_id, ep_score) in &episode_hits {
+            let drilled = self.episode_drilldown(episode_id).await?;
+            debug!(
+                episode_id = %episode_id,
+                score = ep_score,
+                notes = drilled.len(),
+                "Episode drilldown"
+            );
+            for note in drilled {
+                if episode_note_ids.insert(note.id.clone()) {
+                    episode_results.push(SearchResult {
+                        note,
+                        score: *ep_score,
+                        linked_notes: Vec::new(), // Skip multi-hop for episode-drilled notes
+                    });
+                }
+            }
+        }
+
+        // Sort flat hits and truncate
+        flat_hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Budget: never starve flat ANN results — always keep at least top_k
+        let flat_budget = top_k;
+        flat_hits.truncate(flat_budget);
+
+        // Build flat results with multi-hop traversal
         let max_depth = self.config.max_hop_depth;
         let decay = self.config.hop_decay_factor;
+        let mut flat_results: Vec<SearchResult> = Vec::new();
 
-        for (note, score) in scored {
+        for (note, score) in flat_hits {
+            if episode_note_ids.contains(&note.id) {
+                continue; // Already included via episode drilldown
+            }
             let linked_notes = self
                 .multi_hop_traverse(&note.id, max_depth, decay)
                 .await?;
 
-            debug!(
-                note_id = %note.id,
-                score = score,
-                linked = linked_notes.len(),
-                "Search hit"
-            );
-
-            results.push(SearchResult {
+            flat_results.push(SearchResult {
                 note,
                 score,
                 linked_notes,
             });
         }
+
+        // Merge: profiles first, then episode-drilled (chronological), then flat hits (by score)
+        let mut results = profile_results;
+        results.extend(episode_results);
+        results.extend(flat_results);
+        results.truncate(top_k);
 
         // Update last_accessed_at for all returned notes (access tracking for forgetting)
         for result in &results {
@@ -188,6 +318,7 @@ impl ReadEngine {
 
         info!(
             results = results.len(),
+            episode_drilldowns = episode_hits.len(),
             linked_total = results.iter().map(|r| r.linked_notes.len()).sum::<usize>(),
             "Search complete"
         );
@@ -297,10 +428,12 @@ impl ReadEngine {
                     format!("{} days ago", age)
                 };
 
+                let date_str = note.created_at.format("%Y-%m-%d %H:%M");
                 format!(
-                    "[{}] ({}, {}) {}\n    Context: {}",
+                    "[{}] ({}, {}, {}) {}\n    Context: {}",
                     i + 1,
                     provenance_marker,
+                    date_str,
                     recency,
                     note.content,
                     note.context,
@@ -340,16 +473,27 @@ impl ReadEngine {
 
         if should_abstain {
             debug!(reasoning = reasoning, "Structured output: abstaining");
-            return Ok(format!(
-                "Based on the available memories, I don't have information about this topic. {}",
-                parsed["answer"].as_str().unwrap_or("")
-            ));
+            return Ok(
+                "Based on the available memories, I don't have information about this topic."
+                    .to_string(),
+            );
         }
 
-        let mut answer = parsed["answer"]
-            .as_str()
-            .unwrap_or(&response.content)
-            .to_string();
+        // Handle null answer (LLM returned answer: null without setting should_abstain)
+        let mut answer = match parsed["answer"].as_str() {
+            Some(a) if !a.is_empty() => a.to_string(),
+            _ => {
+                // Fallback: if the raw response is valid prose (not JSON), use it;
+                // otherwise abstain gracefully
+                if response.content.starts_with('{') {
+                    return Ok(
+                        "Based on the available memories, I don't have information about this topic."
+                            .to_string(),
+                    );
+                }
+                response.content.clone()
+            }
+        };
 
         // Prepend contradiction notice if flagged
         if has_contradiction {

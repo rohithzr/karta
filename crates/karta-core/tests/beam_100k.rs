@@ -174,6 +174,16 @@ async fn llm_judge_rubric(
     }
 }
 
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key).ok().map(|s| s == "1" || s == "true").unwrap_or(default)
+}
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
 async fn create_karta(conv_id: &str) -> Karta {
     let suffix = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let data_dir = format!("/tmp/karta-beam100k-{}-{}", conv_id, suffix);
@@ -181,10 +191,27 @@ async fn create_karta(conv_id: &str) -> Karta {
 
     let mut config = KartaConfig::default();
     config.storage.data_dir = data_dir;
-    // Enable reranker for better abstention and relevance scoring
-    config.reranker.enabled = true;
-    config.reranker.abstention_threshold = 0.1; // Jina raw scores: <0.1 = abstain
-    config.reranker.max_rerank = 10;
+
+    // All knobs configurable via env vars for experiment sweeps
+    config.episode.enabled = env_bool("K_EPISODE", true);
+    config.read.episode_retrieval_enabled = env_bool("K_EPISODE_RETRIEVAL", true);
+    config.read.graph_weight = env_f32("K_GRAPH_WEIGHT", 0.0);
+    config.read.foresight_boost = env_f32("K_FORESIGHT_BOOST", 0.1);
+    config.read.max_episode_drilldowns = env_usize("K_MAX_DRILLDOWNS", 3);
+    config.read.max_notes_per_episode = env_usize("K_MAX_NOTES_EPISODE", 10);
+    config.read.episode_drilldown_min_score = env_f32("K_DRILLDOWN_MIN", 0.25);
+    config.read.recency_weight = env_f32("K_RECENCY_WEIGHT", 0.15);
+    config.read.summarization_top_k_multiplier = env_usize("K_SUMM_TOPK_MULT", 3);
+    config.reranker.enabled = env_bool("K_RERANKER", true);
+    config.reranker.abstention_threshold = env_f32("K_ABSTENTION_THRESH", 0.01);
+    config.reranker.max_rerank = env_usize("K_MAX_RERANK", 10);
+    config.write.foresight_default_ttl_days = env_usize("K_FORESIGHT_TTL", 90) as i64;
+
+    let exp = std::env::var("K_EXPERIMENT").unwrap_or_else(|_| "default".to_string());
+    println!("  Config [{}]: episode={}, ep_retrieval={}, graph={}, foresight={}, reranker={}, abstention_thresh={}",
+        exp, config.episode.enabled, config.read.episode_retrieval_enabled,
+        config.read.graph_weight, config.read.foresight_boost,
+        config.reranker.enabled, config.reranker.abstention_threshold);
 
     Karta::with_defaults(config)
         .await
@@ -230,15 +257,24 @@ async fn eval_conversation(
 
     let karta = create_karta(&conv.id).await;
 
-    // --- Ingest phase ---
+    // --- Ingest phase (session-aware for episode creation) ---
     let ingest_start = Instant::now();
     let mut ingested = 0;
     let mut ingest_errors = 0;
+    let mut current_session = 0usize;
+    let mut last_anchor = String::new();
 
     for (i, msg) in conv.user_messages.iter().enumerate() {
         if msg.content.trim().is_empty() {
             continue;
         }
+
+        // Derive session boundaries from time_anchor changes
+        if !msg.time_anchor.is_empty() && msg.time_anchor != last_anchor {
+            current_session += 1;
+            last_anchor = msg.time_anchor.clone();
+        }
+        let session_id = format!("session-{}", current_session);
 
         // Add time anchor as prefix for temporal context
         let content = if msg.time_anchor.is_empty() {
@@ -247,7 +283,7 @@ async fn eval_conversation(
             format!("[{}] {}", msg.time_anchor, msg.content)
         };
 
-        match karta.add_note(&content).await {
+        match karta.add_note_with_session(&content, &session_id).await {
             Ok(note) => {
                 ingested += 1;
                 if (i + 1) % 20 == 0 || i == 0 {
@@ -431,22 +467,86 @@ async fn beam_100k_full() {
     println!("BEAM 100K Full Benchmark: {} conversations, {} questions",
         dataset.num_conversations, dataset.total_questions);
 
+    let concurrency: usize = std::env::var("BEAM_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+
+    println!("  Concurrency: {} conversations at a time", concurrency);
+
     let full_start = Instant::now();
     let mut grand_total_q = 0;
     let mut grand_total_passed = 0;
     let mut grand_total_checks = 0;
     let mut grand_ability: HashMap<String, (usize, usize)> = HashMap::new();
 
-    for conv in &dataset.conversations {
-        let (questions, passed, total, ability_scores) = eval_conversation(conv).await;
-        grand_total_q += questions;
-        grand_total_passed += passed;
-        grand_total_checks += total;
+    // Run conversations in parallel batches using tokio JoinSet
+    for chunk in dataset.conversations.chunks(concurrency) {
+        let mut set = tokio::task::JoinSet::new();
+        for conv in chunk {
+            // Clone data into owned types for 'static lifetime
+            let conv_id = conv.id.clone();
+            let conv_category = conv.category.clone();
+            let msgs: Vec<(String, String, String)> = conv
+                .user_messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone(), m.time_anchor.clone()))
+                .collect();
+            let questions: Vec<(String, String, String, serde_json::Value)> = conv
+                .questions
+                .iter()
+                .map(|q| {
+                    (
+                        q.ability.clone(),
+                        q.question.clone(),
+                        q.reference_answer.clone(),
+                        q.rubric.clone(),
+                    )
+                })
+                .collect();
 
-        for (ability, (p, t)) in ability_scores {
-            let entry = grand_ability.entry(ability).or_insert((0, 0));
-            entry.0 += p;
-            entry.1 += t;
+            set.spawn(async move {
+                // Reconstruct the conv reference types
+                let owned_msgs: Vec<BeamMessage> = msgs
+                    .iter()
+                    .map(|(r, c, t)| BeamMessage {
+                        role: r.clone(),
+                        content: c.clone(),
+                        time_anchor: t.clone(),
+                    })
+                    .collect();
+                let owned_qs: Vec<BeamQuestion> = questions
+                    .iter()
+                    .map(|(a, q, ra, rub)| BeamQuestion {
+                        ability: a.clone(),
+                        question: q.clone(),
+                        reference_answer: ra.clone(),
+                        rubric: rub.clone(),
+                    })
+                    .collect();
+                let owned_conv = BeamConversation {
+                    id: conv_id,
+                    category: conv_category,
+                    title: String::new(),
+                    user_messages: owned_msgs,
+                    total_turns: 0,
+                    questions: owned_qs,
+                };
+                eval_conversation(&owned_conv).await
+            });
+        }
+
+        while let Some(result) = set.join_next().await {
+            let (questions, passed, total, ability_scores) = result.expect("task panicked");
+            grand_total_q += questions;
+            grand_total_passed += passed;
+            grand_total_checks += total;
+
+            for (ability, (p, t)) in ability_scores {
+                let entry = grand_ability.entry(ability).or_insert((0, 0));
+                entry.0 += p;
+                entry.1 += t;
+            }
         }
     }
 

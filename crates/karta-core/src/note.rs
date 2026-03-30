@@ -111,6 +111,14 @@ pub struct SearchResult {
     pub linked_notes: Vec<MemoryNote>,
 }
 
+/// A forward-looking statement extracted by the LLM during attribute generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForesightExtraction {
+    pub content: String,
+    /// Optional ISO 8601 date (YYYY-MM-DD) when this prediction/deadline expires.
+    pub valid_until: Option<String>,
+}
+
 /// LLM-generated attributes for a note.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteAttributes {
@@ -119,7 +127,7 @@ pub struct NoteAttributes {
     pub tags: Vec<String>,
     /// Forward-looking statements extracted from the content.
     #[serde(default)]
-    pub foresight_signals: Vec<String>,
+    pub foresight_signals: Vec<ForesightExtraction>,
 }
 
 /// LLM decision about whether to link two notes.

@@ -67,8 +67,16 @@ pub fn note_attributes_schema() -> JsonSchema {
                 },
                 "foresight_signals": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Forward-looking statements: deadlines, scheduled events, plans, predictions. Include time reference. Empty array if none."
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string", "description": "The forward-looking statement including any time reference." },
+                            "valid_until": { "type": ["string", "null"], "description": "ISO 8601 date (YYYY-MM-DD) when this prediction/deadline expires or becomes irrelevant. null if no time reference." }
+                        },
+                        "required": ["content", "valid_until"],
+                        "additionalProperties": false
+                    },
+                    "description": "Forward-looking statements: deadlines, scheduled events, plans, predictions. Empty array if none."
                 }
             },
             "required": ["reasoning", "context", "keywords", "tags", "foresight_signals"],

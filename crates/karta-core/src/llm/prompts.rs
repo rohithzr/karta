@@ -9,7 +9,7 @@ impl Prompts {
            \"context\": \"A rich 1-2 sentence description capturing deeper meaning, implications, and why this matters — not just a restatement of the content. Include any specific dates or deadlines mentioned.\",\n\
            \"keywords\": [\"5 to 8 specific terms that would help find this note\"],\n\
            \"tags\": [\"3 to 5 categorical labels like: preference, decision, constraint, workflow, entity, pattern\"],\n\
-           \"foresightSignals\": [\"forward-looking statements: deadlines, scheduled events, plans, predictions, intentions. Include the time reference if present. Empty array if none.\"]\n\
+           \"foresightSignals\": [{\"content\": \"forward-looking statement with time reference\", \"valid_until\": \"YYYY-MM-DD or null\"}]\n\
          }"
     }
 

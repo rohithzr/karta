@@ -379,7 +379,7 @@ impl DreamEngine {
                 let fs = crate::note::ForesightSignal::new(
                     h.clone(),
                     dream_id.clone(),
-                    None,
+                    Some(chrono::Utc::now() + chrono::Duration::days(90)),
                 );
                 let _ = self.graph_store.upsert_foresight(&fs).await;
             }
@@ -605,7 +605,15 @@ impl DreamEngine {
                 "[{} dream, confidence {:.2}] {}",
                 dream.dream_type.as_str(),
                 dream.confidence,
-                &dream.reasoning[..dream.reasoning.len().min(200)]
+                {
+                    let max = 200;
+                    let s = &dream.reasoning;
+                    if s.len() <= max { s } else {
+                        let mut end = max;
+                        while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+                        &s[..end]
+                    }
+                }
             ),
             keywords: vec![
                 dream.dream_type.as_str().to_string(),
