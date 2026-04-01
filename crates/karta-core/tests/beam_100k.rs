@@ -365,11 +365,16 @@ async fn eval_conversation(
     let mut total_checks = 0;
 
     // JSONL debug log — one line per question with full answer, scores, metadata
+    // Use CARGO_MANIFEST_DIR to resolve relative to repo root (cargo tests run from crate dir)
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent().unwrap().parent().unwrap();
+    let results_dir = repo_root.join(".results");
+    let _ = std::fs::create_dir_all(&results_dir);
     let run_ts = std::env::var("BEAM_RUN_ID").unwrap_or_else(|_| {
         chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string()
     });
     let debug_path = std::env::var("BEAM_DEBUG_PATH")
-        .unwrap_or_else(|_| format!(".results/beam-debug-{}-{}.jsonl", conv.id, run_ts));
+        .unwrap_or_else(|_| results_dir.join(format!("beam-debug-{}-{}.jsonl", conv.id, run_ts)).to_string_lossy().to_string());
     let mut debug_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
