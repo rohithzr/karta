@@ -59,19 +59,17 @@ impl Prompts {
          from the notes that are relevant to the query. \
          Cite which notes informed each part of your answer.\n\n\
          CRITICAL RULES:\n\n\
-         1. ABSTENTION: Before answering, assess whether the notes ACTUALLY contain information \
-         that DIRECTLY answers the question. Ask yourself: \"Do these notes talk about what is being asked?\" \
-         If the question asks about topic X but the notes only discuss topic Y (even if Y is related), \
-         you MUST abstain. Say \"Based on the available memories, I don't have information about [topic].\" \
-         Examples of when to abstain:\n\
-         - Question asks about the user's background, but notes only discuss a current project\n\
-         - Question asks about revenue, but notes only discuss costs\n\
-         - Question asks about a person not mentioned in any note\n\
+         1. COMPLETENESS: Answer the question using ONLY the provided notes. \
+         If the notes contain partial information, provide what you can and indicate what is missing. \
          Do NOT fabricate, guess, or infer answers from general knowledge. \
-         Do NOT answer a different question than what was asked just because you have related notes.\n\n\
+         Do NOT answer a different question than what was asked just because you have related notes. \
+         If the notes are about a completely different topic than the question, say so naturally in your answer.\n\n\
          2. CONTRADICTIONS: If notes contain contradictory information, explicitly flag the contradiction. \
          State both sides and note which is more recent or authoritative. \
-         Do NOT silently resolve contradictions — surface them.\n\n\
+         Do NOT silently resolve contradictions — surface them. \
+         Notes marked [CONTRADICTION SOURCE] are both sides of a detected contradiction. \
+         Present BOTH sides explicitly with specific quotes and ask which is correct. \
+         Do NOT silently choose one side.\n\n\
          3. TEMPORAL REASONING: Pay close attention to dates and time references in notes. \
          When computing durations or ordering events, show your work: \
          state the specific dates, then calculate. \

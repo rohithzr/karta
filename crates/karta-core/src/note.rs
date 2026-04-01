@@ -34,6 +34,13 @@ pub struct MemoryNote {
     /// Last time this note was retrieved or traversed.
     #[serde(default = "Utc::now")]
     pub last_accessed_at: DateTime<Utc>,
+    /// Position of this message within its conversation/session (0-indexed).
+    #[serde(default)]
+    pub turn_index: Option<u32>,
+    /// Original timestamp from source data (e.g., BEAM time_anchor parsed to DateTime).
+    /// Distinct from `created_at` which is the ingestion time.
+    #[serde(default)]
+    pub source_timestamp: Option<DateTime<Utc>>,
 }
 
 impl MemoryNote {
@@ -54,6 +61,8 @@ impl MemoryNote {
             confidence: 1.0,
             status: NoteStatus::Active,
             last_accessed_at: now,
+            turn_index: None,
+            source_timestamp: None,
         }
     }
 

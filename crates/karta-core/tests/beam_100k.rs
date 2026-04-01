@@ -51,6 +51,36 @@ struct BeamQuestion {
     rubric: serde_json::Value,
 }
 
+/// Parse BEAM time_anchor strings into DateTime<Utc>.
+/// BEAM uses formats like "March-15-2024", "2024-03-15", "March 15, 2024", etc.
+fn parse_time_anchor(anchor: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::NaiveDate;
+
+    let anchor = anchor.trim();
+
+    // Try ISO format: "2024-03-15"
+    if let Ok(d) = NaiveDate::parse_from_str(anchor, "%Y-%m-%d") {
+        return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    }
+
+    // Try "March-15-2024"
+    if let Ok(d) = NaiveDate::parse_from_str(anchor, "%B-%d-%Y") {
+        return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    }
+
+    // Try "March 15, 2024"
+    if let Ok(d) = NaiveDate::parse_from_str(anchor, "%B %d, %Y") {
+        return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    }
+
+    // Try "15-March-2024"
+    if let Ok(d) = NaiveDate::parse_from_str(anchor, "%d-%B-%Y") {
+        return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    }
+
+    None
+}
+
 fn load_dataset(path: &str) -> BeamDataset {
     let data = std::fs::read_to_string(path)
         .unwrap_or_else(|_| panic!("Cannot read {}. Run: python3 data/convert_beam.py data/beam-100k.parquet data/beam-100k.json", path));
@@ -276,14 +306,21 @@ async fn eval_conversation(
         }
         let session_id = format!("session-{}", current_session);
 
-        // Add time anchor as prefix for temporal context
+        // Parse time_anchor into structured timestamp instead of text prefix
+        let source_timestamp = if msg.time_anchor.is_empty() {
+            None
+        } else {
+            parse_time_anchor(&msg.time_anchor)
+        };
+
+        // Still include time_anchor as text prefix for LLM context
         let content = if msg.time_anchor.is_empty() {
             msg.content.clone()
         } else {
             format!("[{}] {}", msg.time_anchor, msg.content)
         };
 
-        match karta.add_note_with_session(&content, &session_id).await {
+        match karta.add_note_with_metadata(&content, &session_id, Some(i as u32), source_timestamp).await {
             Ok(note) => {
                 ingested += 1;
                 if (i + 1) % 20 == 0 || i == 0 {

@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use crate::config::KartaConfig;
 use crate::dream::{DreamEngine, DreamRun};
 use crate::error::{KartaError, Result};
@@ -164,6 +166,30 @@ impl Karta {
         self.write_engine
             .add_note_with_session(content, session_id)
             .await
+    }
+
+    /// Add a note with session context and optional temporal metadata.
+    /// `turn_index`: position of this message within its conversation (0-indexed).
+    /// `source_timestamp`: original timestamp from source data (distinct from ingestion time).
+    pub async fn add_note_with_metadata(
+        &self,
+        content: &str,
+        session_id: &str,
+        turn_index: Option<u32>,
+        source_timestamp: Option<DateTime<Utc>>,
+    ) -> Result<MemoryNote> {
+        let mut note = self
+            .write_engine
+            .add_note_with_session(content, session_id)
+            .await?;
+
+        if turn_index.is_some() || source_timestamp.is_some() {
+            note.turn_index = turn_index;
+            note.source_timestamp = source_timestamp;
+            self.vector_store.upsert(&note).await?;
+        }
+
+        Ok(note)
     }
 
     // --- Read ---

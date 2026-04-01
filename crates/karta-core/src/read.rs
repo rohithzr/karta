@@ -11,6 +11,72 @@ use crate::note::{MemoryNote, Provenance, SearchResult};
 use crate::rerank::{Reranker, RerankerConfig};
 use crate::store::{GraphStore, VectorStore};
 
+/// Query classification for mode-specific retrieval behavior.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QueryMode {
+    /// Default: balanced similarity + recency.
+    Standard,
+    /// "current/latest/now" — aggressive recency weighting.
+    Recency,
+    /// "summarize/overview" — broad retrieval with high top_k.
+    Breadth,
+    /// "how many/difference/compare" — force multi-hop for cross-note computation.
+    Computation,
+    /// "order/sequence/steps" — sort by turn_index, maximize episode coverage.
+    Temporal,
+    /// "did I ever/is it true/still" — include contradiction dreams.
+    Existence,
+}
+
+/// Classify a query into a retrieval mode based on keyword signals.
+fn classify_query(query: &str) -> QueryMode {
+    let q = query.to_lowercase();
+
+    // Temporal: event ordering, chronological reconstruction
+    if q.contains("in what order") || q.contains("in order") || q.contains("sequence")
+        || q.contains("timeline") || q.contains("chronolog")
+        || q.contains("progression") || q.contains("history of")
+        || q.contains("changed over") || q.contains("steps ")
+        || (q.contains("list") && (q.contains("order") || q.contains("topic")))
+    {
+        return QueryMode::Temporal;
+    }
+
+    // Recency: current state, latest value
+    if q.contains("current") || q.contains("latest") || q.contains("most recent")
+        || q.contains("right now") || q.contains("updated")
+        || (q.contains("now") && !q.contains("know"))
+    {
+        return QueryMode::Recency;
+    }
+
+    // Breadth: summarization, overviews
+    if q.contains("summary") || q.contains("summarize") || q.contains("comprehensive")
+        || q.contains("overview") || q.contains("walk me through")
+        || q.contains("how has") || q.contains("how did")
+    {
+        return QueryMode::Breadth;
+    }
+
+    // Computation: cross-note math, comparisons
+    if q.contains("how many") || q.contains("how much") || q.contains("total")
+        || q.contains("calculate") || q.contains("difference between")
+        || q.contains("compare") || q.contains("days between")
+        || q.contains("months between")
+    {
+        return QueryMode::Computation;
+    }
+
+    // Existence: contradiction-sensitive queries
+    if q.contains("contradict") || q.contains("is it true") || q.contains("conflict")
+        || q.contains("inconsisten")
+    {
+        return QueryMode::Existence;
+    }
+
+    QueryMode::Standard
+}
+
 /// Handles the read path: search, graph traversal, reranking, synthesis.
 pub struct ReadEngine {
     vector_store: Arc<dyn VectorStore>,
@@ -58,20 +124,11 @@ impl ReadEngine {
     }
 
     /// Combine similarity score with recency to produce a final score.
-    fn blended_score(&self, similarity: f32, note: &MemoryNote) -> f32 {
-        let w = self.config.recency_weight.clamp(0.0, 1.0);
+    /// Accepts an explicit recency weight for mode-specific overrides.
+    fn blended_score_with_weight(&self, similarity: f32, note: &MemoryNote, recency_weight: f32) -> f32 {
+        let w = recency_weight.clamp(0.0, 1.0);
         let recency = self.recency_score(note);
         (1.0 - w) * similarity + w * recency
-    }
-
-    /// Detect if a query is asking about temporal ordering or event sequences.
-    fn is_temporal_query(query: &str) -> bool {
-        let q = query.to_lowercase();
-        q.contains("order") || q.contains("sequence") || q.contains("timeline")
-            || q.contains("chronolog") || q.contains("first") || q.contains("before")
-            || q.contains("after") || q.contains("when did") || q.contains("how did")
-            || q.contains("progression") || q.contains("evolve") || q.contains("changed over")
-            || q.contains("steps") || q.contains("history of")
     }
 
     /// Drill into an episode: fetch constituent notes, filter active, sort chronologically.
@@ -90,8 +147,20 @@ impl ReadEngine {
             .filter(|n| n.is_active())
             .collect();
 
-        // Chronological order — the key fix for event ordering
-        notes.sort_by_key(|n| n.created_at);
+        // Chronological order: prefer turn_index > source_timestamp > created_at
+        notes.sort_by(|a, b| {
+            match (a.turn_index, b.turn_index) {
+                (Some(ai), Some(bi)) => ai.cmp(&bi),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => match (a.source_timestamp, b.source_timestamp) {
+                    (Some(at), Some(bt)) => at.cmp(&bt),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.created_at.cmp(&b.created_at),
+                },
+            }
+        });
         notes.truncate(self.config.max_notes_per_episode);
         Ok(notes)
     }
@@ -155,13 +224,20 @@ impl ReadEngine {
         let embeddings = self.llm.embed(&[query]).await?;
         let query_embedding = embeddings.into_iter().next().unwrap_or_default();
 
-        let is_temporal = Self::is_temporal_query(query);
+        let mode = classify_query(query);
+        debug!(query_mode = ?mode, "Query classified");
 
-        // Fetch more than top_k to allow re-ranking and episode discovery
-        let fetch_k = if is_temporal {
-            (top_k * 4).max(20)
-        } else {
-            (top_k * 2).max(10)
+        // Mode-specific fetch_k: how many ANN candidates to consider
+        let fetch_k = match mode {
+            QueryMode::Temporal => (top_k * 4).max(20),
+            QueryMode::Breadth | QueryMode::Computation => (top_k * 3).max(15),
+            _ => (top_k * 2).max(10),
+        };
+
+        // Mode-specific recency weight override
+        let effective_recency_weight = match mode {
+            QueryMode::Recency => 0.60,
+            _ => self.config.recency_weight,
         };
         let direct = self
             .vector_store
@@ -219,7 +295,7 @@ impl ReadEngine {
             if !note.is_active() || profile_note_ids.contains(&note.id) {
                 continue;
             }
-            let mut final_score = self.blended_score(sim, &note);
+            let mut final_score = self.blended_score_with_weight(sim, &note, effective_recency_weight);
 
             // Graph-aware scoring: notes with more links score higher (PageRank-lite)
             let link_count = self.graph_store.get_link_count(&note.id).await?;
@@ -246,10 +322,9 @@ impl ReadEngine {
         // Sort episodes by score descending
         episode_hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let max_drilldowns = if is_temporal {
-            self.config.max_episode_drilldowns * 2
-        } else {
-            self.config.max_episode_drilldowns
+        let max_drilldowns = match mode {
+            QueryMode::Temporal | QueryMode::Breadth => self.config.max_episode_drilldowns * 2,
+            _ => self.config.max_episode_drilldowns,
         };
         episode_hits.truncate(max_drilldowns);
 
@@ -326,23 +401,16 @@ impl ReadEngine {
         Ok(results)
     }
 
-    /// Detect if a query is asking for a summary/overview (needs broader retrieval).
-    fn is_summarization_query(query: &str) -> bool {
-        let q = query.to_lowercase();
-        q.contains("summary") || q.contains("summarize") || q.contains("comprehensive")
-            || q.contains("overview") || q.contains("walk me through")
-            || q.contains("list the order") || q.contains("how has")
-            || q.contains("how did") || q.contains("progression")
-    }
-
     /// Search + deduplicate + synthesize an answer with provenance markers.
     /// Includes abstention calibration: if no notes are sufficiently relevant, abstains.
     pub async fn ask(&self, query: &str, top_k: usize) -> Result<String> {
-        // Adaptive top-K: summarization queries need broader coverage
-        let effective_top_k = if Self::is_summarization_query(query) {
-            top_k * self.config.summarization_top_k_multiplier
-        } else {
-            top_k
+        // Adaptive top-K based on query mode
+        let mode = classify_query(query);
+        let effective_top_k = match mode {
+            QueryMode::Breadth => top_k * self.config.summarization_top_k_multiplier,
+            QueryMode::Temporal => top_k * 4,
+            QueryMode::Computation => top_k * 2,
+            _ => top_k,
         };
 
         let results = self.search(query, effective_top_k).await?;
@@ -399,48 +467,105 @@ impl ReadEngine {
             return Ok("No relevant memories found.".to_string());
         }
 
-        // Build notes text with provenance markers so the LLM knows
-        // which notes are observed facts vs dream-derived inferences
-        let notes_text: String = all_notes
-            .iter()
-            .enumerate()
-            .map(|(i, note)| {
-                let provenance_marker = match &note.provenance {
-                    Provenance::Observed => "FACT".to_string(),
-                    Provenance::Dream { dream_type, confidence, .. } => {
-                        format!("INFERRED:{} conf={:.0}%", dream_type, confidence * 100.0)
-                    }
-                    Provenance::Profile { entity_id } => {
-                        format!("PROFILE:{}", entity_id)
-                    }
-                    Provenance::Episode { episode_id } => {
-                        format!("EPISODE:{}", episode_id)
-                    }
-                };
-                let age = Utc::now()
-                    .signed_duration_since(note.created_at)
-                    .num_days();
-                let recency = if age == 0 {
-                    "today".to_string()
-                } else if age == 1 {
-                    "1 day ago".to_string()
-                } else {
-                    format!("{} days ago", age)
-                };
+        // --- Contradiction force-retrieval ---
+        // When a contradiction dream is among results (or a result note is linked to one),
+        // force-include both source notes so the LLM sees both sides.
+        let mut contradiction_inject_ids: HashSet<String> = HashSet::new();
+        let seen_ids: HashSet<&String> = seen.iter().copied().collect();
 
-                let date_str = note.created_at.format("%Y-%m-%d %H:%M");
-                format!(
-                    "[{}] ({}, {}, {}) {}\n    Context: {}",
-                    i + 1,
-                    provenance_marker,
-                    date_str,
-                    recency,
-                    note.content,
-                    note.context,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        // 1. Scan for contradiction dreams in retrieved notes
+        for note in all_notes.iter() {
+            if let Provenance::Dream { dream_type, source_note_ids, .. } = &note.provenance {
+                if dream_type == "contradiction" {
+                    for sid in source_note_ids {
+                        if !seen_ids.contains(sid) {
+                            contradiction_inject_ids.insert(sid.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Check if any retrieved note is linked to a contradiction dream (cap at 10 for latency)
+        for note in all_notes.iter().take(10) {
+            if let Ok(links) = self.graph_store.get_links_with_reasons(&note.id).await {
+                for (linked_id, reason) in &links {
+                    if reason.contains("contradiction dream") && !seen_ids.contains(linked_id) {
+                        if let Ok(Some(dream_note)) = self.vector_store.get(linked_id).await {
+                            if let Provenance::Dream { source_note_ids, .. } = &dream_note.provenance {
+                                for sid in source_note_ids {
+                                    if !seen_ids.contains(sid) {
+                                        contradiction_inject_ids.insert(sid.clone());
+                                    }
+                                }
+                            }
+                            contradiction_inject_ids.insert(linked_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Fetch injected notes
+        let inject_refs: Vec<&str> = contradiction_inject_ids.iter().map(|s| s.as_str()).collect();
+        let contradiction_notes: Vec<MemoryNote> = if inject_refs.is_empty() {
+            Vec::new()
+        } else {
+            debug!(count = inject_refs.len(), "Injecting contradiction source notes");
+            self.vector_store.get_many(&inject_refs).await.unwrap_or_default()
+        };
+
+        // Build notes text with provenance markers so the LLM knows
+        // which notes are observed facts vs dream-derived inferences.
+        // Chain regular notes + contradiction-injected notes.
+        let format_note = |i: usize, note: &MemoryNote, is_contradiction_source: bool| {
+            let provenance_marker = match &note.provenance {
+                Provenance::Observed => "FACT".to_string(),
+                Provenance::Dream { dream_type, confidence, .. } => {
+                    format!("INFERRED:{} conf={:.0}%", dream_type, confidence * 100.0)
+                }
+                Provenance::Profile { entity_id } => {
+                    format!("PROFILE:{}", entity_id)
+                }
+                Provenance::Episode { episode_id } => {
+                    format!("EPISODE:{}", episode_id)
+                }
+            };
+            let age = Utc::now()
+                .signed_duration_since(note.created_at)
+                .num_days();
+            let recency = if age == 0 {
+                "today".to_string()
+            } else if age == 1 {
+                "1 day ago".to_string()
+            } else {
+                format!("{} days ago", age)
+            };
+
+            let date_str = note.created_at.format("%Y-%m-%d %H:%M");
+            let prefix = if is_contradiction_source { "[CONTRADICTION SOURCE] " } else { "" };
+            format!(
+                "[{}] {}({}, {}, {}) {}\n    Context: {}",
+                i + 1,
+                prefix,
+                provenance_marker,
+                date_str,
+                recency,
+                note.content,
+                note.context,
+            )
+        };
+
+        let mut note_entries: Vec<String> = Vec::new();
+        for (i, note) in all_notes.iter().enumerate() {
+            note_entries.push(format_note(i, note, false));
+        }
+        let base_count = all_notes.len();
+        for (i, note) in contradiction_notes.iter().enumerate() {
+            note_entries.push(format_note(base_count + i, note, true));
+        }
+
+        let notes_text = note_entries.join("\n\n");
 
         let messages = vec![
             ChatMessage {
@@ -467,19 +592,9 @@ impl ReadEngine {
         let parsed: serde_json::Value =
             serde_json::from_str(&response.content).unwrap_or_default();
 
-        let should_abstain = parsed["should_abstain"].as_bool().unwrap_or(false);
         let has_contradiction = parsed["has_contradiction"].as_bool().unwrap_or(false);
-        let reasoning = parsed["reasoning"].as_str().unwrap_or("");
 
-        if should_abstain {
-            debug!(reasoning = reasoning, "Structured output: abstaining");
-            return Ok(
-                "Based on the available memories, I don't have information about this topic."
-                    .to_string(),
-            );
-        }
-
-        // Handle null answer (LLM returned answer: null without setting should_abstain)
+        // Extract answer — Gate 4: fallback for malformed JSON responses
         let mut answer = match parsed["answer"].as_str() {
             Some(a) if !a.is_empty() => a.to_string(),
             _ => {

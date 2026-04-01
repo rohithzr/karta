@@ -57,6 +57,8 @@ impl LanceVectorStore {
             Field::new("updated_at", DataType::Utf8, false),
             Field::new("status_json", DataType::Utf8, false),
             Field::new("last_accessed_at", DataType::Utf8, false),
+            Field::new("turn_index", DataType::Utf8, true),
+            Field::new("source_timestamp", DataType::Utf8, true),
             Field::new(
                 "vector",
                 DataType::FixedSizeList(
@@ -135,6 +137,8 @@ impl LanceVectorStore {
         let created_at = note.created_at.to_rfc3339();
         let updated_at = note.updated_at.to_rfc3339();
         let last_accessed_at = note.last_accessed_at.to_rfc3339();
+        let turn_index_str = note.turn_index.map(|t| t.to_string()).unwrap_or_default();
+        let source_timestamp_str = note.source_timestamp.map(|t| t.to_rfc3339()).unwrap_or_default();
 
         let batch = RecordBatch::try_new(
             Self::schema(),
@@ -150,6 +154,8 @@ impl LanceVectorStore {
                 Arc::new(StringArray::from(vec![updated_at.as_str()])),
                 Arc::new(StringArray::from(vec![status_json.as_str()])),
                 Arc::new(StringArray::from(vec![last_accessed_at.as_str()])),
+                Arc::new(StringArray::from(vec![turn_index_str.as_str()])),
+                Arc::new(StringArray::from(vec![source_timestamp_str.as_str()])),
                 Arc::new(vector_array),
             ],
         )
@@ -170,9 +176,11 @@ impl LanceVectorStore {
         let updated_ats = batch.column(8).as_any().downcast_ref::<StringArray>().unwrap();
         let status_jsons = batch.column(9).as_any().downcast_ref::<StringArray>().unwrap();
         let last_accessed_ats = batch.column(10).as_any().downcast_ref::<StringArray>().unwrap();
+        let turn_index_strs = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
+        let source_timestamp_strs = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
 
         let vector_col = batch
-            .column(11)
+            .column(13)
             .as_any()
             .downcast_ref::<arrow_array::FixedSizeListArray>()
             .unwrap();
@@ -220,6 +228,20 @@ impl LanceVectorStore {
                 last_accessed_at: chrono::DateTime::parse_from_rfc3339(last_accessed_ats.value(i))
                     .unwrap_or_default()
                     .with_timezone(&chrono::Utc),
+                turn_index: {
+                    let s = turn_index_strs.value(i);
+                    if s.is_empty() { None } else { s.parse().ok() }
+                },
+                source_timestamp: {
+                    let s = source_timestamp_strs.value(i);
+                    if s.is_empty() {
+                        None
+                    } else {
+                        chrono::DateTime::parse_from_rfc3339(s)
+                            .ok()
+                            .map(|d| d.with_timezone(&chrono::Utc))
+                    }
+                },
             });
         }
 

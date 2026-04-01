@@ -183,8 +183,20 @@ fn check_must_contain(answer: &str, pattern: &str) -> bool {
 /// Ingest all user messages from sessions into Karta with session-aware episode creation.
 async fn ingest_sessions(karta: &Karta, sessions: &[Session]) -> usize {
     let mut count = 0usize;
+    let mut global_turn: u32 = 0;
     for session in sessions {
         let session_id = format!("session-{}", session.session_id);
+
+        // Parse session label as date for source_timestamp
+        let source_timestamp = if session.label.is_empty() {
+            None
+        } else {
+            chrono::NaiveDate::parse_from_str(session.label, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|dt| dt.and_utc())
+        };
+
         for msg in &session.messages {
             if msg.role == "user" {
                 let note = if session.label.is_empty() {
@@ -192,8 +204,12 @@ async fn ingest_sessions(karta: &Karta, sessions: &[Session]) -> usize {
                 } else {
                     format!("[{}] {}", session.label, msg.content)
                 };
-                let result = karta.add_note_with_session(&note, &session_id).await.unwrap();
+                let result = karta
+                    .add_note_with_metadata(&note, &session_id, Some(global_turn), source_timestamp)
+                    .await
+                    .unwrap();
                 count += 1;
+                global_turn += 1;
                 println!("  Note {}: {} links", count, result.links.len());
             }
         }

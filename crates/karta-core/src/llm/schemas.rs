@@ -16,17 +16,13 @@ pub fn synthesis_schema() -> JsonSchema {
                     "type": "string",
                     "description": "Step-by-step reasoning: 1) What topic does the question ask about? 2) Do ANY of the notes discuss this topic, even partially? 3) Are there contradictions? 4) What dates/times are relevant? Think through this before answering."
                 },
-                "should_abstain": {
-                    "type": "boolean",
-                    "description": "true ONLY if the notes are about a completely different topic than the question. If the notes contain ANY relevant information — even partial, indirect, or requiring synthesis — set to false and answer. Examples where should_abstain=false: notes mention a number the question asks about, notes discuss a related feature, notes contain facts that can be combined to answer. Examples where should_abstain=true: question asks about personal history but notes only discuss a project, question asks about a person never mentioned."
-                },
                 "has_contradiction": {
                     "type": "boolean",
-                    "description": "true if the notes contain contradictory information relevant to the question."
+                    "description": "true ONLY if the notes contain mutually exclusive claims that cannot both be true simultaneously (e.g., 'I use Excel' vs 'I have never used Excel'). Mere updates or corrections (e.g., 'accuracy was 78%' then 'accuracy is now 92%') are NOT contradictions. If you flag true, you MUST present BOTH sides in the answer."
                 },
                 "answer": {
-                    "type": ["string", "null"],
-                    "description": "The answer to the question based on the notes. null if should_abstain is true. Include code blocks when the notes contain code and the question asks for implementation details."
+                    "type": "string",
+                    "description": "The answer to the question based on the notes. Include code blocks when the notes contain code and the question asks for implementation details. If the notes don't answer the question, explain what information is available and what is missing."
                 },
                 "cited_notes": {
                     "type": "array",
@@ -34,7 +30,7 @@ pub fn synthesis_schema() -> JsonSchema {
                     "description": "List of note numbers (1-indexed) that informed the answer."
                 }
             },
-            "required": ["reasoning", "should_abstain", "has_contradiction", "answer", "cited_notes"],
+            "required": ["reasoning", "has_contradiction", "answer", "cited_notes"],
             "additionalProperties": false
         }),
     }

@@ -501,6 +501,8 @@ impl DreamEngine {
             confidence: 1.0,
             status: crate::note::NoteStatus::Active,
             last_accessed_at: Utc::now(),
+            turn_index: None,
+            source_timestamp: None,
         };
 
         self.vector_store.upsert(&note).await?;
@@ -637,6 +639,8 @@ impl DreamEngine {
             confidence: dream.confidence,
             status: crate::note::NoteStatus::Active,
             last_accessed_at: dream.created_at,
+            turn_index: None,
+            source_timestamp: None,
         };
 
         self.vector_store.upsert(&note).await?;
