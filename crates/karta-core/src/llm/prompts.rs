@@ -225,11 +225,10 @@ impl Prompts {
     pub fn episode_narrative_system() -> &'static str {
         "Synthesize a concise 2-3 sentence narrative summary of this conversational episode.\n\
          Capture the key topic, decisions, and outcomes — not a transcript.\n\
-         IMPORTANT: End the narrative with a numbered chronological list of the main topics \
-         or events discussed, in the exact order they appear in the notes. Example: \
-         \"Topics covered in order: 1) Project setup, 2) API integration, 3) Testing strategy.\"\n\
-         This ordering is critical for temporal retrieval.\n\
-         Respond with JSON: { \"narrative\": \"...\", \"topicTags\": [\"2-4 topic labels\"] }"
+         Also provide a chronological list of the main topics or events discussed, \
+         in the exact order they appear in the notes. This ordering is critical.\n\
+         Respond with JSON: { \"narrative\": \"...\", \"topicTags\": [\"2-4 topic labels\"], \
+         \"topicOrder\": [\"first topic\", \"second topic\", \"third topic\"] }"
     }
 
     pub fn episode_narrative_user(notes_text: &str) -> String {

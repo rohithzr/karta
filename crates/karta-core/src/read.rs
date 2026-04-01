@@ -228,10 +228,7 @@ impl ReadEngine {
         debug!(query_mode = ?mode, "Query classified");
 
         // Fetch 4x candidates for all modes — reranker picks the best top_k from the wider pool
-        let fetch_k = match mode {
-            QueryMode::Temporal => (top_k * 4).max(20),
-            _ => (top_k * 4).max(20),
-        };
+        let fetch_k = (top_k * 4).max(20);
 
         // Mode-specific recency weight override
         let effective_recency_weight = match mode {
@@ -621,9 +618,10 @@ impl ReadEngine {
 
         let has_contradiction = parsed["has_contradiction"].as_bool().unwrap_or(false);
 
-        // Collect note IDs for metadata
-        let collected_note_ids: Vec<String> = all_notes.iter().map(|n| n.id.clone()).collect();
-        let collected_count = all_notes.len();
+        // Collect note IDs for metadata (including contradiction-injected notes)
+        let mut collected_note_ids: Vec<String> = all_notes.iter().map(|n| n.id.clone()).collect();
+        collected_note_ids.extend(contradiction_notes.iter().map(|n| n.id.clone()));
+        let collected_count = all_notes.len() + contradiction_notes.len();
         let contradiction_count = contradiction_notes.len();
 
         // Extract answer — Gate 4: fallback for malformed JSON responses
@@ -658,7 +656,7 @@ impl ReadEngine {
         Ok(AskResult {
             answer,
             query_mode: mode_str,
-            notes_used: collected_count + contradiction_count,
+            notes_used: collected_count,
             note_ids: collected_note_ids,
             contradiction_injected: contradiction_count,
             has_contradiction,

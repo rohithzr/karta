@@ -31,11 +31,11 @@ while true; do
 
     # Running score
     if [ "$QUESTIONS" -gt 0 ]; then
-        python3 -c "
+        python3 - "$LOG" <<'PYEOF'
 import re, sys
 scores, abilities = [], {}
 ability = None
-with open('$LOG') as f:
+with open(sys.argv[1]) as f:
     for line in f:
         am = re.search(r'\[(\w+)\] Q\d+:', line)
         if am: ability = am.group(1)
@@ -57,7 +57,7 @@ if scores:
         p = sum(1 for s in sc if s >= 0.5)
         bar = '#' * int(a * 20)
         print(f'  {name:30s} {a:5.0%} {bar:20s} ({p}/{len(sc)})')
-" 2>/dev/null || echo "(waiting for scores...)"
+PYEOF
     fi
 
     echo ""

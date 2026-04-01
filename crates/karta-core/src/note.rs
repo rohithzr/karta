@@ -121,7 +121,7 @@ pub struct SearchResult {
 }
 
 /// Result of an ask() call, including the answer and retrieval metadata for debugging.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AskResult {
     /// The synthesized answer.
     pub answer: String,
