@@ -24,8 +24,8 @@ while true; do
     echo ""
 
     # Progress: count completed questions and conversations
-    QUESTIONS=$(grep -c "BEAM score:" "$LOG" 2>/dev/null || echo "0")
-    CONVS_DONE=$(grep -c "^BEAM 100K — Conv" "$LOG" 2>/dev/null || echo "0")
+    QUESTIONS=$(grep -c "BEAM score:" "$LOG" 2>/dev/null | tail -1 || echo "0")
+    CONVS_DONE=$(grep -c "BEAM 100K — Conv" "$LOG" 2>/dev/null | tail -1 || echo "0")
     echo "Progress: $QUESTIONS/400 questions scored ($CONVS_DONE convs started)"
     echo ""
 
@@ -65,7 +65,7 @@ PYEOF
     tail -20 "$LOG"
 
     # Extract errors to error log and show last 15
-    grep -iE "(WARN|ERROR|panic|failed|thread.*panicked)" "$LOG" > "$ERROR_LOG" 2>/dev/null || true
+    grep -iE "(panic|thread.*panicked|WARN: Note|failed:)" "$LOG" | grep -v "^warning:" > "$ERROR_LOG" 2>/dev/null || true
     ERROR_COUNT=$(wc -l < "$ERROR_LOG" 2>/dev/null | tr -d ' ')
     if [ "$ERROR_COUNT" -gt 0 ]; then
         echo ""

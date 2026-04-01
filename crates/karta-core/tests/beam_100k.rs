@@ -412,19 +412,18 @@ async fn eval_conversation(
 
         let entry = ability_scores.entry(q.ability.clone()).or_insert((0, 0));
         let mut rubric_scores_debug: Vec<serde_json::Value> = Vec::new();
-        let mut beam_score: f64 = 0.0;
 
-        if rubric_items.is_empty() {
+        let beam_score: f64 = if rubric_items.is_empty() {
             entry.1 += 1;
             total_checks += 1;
             if answer.len() > 50 {
                 total_passed += 1;
                 entry.0 += 1;
                 println!("    [PASS] (no rubric, non-trivial answer)");
-                beam_score = 1.0;
+                1.0
             } else {
                 println!("    [FAIL] (no rubric, trivial answer)");
-                beam_score = 0.0;
+                0.0
             }
         } else {
             let mut rubric_score_sum = 0.0;
@@ -452,9 +451,10 @@ async fn eval_conversation(
                 }));
             }
 
-            beam_score = rubric_score_sum / rubric_items.len() as f64;
-            println!("    → Q{} BEAM score: {:.2}", qi + 1, beam_score);
-        }
+            let score = rubric_score_sum / rubric_items.len() as f64;
+            println!("    → Q{} BEAM score: {:.2}", qi + 1, score);
+            score
+        };
 
         // Write JSONL debug line
         if let Some(ref mut f) = debug_file {
