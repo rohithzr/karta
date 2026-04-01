@@ -302,7 +302,7 @@ async fn eval_all_scenarios() {
         // Run queries
         for q in &scenario.queries {
             total_queries += 1;
-            let answer = karta.ask(q.query, 5).await.unwrap();
+            let answer = karta.ask(q.query, 5).await.unwrap().answer;
             println!("\n  Q: {}", q.query);
             println!("  A: {}...", &answer[..answer.len().min(200)]);
 

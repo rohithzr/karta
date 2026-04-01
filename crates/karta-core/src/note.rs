@@ -120,6 +120,25 @@ pub struct SearchResult {
     pub linked_notes: Vec<MemoryNote>,
 }
 
+/// Result of an ask() call, including the answer and retrieval metadata for debugging.
+#[derive(Debug, Clone)]
+pub struct AskResult {
+    /// The synthesized answer.
+    pub answer: String,
+    /// Query classification mode used for retrieval.
+    pub query_mode: String,
+    /// Number of unique notes used in synthesis (after dedup).
+    pub notes_used: usize,
+    /// IDs of notes used in synthesis.
+    pub note_ids: Vec<String>,
+    /// Number of contradiction source notes force-injected.
+    pub contradiction_injected: usize,
+    /// Whether the LLM flagged contradictory information.
+    pub has_contradiction: bool,
+    /// Best reranker relevance score (None if reranker disabled).
+    pub reranker_best_score: Option<f32>,
+}
+
 /// A forward-looking statement extracted by the LLM during attribute generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForesightExtraction {

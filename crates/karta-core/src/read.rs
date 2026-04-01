@@ -7,7 +7,7 @@ use tracing::{debug, info};
 use crate::config::ReadConfig;
 use crate::error::Result;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
-use crate::note::{MemoryNote, Provenance, SearchResult};
+use crate::note::{AskResult, MemoryNote, Provenance, SearchResult};
 use crate::rerank::{Reranker, RerankerConfig};
 use crate::store::{GraphStore, VectorStore};
 
@@ -227,11 +227,10 @@ impl ReadEngine {
         let mode = classify_query(query);
         debug!(query_mode = ?mode, "Query classified");
 
-        // Mode-specific fetch_k: how many ANN candidates to consider
+        // Fetch 4x candidates for all modes — reranker picks the best top_k from the wider pool
         let fetch_k = match mode {
             QueryMode::Temporal => (top_k * 4).max(20),
-            QueryMode::Breadth | QueryMode::Computation => (top_k * 3).max(15),
-            _ => (top_k * 2).max(10),
+            _ => (top_k * 4).max(20),
         };
 
         // Mode-specific recency weight override
@@ -403,7 +402,7 @@ impl ReadEngine {
 
     /// Search + deduplicate + synthesize an answer with provenance markers.
     /// Includes abstention calibration: if no notes are sufficiently relevant, abstains.
-    pub async fn ask(&self, query: &str, top_k: usize) -> Result<String> {
+    pub async fn ask(&self, query: &str, top_k: usize) -> Result<AskResult> {
         // Adaptive top-K based on query mode
         let mode = classify_query(query);
         let effective_top_k = match mode {
@@ -413,10 +412,21 @@ impl ReadEngine {
             _ => top_k,
         };
 
+        let mode_str = format!("{:?}", mode);
+        let mut reranker_best: Option<f32> = None;
+
         let results = self.search(query, effective_top_k).await?;
 
         if results.is_empty() {
-            return Ok("Based on the available memories, I don't have information about this topic.".to_string());
+            return Ok(AskResult {
+                answer: "Based on the available memories, I don't have information about this topic.".to_string(),
+                query_mode: mode_str,
+                notes_used: 0,
+                note_ids: Vec::new(),
+                contradiction_injected: 0,
+                has_contradiction: false,
+                reranker_best_score: None,
+            });
         }
 
         // --- Reranker-based abstention ---
@@ -435,16 +445,23 @@ impl ReadEngine {
                 .map(|r| r.relevance_score)
                 .fold(0.0f32, f32::max);
 
+            reranker_best = Some(best_relevance);
+
             if best_relevance < self.reranker_config.abstention_threshold {
                 debug!(
                     best_relevance = best_relevance,
                     threshold = self.reranker_config.abstention_threshold,
                     "Reranker: abstaining — notes not relevant to query"
                 );
-                return Ok(
-                    "Based on the available memories, I don't have information about this topic."
-                        .to_string(),
-                );
+                return Ok(AskResult {
+                    answer: "Based on the available memories, I don't have information about this topic.".to_string(),
+                    query_mode: mode_str,
+                    notes_used: 0,
+                    note_ids: Vec::new(),
+                    contradiction_injected: 0,
+                    has_contradiction: false,
+                    reranker_best_score: reranker_best,
+                });
             }
         }
 
@@ -464,7 +481,15 @@ impl ReadEngine {
         }
 
         if all_notes.is_empty() {
-            return Ok("No relevant memories found.".to_string());
+            return Ok(AskResult {
+                answer: "No relevant memories found.".to_string(),
+                query_mode: mode_str,
+                notes_used: 0,
+                note_ids: Vec::new(),
+                contradiction_injected: 0,
+                has_contradiction: false,
+                reranker_best_score: reranker_best,
+            });
         }
 
         // --- Contradiction force-retrieval ---
@@ -596,6 +621,11 @@ impl ReadEngine {
 
         let has_contradiction = parsed["has_contradiction"].as_bool().unwrap_or(false);
 
+        // Collect note IDs for metadata
+        let collected_note_ids: Vec<String> = all_notes.iter().map(|n| n.id.clone()).collect();
+        let collected_count = all_notes.len();
+        let contradiction_count = contradiction_notes.len();
+
         // Extract answer — Gate 4: fallback for malformed JSON responses
         let mut answer = match parsed["answer"].as_str() {
             Some(a) if !a.is_empty() => a.to_string(),
@@ -603,10 +633,15 @@ impl ReadEngine {
                 // Fallback: if the raw response is valid prose (not JSON), use it;
                 // otherwise abstain gracefully
                 if response.content.starts_with('{') {
-                    return Ok(
-                        "Based on the available memories, I don't have information about this topic."
-                            .to_string(),
-                    );
+                    return Ok(AskResult {
+                        answer: "Based on the available memories, I don't have information about this topic.".to_string(),
+                        query_mode: mode_str,
+                        notes_used: collected_count,
+                        note_ids: collected_note_ids,
+                        contradiction_injected: contradiction_count,
+                        has_contradiction,
+                        reranker_best_score: reranker_best,
+                    });
                 }
                 response.content.clone()
             }
@@ -620,6 +655,14 @@ impl ReadEngine {
             );
         }
 
-        Ok(answer)
+        Ok(AskResult {
+            answer,
+            query_mode: mode_str,
+            notes_used: collected_count + contradiction_count,
+            note_ids: collected_note_ids,
+            contradiction_injected: contradiction_count,
+            has_contradiction,
+            reranker_best_score: reranker_best,
+        })
     }
 }

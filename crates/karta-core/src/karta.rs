@@ -198,7 +198,7 @@ impl Karta {
         self.read_engine.search(query, top_k).await
     }
 
-    pub async fn ask(&self, query: &str, top_k: usize) -> Result<String> {
+    pub async fn ask(&self, query: &str, top_k: usize) -> Result<crate::note::AskResult> {
         self.read_engine.ask(query, top_k).await
     }
 

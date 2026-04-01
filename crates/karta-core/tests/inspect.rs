@@ -111,8 +111,8 @@ async fn inspect_ingestion() {
         }
 
         // Full ask
-        let answer = karta.ask(query, 5).await.unwrap();
-        let preview: String = answer.chars().take(300).collect();
+        let result = karta.ask(query, 5).await.unwrap();
+        let preview: String = result.answer.chars().take(300).collect();
         println!("Answer: {}...", preview);
         println!();
     }

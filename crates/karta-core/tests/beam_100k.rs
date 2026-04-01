@@ -364,16 +364,26 @@ async fn eval_conversation(
     let mut total_passed = 0;
     let mut total_checks = 0;
 
+    // JSONL debug log — one line per question with full answer, scores, metadata
+    let debug_path = std::env::var("BEAM_DEBUG_PATH")
+        .unwrap_or_else(|_| format!(".results/beam-debug-{}.jsonl", conv.id));
+    let mut debug_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&debug_path)
+        .ok();
+
     for (qi, q) in conv.questions.iter().enumerate() {
         let query_start = Instant::now();
-        let answer = match karta.ask(&q.question, 5).await {
-            Ok(a) => a,
+        let ask_result = match karta.ask(&q.question, 5).await {
+            Ok(r) => r,
             Err(e) => {
                 eprintln!("  Query {} failed: {}", qi + 1, e);
                 continue;
             }
         };
         let query_ms = query_start.elapsed().as_millis();
+        let answer = &ask_result.answer;
 
         println!(
             "\n  [{}] Q{}: {}",
@@ -384,7 +394,7 @@ async fn eval_conversation(
         println!(
             "  A ({:.1}s): {}",
             query_ms as f64 / 1000.0,
-            safe_truncate(&answer, 200)
+            safe_truncate(answer, 200)
         );
 
         // Score against rubric items using LLM-as-judge (BEAM official methodology).
@@ -398,6 +408,8 @@ async fn eval_conversation(
         };
 
         let entry = ability_scores.entry(q.ability.clone()).or_insert((0, 0));
+        let mut rubric_scores_debug: Vec<serde_json::Value> = Vec::new();
+        let mut beam_score: f64 = 0.0;
 
         if rubric_items.is_empty() {
             entry.1 += 1;
@@ -406,8 +418,10 @@ async fn eval_conversation(
                 total_passed += 1;
                 entry.0 += 1;
                 println!("    [PASS] (no rubric, non-trivial answer)");
+                beam_score = 1.0;
             } else {
                 println!("    [FAIL] (no rubric, trivial answer)");
+                beam_score = 0.0;
             }
         } else {
             let mut rubric_score_sum = 0.0;
@@ -417,7 +431,7 @@ async fn eval_conversation(
                 entry.1 += 1;
 
                 // LLM-as-judge scores this rubric item
-                let score = llm_judge_rubric(&karta, &q.question, &answer, rubric).await;
+                let score = llm_judge_rubric(&karta, &q.question, answer, rubric).await;
                 rubric_score_sum += score;
 
                 let label = if score >= 1.0 { "FULL" } else if score >= 0.5 { "PART" } else { "FAIL" };
@@ -427,10 +441,40 @@ async fn eval_conversation(
                     entry.0 += 1;
                 }
                 println!("    [{}] R{}: {:.1} ({})", label, ri + 1, score, safe_truncate(rubric, 70));
+
+                rubric_scores_debug.push(serde_json::json!({
+                    "item": rubric,
+                    "score": score,
+                    "grade": label,
+                }));
             }
 
-            let avg_score = rubric_score_sum / rubric_items.len() as f64;
-            println!("    → Q{} BEAM score: {:.2}", qi + 1, avg_score);
+            beam_score = rubric_score_sum / rubric_items.len() as f64;
+            println!("    → Q{} BEAM score: {:.2}", qi + 1, beam_score);
+        }
+
+        // Write JSONL debug line
+        if let Some(ref mut f) = debug_file {
+            use std::io::Write;
+            let debug_entry = serde_json::json!({
+                "conv_id": conv.id,
+                "category": conv.category,
+                "q_index": qi,
+                "ability": q.ability,
+                "question": q.question,
+                "reference_answer": q.reference_answer,
+                "system_answer": answer,
+                "query_mode": ask_result.query_mode,
+                "notes_used": ask_result.notes_used,
+                "note_ids": ask_result.note_ids,
+                "contradiction_injected": ask_result.contradiction_injected,
+                "has_contradiction": ask_result.has_contradiction,
+                "reranker_best_score": ask_result.reranker_best_score,
+                "rubric_scores": rubric_scores_debug,
+                "beam_score": beam_score,
+                "query_time_ms": query_ms,
+            });
+            let _ = writeln!(f, "{}", debug_entry);
         }
     }
 

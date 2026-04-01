@@ -365,7 +365,7 @@ async fn eval_entry(
     // --- Query phase ---
     let query_start = Instant::now();
     let answer = match karta.ask(&entry.question, 5).await {
-        Ok(a) => a,
+        Ok(result) => result.answer,
         Err(e) => {
             eprintln!("    Query failed: {}", e);
             results.record(&entry.question_type, false);

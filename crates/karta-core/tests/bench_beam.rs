@@ -737,7 +737,7 @@ async fn run_beam_benchmark(scenarios: &[BeamScenario], use_real_llm: bool) -> B
             metrics.questions_total += 1;
 
             let query_start = Instant::now();
-            let answer = karta.ask(q.question, 5).await.unwrap();
+            let answer = karta.ask(q.question, 5).await.unwrap().answer;
             let query_ms = query_start.elapsed().as_millis();
             metrics.query_latencies_ms.push(query_ms);
             report.total_query_ms += query_ms;
@@ -999,7 +999,7 @@ async fn beam_real_with_dreaming() {
 
         // Query (post-dream)
         for q in &scenario.questions {
-            let answer = karta.ask(q.question, 5).await.unwrap();
+            let answer = karta.ask(q.question, 5).await.unwrap().answer;
             println!(
                 "\n  [{}] Q: {}",
                 q.ability.as_str(),
