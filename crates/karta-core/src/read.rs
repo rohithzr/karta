@@ -227,8 +227,13 @@ impl ReadEngine {
         let mode = classify_query(query);
         debug!(query_mode = ?mode, "Query classified");
 
-        // Fetch 4x candidates for all modes — reranker picks the best top_k from the wider pool
-        let fetch_k = (top_k * 4).max(20);
+        // Mode-specific fetch_k: wide pool for reranker, but Computation stays tight (precision > recall)
+        let fetch_k = match mode {
+            QueryMode::Temporal => (top_k * 4).max(20),
+            QueryMode::Breadth => (top_k * 3).max(15),
+            QueryMode::Computation => (top_k * 2).max(10),
+            _ => (top_k * 4).max(20),
+        };
 
         // Mode-specific recency weight override
         let effective_recency_weight = match mode {
@@ -412,7 +417,7 @@ impl ReadEngine {
         let mode_str = format!("{:?}", mode);
         let mut reranker_best: Option<f32> = None;
 
-        let results = self.search(query, effective_top_k).await?;
+        let mut results = self.search(query, effective_top_k).await?;
 
         if results.is_empty() {
             return Ok(AskResult {
@@ -426,9 +431,7 @@ impl ReadEngine {
             });
         }
 
-        // --- Reranker-based abstention ---
-        // If reranker is enabled, re-score results for true relevance.
-        // The reranker distinguishes "shares vocabulary" from "actually answers the question."
+        // --- Reranker: abstention gate + reorder results by cross-encoder relevance ---
         if self.reranker_config.enabled {
             let notes_for_rerank: Vec<(MemoryNote, f32)> = results
                 .iter()
@@ -460,6 +463,35 @@ impl ReadEngine {
                     reranker_best_score: reranker_best,
                 });
             }
+
+            // Rebuild results ordered by reranker relevance_score (descending).
+            // Reranked notes replace their original SearchResult entries.
+            // Non-reranked results (beyond max_rerank) keep original order at the end.
+            let reranked_ids: HashSet<String> = reranked.iter().map(|r| r.note.id.clone()).collect();
+            let mut reordered: Vec<SearchResult> = Vec::new();
+
+            // First: reranked notes in cross-encoder order, with their linked_notes preserved
+            for rr in &reranked {
+                let linked = results.iter()
+                    .find(|r| r.note.id == rr.note.id)
+                    .map(|r| r.linked_notes.clone())
+                    .unwrap_or_default();
+                reordered.push(SearchResult {
+                    note: rr.note.clone(),
+                    score: rr.relevance_score,
+                    linked_notes: linked,
+                });
+            }
+
+            // Then: any results that weren't sent to reranker (original order)
+            for r in &results {
+                if !reranked_ids.contains(&r.note.id) {
+                    reordered.push(r.clone());
+                }
+            }
+
+            results = reordered;
+            debug!(reranked_count = reranked.len(), "Reranker: reordered results by relevance");
         }
 
         // Deduplicate: collect all unique notes (direct + linked)
