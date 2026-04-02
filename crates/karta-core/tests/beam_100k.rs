@@ -446,39 +446,18 @@ async fn eval_conversation(
     let debug_path = std::env::var("BEAM_DEBUG_PATH")
         .unwrap_or_else(|_| results_dir.join(format!("beam-debug-{}-{}.jsonl", conv.id, run_ts)).to_string_lossy().to_string());
 
-    // Phase 1: Fire all ask() calls in parallel
+    // Phase 1: Ask questions with bounded concurrency via semaphore
     let query_concurrency: usize = std::env::var("BEAM_QUERY_CONCURRENCY")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(query_concurrency));
     let mut ask_handles = Vec::new();
 
     for (qi, q) in conv.questions.iter().enumerate() {
         let karta_ref = Arc::clone(&karta);
+        let sem = Arc::clone(&semaphore);
         let question = q.question.clone();
         ask_handles.push(tokio::spawn(async move {
-            let start = Instant::now();
-            let result = karta_ref.ask(&question, 5).await;
-            let ms = start.elapsed().as_millis();
-            (qi, result, ms)
-        }));
-
-        // Throttle: wait for batch to fill before spawning more
-        if ask_handles.len() >= query_concurrency {
-            // Wait for all in this batch
-            let batch: Vec<_> = ask_handles.drain(..).collect();
-            for h in batch {
-                ask_handles.push(h); // put back — we'll collect below
-            }
-            break; // Actually, just let tokio schedule them all
-        }
-    }
-    // Spawn remaining
-    let remaining_qs: Vec<_> = conv.questions.iter().enumerate()
-        .skip(ask_handles.len())
-        .collect();
-    for (qi, q) in remaining_qs {
-        let karta_ref = Arc::clone(&karta);
-        let question = q.question.clone();
-        ask_handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
             let start = Instant::now();
             let result = karta_ref.ask(&question, 5).await;
             let ms = start.elapsed().as_millis();
