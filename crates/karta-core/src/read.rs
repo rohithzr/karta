@@ -548,9 +548,14 @@ impl ReadEngine {
     pub async fn ask(&self, query: &str, top_k: usize) -> Result<AskResult> {
         let result = self.ask_inner(query, top_k, false).await?;
 
-        // Retry if the answer admits missing information and this was the first attempt
-        if Self::answer_admits_insufficient_info(&result.answer) && result.notes_used > 0 {
-            debug!("Answer admits insufficient info, retrying with wider retrieval");
+        // Retry if the answer admits missing information, but ONLY for query modes
+        // where missing specific facts is the failure mode (Computation, Temporal).
+        // Don't retry Standard/Breadth/Existence — abstention is more likely correct there.
+        let mode = classify_query_keywords(query);
+        let retry_eligible = matches!(mode, QueryMode::Computation | QueryMode::Temporal);
+
+        if retry_eligible && Self::answer_admits_insufficient_info(&result.answer) && result.notes_used > 0 {
+            debug!(query_mode = ?mode, "Answer admits insufficient info, retrying with wider retrieval");
             let retry = self.ask_inner(query, top_k * 3, true).await?;
             // Keep the retry only if it produced a more confident answer
             if !Self::answer_admits_insufficient_info(&retry.answer) {
