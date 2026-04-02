@@ -28,11 +28,140 @@ pub enum QueryMode {
     Existence,
 }
 
-/// Classify a query into a retrieval mode based on keyword signals.
-fn classify_query(query: &str) -> QueryMode {
+/// Prototype examples for embedding-based query classification.
+/// Each mode has representative queries that define its embedding centroid.
+const PROTOTYPES: &[(QueryMode, &[&str])] = &[
+    (QueryMode::Temporal, &[
+        "Can you list in order how I brought up different topics?",
+        "What was the sequence of events in my project?",
+        "In what order did I discuss these subjects?",
+        "What was the chronological progression of my work?",
+        "List the timeline of my activities",
+        "What happened first, second, third?",
+        "Walk me through the order of topics we covered",
+    ]),
+    (QueryMode::Recency, &[
+        "What is my current status on the project?",
+        "What's the latest update on my progress?",
+        "What am I working on right now?",
+        "What's the most recent version of my plan?",
+        "What did I last decide about the design?",
+        "What's my updated budget?",
+    ]),
+    (QueryMode::Breadth, &[
+        "Give me a comprehensive summary of my project",
+        "Can you summarize everything we've discussed?",
+        "Provide an overview of all my activities",
+        "Walk me through the full picture of what I've been doing",
+        "How has my approach evolved over time?",
+        "How did my project develop from start to finish?",
+    ]),
+    (QueryMode::Computation, &[
+        "How many days between the start and the deadline?",
+        "How many weeks did it take to finish?",
+        "How long did it take me to complete the task?",
+        "What's the total number of items I completed?",
+        "How many more problems did I solve compared to last time?",
+        "Calculate the time between event A and event B",
+        "How much progress did I make between March and April?",
+        "Which happened first, X or Y, and how far apart?",
+        "How many hours did I spend studying?",
+        "Days between my meeting and the deadline",
+    ]),
+    (QueryMode::Existence, &[
+        "Did I ever mention using Excel for tracking?",
+        "Is it true that I contradicted myself about the tool?",
+        "Have I been inconsistent about my preferences?",
+        "Does my earlier statement conflict with the later one?",
+        "Was there a contradiction in what I said?",
+    ]),
+    (QueryMode::Standard, &[
+        "What tools am I using for my project?",
+        "What did I say about the API integration?",
+        "What are my preferences for the UI design?",
+        "Tell me about my debugging approach",
+        "What feedback did I receive on my work?",
+        "What are the main features I'm building?",
+        "What constraints or requirements did I mention?",
+    ]),
+];
+
+/// Embedding-based query classifier. Classifies by cosine similarity to prototype centroids.
+struct QueryClassifier {
+    centroids: Vec<(QueryMode, Vec<f32>)>,
+}
+
+impl QueryClassifier {
+    /// Build classifier by embedding all prototypes and averaging per mode.
+    async fn new(llm: &dyn LlmProvider) -> Self {
+        let mut centroids = Vec::new();
+
+        for (mode, examples) in PROTOTYPES {
+            let refs: Vec<&str> = examples.to_vec();
+            match llm.embed(&refs).await {
+                Ok(embeddings) if !embeddings.is_empty() => {
+                    let dim = embeddings[0].len();
+                    let mut centroid = vec![0.0f32; dim];
+                    for emb in &embeddings {
+                        for (i, v) in emb.iter().enumerate() {
+                            centroid[i] += v;
+                        }
+                    }
+                    let n = embeddings.len() as f32;
+                    for v in centroid.iter_mut() {
+                        *v /= n;
+                    }
+                    centroids.push((*mode, centroid));
+                }
+                _ => {
+                    tracing::warn!(mode = ?mode, "Failed to embed prototypes, skipping mode");
+                }
+            }
+        }
+
+        Self { centroids }
+    }
+
+    fn classify(&self, query_embedding: &[f32]) -> QueryMode {
+        if self.centroids.is_empty() {
+            return QueryMode::Standard;
+        }
+
+        let mut best_mode = QueryMode::Standard;
+        let mut best_sim = f32::NEG_INFINITY;
+
+        for (mode, centroid) in &self.centroids {
+            let sim = cosine_similarity(query_embedding, centroid);
+            if sim > best_sim {
+                best_sim = sim;
+                best_mode = *mode;
+            }
+        }
+
+        best_mode
+    }
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom == 0.0 { 0.0 } else { dot / denom }
+}
+
+/// Keyword-based fallback classifier (used when embeddings unavailable).
+fn classify_query_keywords(query: &str) -> QueryMode {
     let q = query.to_lowercase();
 
-    // Temporal: event ordering, chronological reconstruction
     if q.contains("in what order") || q.contains("in order") || q.contains("sequence")
         || q.contains("timeline") || q.contains("chronolog")
         || q.contains("progression") || q.contains("history of")
@@ -42,7 +171,6 @@ fn classify_query(query: &str) -> QueryMode {
         return QueryMode::Temporal;
     }
 
-    // Recency: current state, latest value
     if q.contains("current") || q.contains("latest") || q.contains("most recent")
         || q.contains("right now") || q.contains("updated")
         || (q.contains("now") && !q.contains("know"))
@@ -50,7 +178,6 @@ fn classify_query(query: &str) -> QueryMode {
         return QueryMode::Recency;
     }
 
-    // Breadth: summarization, overviews
     if q.contains("summary") || q.contains("summarize") || q.contains("comprehensive")
         || q.contains("overview") || q.contains("walk me through")
         || q.contains("how has") || q.contains("how did")
@@ -58,7 +185,6 @@ fn classify_query(query: &str) -> QueryMode {
         return QueryMode::Breadth;
     }
 
-    // Computation: cross-note math, comparisons
     if q.contains("how many") || q.contains("how much") || q.contains("total")
         || q.contains("calculate") || q.contains("difference between")
         || q.contains("compare") || q.contains("days between")
@@ -67,7 +193,6 @@ fn classify_query(query: &str) -> QueryMode {
         return QueryMode::Computation;
     }
 
-    // Existence: contradiction-sensitive queries
     if q.contains("contradict") || q.contains("is it true") || q.contains("conflict")
         || q.contains("inconsisten")
     {
@@ -85,6 +210,7 @@ pub struct ReadEngine {
     reranker: Arc<dyn Reranker>,
     config: ReadConfig,
     reranker_config: RerankerConfig,
+    classifier: tokio::sync::OnceCell<QueryClassifier>,
 }
 
 impl ReadEngine {
@@ -103,7 +229,16 @@ impl ReadEngine {
             reranker,
             config,
             reranker_config,
+            classifier: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Get or initialize the embedding-based query classifier.
+    async fn get_classifier(&self) -> &QueryClassifier {
+        self.classifier.get_or_init(|| async {
+            info!("Initializing embedding-based query classifier...");
+            QueryClassifier::new(self.llm.as_ref()).await
+        }).await
     }
 
     /// Compute a recency score for a note using exponential decay.
@@ -224,7 +359,13 @@ impl ReadEngine {
         let embeddings = self.llm.embed(&[query]).await?;
         let query_embedding = embeddings.into_iter().next().unwrap_or_default();
 
-        let mode = classify_query(query);
+        // Embedding-based classification with keyword fallback
+        let classifier = self.get_classifier().await;
+        let mode = if classifier.centroids.is_empty() {
+            classify_query_keywords(query)
+        } else {
+            classifier.classify(&query_embedding)
+        };
         debug!(query_mode = ?mode, "Query classified");
 
         // Mode-specific fetch_k: wide pool for reranker, but Computation stays tight (precision > recall)
@@ -405,8 +546,8 @@ impl ReadEngine {
     /// Search + deduplicate + synthesize an answer with provenance markers.
     /// Includes abstention calibration: if no notes are sufficiently relevant, abstains.
     pub async fn ask(&self, query: &str, top_k: usize) -> Result<AskResult> {
-        // Adaptive top-K based on query mode
-        let mode = classify_query(query);
+        // Adaptive top-K based on query mode (keyword fallback; search() uses embedding classifier)
+        let mode = classify_query_keywords(query);
         let effective_top_k = match mode {
             QueryMode::Breadth => top_k * self.config.summarization_top_k_multiplier,
             QueryMode::Temporal => top_k * 4,
