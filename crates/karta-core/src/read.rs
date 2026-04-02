@@ -846,6 +846,107 @@ impl ReadEngine {
             );
         }
 
+        // --- A.3: Insufficient-info retry for Computation/Temporal modes ---
+        // When the LLM admits it can't find specific data (dates, counts), retry with
+        // wider retrieval and no reranker. Only for modes where missing specific facts
+        // is the failure mode. Standard/Breadth/Existence abstentions are likely correct.
+        let retry_eligible = matches!(mode, QueryMode::Computation | QueryMode::Temporal);
+        if retry_eligible && collected_count > 0 && Self::answer_admits_insufficient_info(&answer) {
+            info!(
+                query_mode = ?mode,
+                notes_used = collected_count,
+                "Answer admits insufficient info — retrying with 3x wider retrieval"
+            );
+
+            // Retry: 3x top_k, skip reranker entirely
+            let retry_top_k = effective_top_k * 3;
+            let retry_results = self.search(query, retry_top_k).await?;
+
+            if !retry_results.is_empty() {
+                // Build notes text from retry results (same dedup + sort + format logic)
+                let mut retry_seen = HashSet::new();
+                let mut retry_notes: Vec<&MemoryNote> = Vec::new();
+                for result in &retry_results {
+                    if retry_seen.insert(&result.note.id) {
+                        retry_notes.push(&result.note);
+                    }
+                    for linked in &result.linked_notes {
+                        if retry_seen.insert(&linked.id) {
+                            retry_notes.push(linked);
+                        }
+                    }
+                }
+
+                // Sort chronologically
+                retry_notes.sort_by(|a, b| {
+                    match (a.turn_index, b.turn_index) {
+                        (Some(ai), Some(bi)) => ai.cmp(&bi),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => match (a.source_timestamp, b.source_timestamp) {
+                            (Some(at), Some(bt)) => at.cmp(&bt),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => a.created_at.cmp(&b.created_at),
+                        },
+                    }
+                });
+
+                let retry_notes_text: String = retry_notes.iter().enumerate()
+                    .map(|(i, note)| format_note(i, note, false))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+
+                let retry_messages = vec![
+                    ChatMessage {
+                        role: Role::System,
+                        content: Prompts::synthesize_system().to_string(),
+                    },
+                    ChatMessage {
+                        role: Role::User,
+                        content: Prompts::synthesize_user(query, &retry_notes_text),
+                    },
+                ];
+
+                info!(
+                    retry_notes = retry_notes.len(),
+                    original_notes = collected_count,
+                    "Retry: synthesizing with wider note set"
+                );
+
+                if let Ok(retry_response) = self.llm.chat(&retry_messages, &config).await {
+                    let retry_parsed: serde_json::Value =
+                        serde_json::from_str(&retry_response.content).unwrap_or_default();
+                    if let Some(retry_answer) = retry_parsed["answer"].as_str() {
+                        if !retry_answer.is_empty() && !Self::answer_admits_insufficient_info(retry_answer) {
+                            let retry_note_ids: Vec<String> = retry_notes.iter().map(|n| n.id.clone()).collect();
+                            let retry_has_contradiction = retry_parsed["has_contradiction"].as_bool().unwrap_or(false);
+
+                            let mut final_answer = retry_answer.to_string();
+                            if retry_has_contradiction {
+                                final_answer = format!(
+                                    "**Note: The memories contain contradictory information on this topic.**\n\n{}",
+                                    final_answer
+                                );
+                            }
+
+                            info!("Retry produced confident answer, using it");
+                            return Ok(AskResult {
+                                answer: final_answer,
+                                query_mode: mode_str,
+                                notes_used: retry_notes.len(),
+                                note_ids: retry_note_ids,
+                                contradiction_injected: 0,
+                                has_contradiction: retry_has_contradiction,
+                                reranker_best_score: reranker_best,
+                            });
+                        }
+                    }
+                }
+                info!("Retry also insufficient or failed, keeping original answer");
+            }
+        }
+
         Ok(AskResult {
             answer,
             query_mode: mode_str,
@@ -855,5 +956,21 @@ impl ReadEngine {
             has_contradiction,
             reranker_best_score: reranker_best,
         })
+    }
+
+    /// Check if an answer contains language indicating the LLM couldn't find enough information.
+    fn answer_admits_insufficient_info(answer: &str) -> bool {
+        let lower = answer.to_lowercase();
+        lower.contains("don't have information")
+            || lower.contains("notes do not")
+            || lower.contains("notes don't")
+            || lower.contains("can't find")
+            || lower.contains("can't determine")
+            || lower.contains("cannot determine")
+            || lower.contains("not explicitly stated")
+            || lower.contains("not mentioned in")
+            || lower.contains("not in the notes")
+            || lower.contains("not provided in")
+            || lower.contains("i don't see any note")
     }
 }
