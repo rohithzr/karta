@@ -8,21 +8,25 @@
 | Post-wiring (all features) | 41.4% | episodes=on, graph=0.05, reranker=0.1 | Massive regression |
 | Optimal (Day 2) | 51.3% | episodes=on, graph=0.0, foresight=0.1, reranker=0.01 | After experiment sweep |
 | P0 foundation fixes | **56.8%** | +turn_index, query router, contradiction wiring, kill abstention | 2026-03-31 |
-| P0+P1+P2 | **55.3%** | +fetch_k=4x, max_rerank=20, narrative ordering | 2026-04-01 (regression) |
+| P0+P1+P2 | 55.3% | +fetch_k=4x, max_rerank=20, narrative ordering | 2026-04-01 (regression) |
+| P1-fix | 56.4% | +reranker reorder, mode-specific fetch_k | 2026-04-01 |
+| All-fixes | **57.8%** | +embed classifier, note sorting, source timestamps, parallel questions | 2026-04-02 (new best) |
 | Honcho reference | 63.0% | Their system | Published number |
 
 ### Per-Ability Comparison (All Runs)
 
-| Ability | Day 2 Opt (51.3%) | P0 (56.8%) | P0+P1+P2 (55.3%) | Best |
-|---------|-------------------|------------|-------------------|------|
-| preference_following | 80% | 84% | 80% | **84% (P0)** |
-| instruction_following | 54% | 66% | 68% | **68% (P0+P1+P2)** |
-| summarization | 64% | 61% | 64% | **64%** |
-| contradiction_resolution | 52% | 61% | 63% | **63% (P0+P1+P2)** |
-| abstention | 60% | 65% | 62% | **65% (P0)** |
-| multi_session_reasoning | 53% | 71% | 62% | **71% (P0)** |
-| information_extraction | 50% | 58% | 51% | **58% (P0)** |
-| temporal_reasoning | 40% | 49% | 41% | **49% (P0)** |
+| Ability | Day 2 Opt (51.3%) | P0 (56.8%) | P0+P1+P2 (55.3%) | All-fixes (57.8%) | Best |
+|---------|-------------------|------------|-------------------|-------------------|------|
+| preference_following | 80% | 84% | 80% | 78% | **84% (P0)** |
+| contradiction_resolution | 52% | 61% | 63% | **71%** | **71% (all-fixes)** |
+| instruction_following | 54% | 66% | 68% | 68% | **68%** |
+| abstention | 60% | 65% | 62% | 68% | **68% (all-fixes)** |
+| information_extraction | 50% | 58% | 51% | **63%** | **63% (all-fixes)** |
+| summarization | 64% | 61% | 64% | 62% | **64%** |
+| multi_session_reasoning | 53% | 71% | 62% | 61% | **71% (P0)** |
+| temporal_reasoning | 40% | 49% | 41% | 45% | **49% (P0)** |
+| knowledge_update | 45% | 40% | 40% | 38% | **45% (Day 2)** |
+| event_ordering | 31% | 35% | 35% | 37% | **37% (all-fixes)** |
 | knowledge_update | 45% | 40% | 40% | **45% (Day 2)** |
 | event_ordering | 31% | 35% | 35% | **35%** |
 
