@@ -237,7 +237,17 @@ impl ReadEngine {
     async fn get_classifier(&self) -> &QueryClassifier {
         self.classifier.get_or_init(|| async {
             info!("Initializing embedding-based query classifier...");
-            QueryClassifier::new(self.llm.as_ref()).await
+            // Timeout: if Azure is slow/overloaded, fall back to empty classifier (keyword fallback)
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                QueryClassifier::new(self.llm.as_ref()),
+            ).await {
+                Ok(c) => c,
+                Err(_) => {
+                    tracing::warn!("Classifier init timed out after 30s, using keyword fallback");
+                    QueryClassifier { centroids: Vec::new() }
+                }
+            }
         }).await
     }
 
