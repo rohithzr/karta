@@ -248,9 +248,19 @@ fn apply_config_env(config: &mut KartaConfig) {
         config.reranker.enabled, config.reranker.abstention_threshold);
 }
 
-/// Find the most recent data directory for a conversation ID.
+/// Find a data directory for a conversation ID.
+/// If BEAM_DATA_SUFFIX is set, use that exact suffix. Otherwise find the most recently created.
 fn find_latest_data_dir(conv_id: &str) -> Option<String> {
-    let pattern = format!("/tmp/karta-beam100k-{}-", conv_id);
+    // Allow explicit suffix: BEAM_DATA_SUFFIX=8cfad35c → /tmp/karta-beam100k-1-8cfad35c
+    if let Ok(suffix) = std::env::var("BEAM_DATA_SUFFIX") {
+        let path = format!("/tmp/karta-beam100k-{}-{}", conv_id, suffix);
+        if std::path::Path::new(&path).is_dir() {
+            return Some(path);
+        }
+    }
+
+    // Find by birth time (creation time), not modification time.
+    // macOS: std::fs::Metadata has created(). Linux: falls back to modified().
     let mut dirs: Vec<_> = std::fs::read_dir("/tmp")
         .ok()?
         .filter_map(|e| e.ok())
@@ -259,11 +269,19 @@ fn find_latest_data_dir(conv_id: &str) -> Option<String> {
                 && e.path().is_dir()
         })
         .filter_map(|e| {
-            let modified = e.metadata().ok()?.modified().ok()?;
-            Some((e.path().to_string_lossy().to_string(), modified))
+            let meta = e.metadata().ok()?;
+            let created = meta.created().ok().or_else(|| meta.modified().ok())?;
+            // Verify the dir has actual data (lance table exists)
+            let lance_path = e.path().join("lance/notes.lance/data");
+            let has_data = lance_path.exists();
+            if has_data {
+                Some((e.path().to_string_lossy().to_string(), created))
+            } else {
+                None
+            }
         })
         .collect();
-    dirs.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
+    dirs.sort_by(|a, b| b.1.cmp(&a.1)); // most recently created first
     dirs.into_iter().next().map(|(path, _)| path)
 }
 
