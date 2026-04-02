@@ -13,9 +13,11 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use karta_core::config::KartaConfig;
+use karta_core::note::AskResult;
 use karta_core::Karta;
 
 #[derive(serde::Deserialize)]
@@ -158,6 +160,16 @@ Return your evaluation in JSON format with two fields:
 }
 
 NOTE: ONLY output the json object, without any explanation before or after that"#;
+
+/// LLM-as-judge (Arc version for parallel execution).
+async fn llm_judge_rubric_arc(
+    karta: &Arc<Karta>,
+    question: &str,
+    answer: &str,
+    rubric_item: &str,
+) -> f64 {
+    llm_judge_rubric(karta.as_ref(), question, answer, rubric_item).await
+}
 
 /// LLM-as-judge using the exact BEAM official prompt and 3-tier scoring (1.0/0.5/0.0).
 /// Returns score 0.0, 0.5, or 1.0.
@@ -402,13 +414,10 @@ async fn eval_conversation(
         }
     }
 
-    // --- Query phase ---
-    let mut ability_scores: HashMap<String, (usize, usize)> = HashMap::new();
-    let mut total_passed = 0;
-    let mut total_checks = 0;
+    // --- Query phase (parallelized) ---
+    let karta = Arc::new(karta);
 
-    // JSONL debug log — one line per question with full answer, scores, metadata
-    // Use CARGO_MANIFEST_DIR to resolve relative to repo root (cargo tests run from crate dir)
+    // JSONL debug log setup
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap().parent().unwrap();
     let results_dir = repo_root.join(".results");
@@ -418,37 +427,71 @@ async fn eval_conversation(
     });
     let debug_path = std::env::var("BEAM_DEBUG_PATH")
         .unwrap_or_else(|_| results_dir.join(format!("beam-debug-{}-{}.jsonl", conv.id, run_ts)).to_string_lossy().to_string());
-    let mut debug_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&debug_path)
-        .ok();
+
+    // Phase 1: Fire all ask() calls in parallel
+    let query_concurrency: usize = std::env::var("BEAM_QUERY_CONCURRENCY")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let mut ask_handles = Vec::new();
 
     for (qi, q) in conv.questions.iter().enumerate() {
-        let query_start = Instant::now();
-        let ask_result = match karta.ask(&q.question, 5).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("  Query {} failed: {}", qi + 1, e);
-                continue;
+        let karta_ref = Arc::clone(&karta);
+        let question = q.question.clone();
+        ask_handles.push(tokio::spawn(async move {
+            let start = Instant::now();
+            let result = karta_ref.ask(&question, 5).await;
+            let ms = start.elapsed().as_millis();
+            (qi, result, ms)
+        }));
+
+        // Throttle: wait for batch to fill before spawning more
+        if ask_handles.len() >= query_concurrency {
+            // Wait for all in this batch
+            let batch: Vec<_> = ask_handles.drain(..).collect();
+            for h in batch {
+                ask_handles.push(h); // put back — we'll collect below
             }
+            break; // Actually, just let tokio schedule them all
+        }
+    }
+    // Spawn remaining
+    let remaining_qs: Vec<_> = conv.questions.iter().enumerate()
+        .skip(ask_handles.len())
+        .collect();
+    for (qi, q) in remaining_qs {
+        let karta_ref = Arc::clone(&karta);
+        let question = q.question.clone();
+        ask_handles.push(tokio::spawn(async move {
+            let start = Instant::now();
+            let result = karta_ref.ask(&question, 5).await;
+            let ms = start.elapsed().as_millis();
+            (qi, result, ms)
+        }));
+    }
+
+    // Collect all ask results
+    let mut ask_results: Vec<(usize, Option<AskResult>, u128)> = Vec::new();
+    for handle in ask_handles {
+        match handle.await {
+            Ok((qi, Ok(result), ms)) => ask_results.push((qi, Some(result), ms)),
+            Ok((qi, Err(e), ms)) => {
+                eprintln!("  Query {} failed: {}", qi + 1, e);
+                ask_results.push((qi, None, ms));
+            }
+            Err(e) => eprintln!("  Task panicked: {}", e),
+        }
+    }
+    ask_results.sort_by_key(|(qi, _, _)| *qi);
+
+    // Phase 2: Score rubrics in parallel for all questions
+    let mut judge_handles = Vec::new();
+    for (qi, ask_result, _) in &ask_results {
+        let qi = *qi;
+        let q = &conv.questions[qi];
+        let answer = match ask_result {
+            Some(r) => r.answer.clone(),
+            None => continue,
         };
-        let query_ms = query_start.elapsed().as_millis();
-        let answer = &ask_result.answer;
 
-        println!(
-            "\n  [{}] Q{}: {}",
-            q.ability,
-            qi + 1,
-            safe_truncate(&q.question, 80)
-        );
-        println!(
-            "  A ({:.1}s): {}",
-            query_ms as f64 / 1000.0,
-            safe_truncate(answer, 200)
-        );
-
-        // Score against rubric items using LLM-as-judge (BEAM official methodology).
         let rubric_items: Vec<String> = match &q.rubric {
             serde_json::Value::Array(arr) => arr
                 .iter()
@@ -458,10 +501,64 @@ async fn eval_conversation(
             _ => Vec::new(),
         };
 
+        for (ri, rubric) in rubric_items.into_iter().enumerate() {
+            let karta_ref = Arc::clone(&karta);
+            let question = q.question.clone();
+            let answer_clone = answer.clone();
+            judge_handles.push(tokio::spawn(async move {
+                let score = llm_judge_rubric_arc(&karta_ref, &question, &answer_clone, &rubric).await;
+                (qi, ri, rubric, score)
+            }));
+        }
+    }
+
+    // Collect all judge results
+    let mut judge_results: Vec<(usize, usize, String, f64)> = Vec::new();
+    for handle in judge_handles {
+        match handle.await {
+            Ok(result) => judge_results.push(result),
+            Err(e) => eprintln!("  Judge task panicked: {}", e),
+        }
+    }
+    judge_results.sort_by_key(|(qi, ri, _, _)| (*qi, *ri));
+
+    // Phase 3: Aggregate scores and write output (sequential, for consistent logging)
+    let mut ability_scores: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut total_passed = 0;
+    let mut total_checks = 0;
+    let mut debug_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&debug_path)
+        .ok();
+
+    for (qi, ask_result, query_ms) in &ask_results {
+        let q = &conv.questions[*qi];
+        let ask_result = match ask_result {
+            Some(r) => r,
+            None => continue,
+        };
+        let answer = &ask_result.answer;
+
+        println!(
+            "\n  [{}] Q{}: {}",
+            q.ability, qi + 1, safe_truncate(&q.question, 80)
+        );
+        println!(
+            "  A ({:.1}s): {}",
+            *query_ms as f64 / 1000.0, safe_truncate(answer, 200)
+        );
+
         let entry = ability_scores.entry(q.ability.clone()).or_insert((0, 0));
         let mut rubric_scores_debug: Vec<serde_json::Value> = Vec::new();
 
-        let beam_score: f64 = if rubric_items.is_empty() {
+        // Get rubric scores for this question from collected results
+        let q_rubric_scores: Vec<&(usize, usize, String, f64)> = judge_results
+            .iter()
+            .filter(|(qidx, _, _, _)| *qidx == *qi)
+            .collect();
+
+        let beam_score: f64 = if q_rubric_scores.is_empty() {
             entry.1 += 1;
             total_checks += 1;
             if answer.len() > 50 {
@@ -475,31 +572,23 @@ async fn eval_conversation(
             }
         } else {
             let mut rubric_score_sum = 0.0;
-
-            for (ri, rubric) in rubric_items.iter().enumerate() {
+            for (_, ri, rubric, score) in &q_rubric_scores {
                 total_checks += 1;
                 entry.1 += 1;
-
-                // LLM-as-judge scores this rubric item
-                let score = llm_judge_rubric(&karta, &q.question, answer, rubric).await;
                 rubric_score_sum += score;
 
-                let label = if score >= 1.0 { "FULL" } else if score >= 0.5 { "PART" } else { "FAIL" };
-                // Count >= 0.5 as passed for the binary tally
-                if score >= 0.5 {
+                let label = if *score >= 1.0 { "FULL" } else if *score >= 0.5 { "PART" } else { "FAIL" };
+                if *score >= 0.5 {
                     total_passed += 1;
                     entry.0 += 1;
                 }
                 println!("    [{}] R{}: {:.1} ({})", label, ri + 1, score, safe_truncate(rubric, 70));
 
                 rubric_scores_debug.push(serde_json::json!({
-                    "item": rubric,
-                    "score": score,
-                    "grade": label,
+                    "item": rubric, "score": score, "grade": label,
                 }));
             }
-
-            let score = rubric_score_sum / rubric_items.len() as f64;
+            let score = rubric_score_sum / q_rubric_scores.len() as f64;
             println!("    → Q{} BEAM score: {:.2}", qi + 1, score);
             score
         };

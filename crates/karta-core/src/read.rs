@@ -664,6 +664,22 @@ impl ReadEngine {
             });
         }
 
+        // Sort notes by conversation order (turn_index > source_timestamp > created_at).
+        // LLMs perform better when notes arrive in chronological sequence, not relevance order.
+        all_notes.sort_by(|a, b| {
+            match (a.turn_index, b.turn_index) {
+                (Some(ai), Some(bi)) => ai.cmp(&bi),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => match (a.source_timestamp, b.source_timestamp) {
+                    (Some(at), Some(bt)) => at.cmp(&bt),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.created_at.cmp(&b.created_at),
+                },
+            }
+        });
+
         // --- Contradiction force-retrieval ---
         // When a contradiction dream is among results (or a result note is linked to one),
         // force-include both source notes so the LLM sees both sides.
@@ -730,8 +746,10 @@ impl ReadEngine {
                     format!("EPISODE:{}", episode_id)
                 }
             };
+            // Use source_timestamp (real conversation date) if available, fall back to created_at
+            let display_time = note.source_timestamp.unwrap_or(note.created_at);
             let age = Utc::now()
-                .signed_duration_since(note.created_at)
+                .signed_duration_since(display_time)
                 .num_days();
             let recency = if age == 0 {
                 "today".to_string()
@@ -741,7 +759,7 @@ impl ReadEngine {
                 format!("{} days ago", age)
             };
 
-            let date_str = note.created_at.format("%Y-%m-%d %H:%M");
+            let date_str = display_time.format("%Y-%m-%d");
             let prefix = if is_contradiction_source { "[CONTRADICTION SOURCE] " } else { "" };
             format!(
                 "[{}] {}({}, {}, {}) {}\n    Context: {}",
