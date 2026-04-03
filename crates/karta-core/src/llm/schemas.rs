@@ -73,9 +73,22 @@ pub fn note_attributes_schema() -> JsonSchema {
                         "additionalProperties": false
                     },
                     "description": "Forward-looking statements: deadlines, scheduled events, plans, predictions. Empty array if none."
+                },
+                "atomic_facts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string", "description": "A single atomic, independently verifiable statement." },
+                            "subject": { "type": ["string", "null"], "description": "Primary entity or topic this fact is about. null if general." }
+                        },
+                        "required": ["content", "subject"],
+                        "additionalProperties": false
+                    },
+                    "description": "1-5 atomic facts. Each is a standalone, verifiable statement with one specific claim."
                 }
             },
-            "required": ["reasoning", "context", "keywords", "tags", "foresight_signals"],
+            "required": ["reasoning", "context", "keywords", "tags", "foresight_signals", "atomic_facts"],
             "additionalProperties": false
         }),
     }

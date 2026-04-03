@@ -3,13 +3,23 @@ pub struct Prompts;
 
 impl Prompts {
     pub fn note_attributes_system() -> &'static str {
-        "You are a memory indexing system. Given a piece of information, extract structured attributes.\n\
+        "You are a memory indexing system. Given a piece of information, extract structured attributes.\n\n\
+         Also extract 1-5 atomic facts. Each fact should be:\n\
+         - A single, self-contained statement that makes sense without context\n\
+         - Independently verifiable (not \"he said\" but \"John said\")\n\
+         - Include specific values, dates, numbers when present\n\
+         - Each fact about ONE thing\n\
+         Example: \"I'm using Flask 2.3.1 on Python 3.11 and my budget is $500\" becomes:\n\
+           1. \"The user is using Flask version 2.3.1\" (subject: \"Flask\")\n\
+           2. \"The user is using Python version 3.11\" (subject: \"Python\")\n\
+           3. \"The user's budget is $500\" (subject: \"budget\")\n\n\
          Respond with JSON only in this exact shape:\n\
          {\n\
            \"context\": \"A rich 1-2 sentence description capturing deeper meaning, implications, and why this matters — not just a restatement of the content. Include any specific dates or deadlines mentioned.\",\n\
            \"keywords\": [\"5 to 8 specific terms that would help find this note\"],\n\
            \"tags\": [\"3 to 5 categorical labels like: preference, decision, constraint, workflow, entity, pattern\"],\n\
-           \"foresightSignals\": [{\"content\": \"forward-looking statement with time reference\", \"valid_until\": \"YYYY-MM-DD or null\"}]\n\
+           \"foresightSignals\": [{\"content\": \"forward-looking statement with time reference\", \"valid_until\": \"YYYY-MM-DD or null\"}],\n\
+           \"atomic_facts\": [{\"content\": \"single atomic statement\", \"subject\": \"primary entity or null\"}]\n\
          }"
     }
 
@@ -233,6 +243,55 @@ impl Prompts {
 
     pub fn episode_narrative_user(notes_text: &str) -> String {
         format!("Episode notes:\n{}", notes_text)
+    }
+
+    // --- Episode Digest prompts (Phase Next) ---
+
+    pub fn episode_digest(notes_text: &str) -> String {
+        format!(
+            "Analyze this episode's notes and produce a structured digest.\n\n\
+             Extract:\n\
+             1. entities: every named entity (person, tool, framework, project, date, number) \
+                with type and mention count. If an entity's value was updated during the episode, \
+                record the LATEST value.\n\
+             2. date_range: earliest and latest dates mentioned IN THE CONTENT (not timestamps).\n\
+             3. aggregations: countable collections (e.g., '5 movies discussed: [list]').\n\
+             4. topic_sequence: topics in the ORDER they appeared.\n\
+             5. digest_text: A 2-4 sentence summary that embeds well for retrieval. \
+                Include specific names, numbers, and dates.\n\n\
+             Notes:\n{}\n\n\
+             Respond with JSON:\n\
+             {{\n\
+               \"entities\": [{{\"name\": \"...\", \"type\": \"person|tool|framework|project|date|number|other\", \
+                 \"count\": 1, \"latest_value\": \"...or null\"}}],\n\
+               \"date_range\": {{\"earliest\": \"YYYY-MM-DD\", \"latest\": \"YYYY-MM-DD\"}} or null,\n\
+               \"aggregations\": [{{\"label\": \"movies discussed\", \"count\": 5, \"items\": [\"...\"]}}],\n\
+               \"topic_sequence\": [\"first topic\", \"second topic\"],\n\
+               \"digest_text\": \"retrieval-optimized summary\",\n\
+               \"confidence\": 0.8\n\
+             }}",
+            notes_text
+        )
+    }
+
+    pub fn cross_episode_digest(episode_digests_text: &str) -> String {
+        format!(
+            "You are analyzing digests from multiple episodes to find cross-episode patterns.\n\n\
+             For each entity that appears in 2+ episodes, track how its value changed over time.\n\
+             Identify aggregations that span episodes (total unique items across all episodes).\n\
+             Find the overall topic progression across episodes.\n\n\
+             Episode digests:\n{}\n\n\
+             Respond with JSON:\n\
+             {{\n\
+               \"entity_timeline\": [{{\"name\": \"...\", \"type\": \"...\", \
+                 \"changes\": [{{\"episode_id\": \"...\", \"value\": \"...\"}}]}}],\n\
+               \"cross_aggregations\": [{{\"label\": \"...\", \"count\": 0, \"items\": [\"...\"]}}],\n\
+               \"topic_progression\": [\"...\"],\n\
+               \"digest_text\": \"cross-episode summary optimized for retrieval\",\n\
+               \"confidence\": 0.7\n\
+             }}",
+            episode_digests_text
+        )
     }
 
     pub fn dream_contradiction(notes_text: &str) -> String {
