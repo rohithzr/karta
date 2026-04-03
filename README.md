@@ -30,8 +30,8 @@ async fn main() {
     karta.add_note("Brightline requires all integrations on the approved vendor list").await.unwrap();
 
     // Query with synthesis
-    let answer = karta.ask("What should I know about Sarah's notification preferences?", 5).await.unwrap();
-    println!("{}", answer);
+    let result = karta.ask("What should I know about Sarah's notification preferences?", 5).await.unwrap();
+    println!("{}", result.answer);
 
     // Run background reasoning
     let dream_run = karta.run_dreaming("workspace", "default").await.unwrap();
@@ -96,21 +96,23 @@ abstention_threshold = 0.1
 
 BEAM 100K (20 conversations, 400 questions, official judge prompt):
 
-| Ability | Score |
-|---------|-------|
-| Preference Following | 80% |
-| Contradiction Resolution | 69% |
-| Multi-session Reasoning | 69% |
-| Summarization | 64% |
-| Information Extraction | 63% |
-| Knowledge Update | 62% |
-| Temporal Reasoning | 61% |
-| Instruction Following | 56% |
-| Abstention | 52% |
-| Event Ordering | 23% |
-| **Overall** | **56.8%** |
+| Ability | Day 2 | Day 4 |
+|---------|-------|-------|
+| Preference Following | 80% | 78% |
+| Abstention | 52% | 68% |
+| Contradiction Resolution | 52% | 67% |
+| Multi-session Reasoning | 53% | 66% |
+| Instruction Following | 54% | 64% |
+| Information Extraction | 50% | 63% |
+| Summarization | 64% | 61% |
+| Temporal Reasoning | 40% | 53% |
+| Knowledge Update | 45% | 40% |
+| Event Ordering | 31% | 36% |
+| **Overall** | **51.3%** | **57.7%** |
 
-> Day 2 baseline. Active development — episode-based retrieval, confidence propagation, and dream-of-dreams are next.
+Day 4 improvements: query-type routing (embedding-based classifier), contradiction force-retrieval from dream source notes, chronological note ordering for LLM synthesis, cross-encoder reranker reordering, insufficient-info retry for temporal/computation queries.
+
+> Honcho reference: 63.0%. Active development targeting 90%+ via atomic fact decomposition and dream-powered episode intelligence.
 
 ## Project Structure
 
