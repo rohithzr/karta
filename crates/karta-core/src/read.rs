@@ -555,7 +555,6 @@ impl ReadEngine {
         let fact_boost = self.config.fact_match_boost;
         for (fact, score) in &fact_hits {
             if *score < 0.3 { continue; }
-            if seen_note_ids.contains(&fact.source_note_id) { continue; }
             if seen_note_ids.insert(fact.source_note_id.clone()) {
                 if let Ok(Some(parent)) = self.vector_store.get(&fact.source_note_id).await {
                     if parent.is_active() {

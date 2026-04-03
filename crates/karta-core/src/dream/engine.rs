@@ -819,7 +819,12 @@ impl DreamEngine {
             digest_note_id: digest_note_id.clone(),
             created_at: Utc::now(),
         };
-        self.graph_store.upsert_episode_digest(&digest).await?;
+        // Only store digest if the LLM produced meaningful content (guard against parse failures)
+        if !digest_text.is_empty() {
+            self.graph_store.upsert_episode_digest(&digest).await?;
+        } else {
+            debug!(episode_id = %episode.id, "Skipping empty digest (LLM parse failure)");
+        }
 
         debug!(
             episode_id = %episode.id,

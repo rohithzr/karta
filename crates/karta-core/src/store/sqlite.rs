@@ -135,6 +135,7 @@ impl crate::store::GraphStore for SqliteGraphStore {
                 date_range_json TEXT,
                 aggregations_json TEXT NOT NULL DEFAULT '[]',
                 topic_sequence_json TEXT NOT NULL DEFAULT '[]',
+                digest_text TEXT NOT NULL DEFAULT '',
                 digest_note_id TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -148,7 +149,7 @@ impl crate::store::GraphStore for SqliteGraphStore {
                 entity TEXT,
                 reason TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (from_episode_id, to_episode_id, link_type)
+                PRIMARY KEY (from_episode_id, to_episode_id, link_type, entity)
             );
             CREATE INDEX IF NOT EXISTS idx_ep_links_from ON episode_links(from_episode_id);
             CREATE INDEX IF NOT EXISTS idx_ep_links_to ON episode_links(to_episode_id);
@@ -595,8 +596,8 @@ impl crate::store::GraphStore for SqliteGraphStore {
         let aggregations_json = serde_json::to_string(&digest.aggregations)?;
         let topic_sequence_json = serde_json::to_string(&digest.topic_sequence)?;
         conn.execute(
-            "INSERT OR REPLACE INTO episode_digests (id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest_note_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![digest.id, digest.episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest.digest_note_id, digest.created_at.to_rfc3339()],
+            "INSERT OR REPLACE INTO episode_digests (id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest_text, digest_note_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![digest.id, digest.episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest.digest_text, digest.digest_note_id, digest.created_at.to_rfc3339()],
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
         Ok(())
     }
@@ -604,7 +605,7 @@ impl crate::store::GraphStore for SqliteGraphStore {
     async fn get_episode_digest(&self, episode_id: &str) -> Result<Option<crate::note::EpisodeDigest>> {
         let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn.prepare(
-            "SELECT id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest_note_id, created_at FROM episode_digests WHERE episode_id = ?1"
+            "SELECT id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest_text, digest_note_id, created_at FROM episode_digests WHERE episode_id = ?1"
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
         let result = stmt.query_row(rusqlite::params![episode_id], |row| {
@@ -612,7 +613,7 @@ impl crate::store::GraphStore for SqliteGraphStore {
             let date_range_str: Option<String> = row.get(3)?;
             let agg_str: String = row.get(4)?;
             let topic_str: String = row.get(5)?;
-            let created_str: String = row.get(7)?;
+            let created_str: String = row.get(8)?;
             Ok(crate::note::EpisodeDigest {
                 id: row.get(0)?,
                 episode_id: row.get(1)?,
@@ -620,8 +621,8 @@ impl crate::store::GraphStore for SqliteGraphStore {
                 date_range: date_range_str.and_then(|s| serde_json::from_str(&s).ok()),
                 aggregations: serde_json::from_str(&agg_str).unwrap_or_default(),
                 topic_sequence: serde_json::from_str(&topic_str).unwrap_or_default(),
-                digest_text: String::new(), // Not stored in SQLite, lives in the MemoryNote
-                digest_note_id: row.get(6)?,
+                digest_text: row.get(6)?,
+                digest_note_id: row.get(7)?,
                 created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
                     .unwrap_or_default().with_timezone(&chrono::Utc),
             })
@@ -637,7 +638,7 @@ impl crate::store::GraphStore for SqliteGraphStore {
     async fn get_all_episode_digests(&self) -> Result<Vec<crate::note::EpisodeDigest>> {
         let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn.prepare(
-            "SELECT id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest_note_id, created_at FROM episode_digests ORDER BY created_at"
+            "SELECT id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest_text, digest_note_id, created_at FROM episode_digests ORDER BY created_at"
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
         let digests = stmt.query_map([], |row| {
@@ -645,7 +646,7 @@ impl crate::store::GraphStore for SqliteGraphStore {
             let date_range_str: Option<String> = row.get(3)?;
             let agg_str: String = row.get(4)?;
             let topic_str: String = row.get(5)?;
-            let created_str: String = row.get(7)?;
+            let created_str: String = row.get(8)?;
             Ok(crate::note::EpisodeDigest {
                 id: row.get(0)?,
                 episode_id: row.get(1)?,
@@ -653,8 +654,8 @@ impl crate::store::GraphStore for SqliteGraphStore {
                 date_range: date_range_str.and_then(|s| serde_json::from_str(&s).ok()),
                 aggregations: serde_json::from_str(&agg_str).unwrap_or_default(),
                 topic_sequence: serde_json::from_str(&topic_str).unwrap_or_default(),
-                digest_text: String::new(),
-                digest_note_id: row.get(6)?,
+                digest_text: row.get(6)?,
+                digest_note_id: row.get(7)?,
                 created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
                     .unwrap_or_default().with_timezone(&chrono::Utc),
             })

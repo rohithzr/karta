@@ -181,7 +181,7 @@ impl WriteEngine {
         // 10. Store atomic facts (each with its own embedding for fine-grained retrieval)
         if !attrs.atomic_facts.is_empty() {
             let fact_texts: Vec<&str> = attrs.atomic_facts.iter()
-                .take(5) // Cap at 5 facts per note
+                .take(self.config.max_facts_per_note)
                 .map(|f| f.content.as_str())
                 .collect();
 
