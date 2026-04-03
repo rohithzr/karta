@@ -9,6 +9,8 @@ pub enum DreamType {
     Abduction,
     Consolidation,
     Contradiction,
+    EpisodeDigest,
+    CrossEpisodeDigest,
 }
 
 impl DreamType {
@@ -19,6 +21,8 @@ impl DreamType {
             Self::Abduction => "abduction",
             Self::Consolidation => "consolidation",
             Self::Contradiction => "contradiction",
+            Self::EpisodeDigest => "episode_digest",
+            Self::CrossEpisodeDigest => "cross_episode_digest",
         }
     }
 
@@ -29,6 +33,8 @@ impl DreamType {
             "abduction" => Some(Self::Abduction),
             "consolidation" => Some(Self::Consolidation),
             "contradiction" => Some(Self::Contradiction),
+            "episode_digest" => Some(Self::EpisodeDigest),
+            "cross_episode_digest" => Some(Self::CrossEpisodeDigest),
             _ => None,
         }
     }

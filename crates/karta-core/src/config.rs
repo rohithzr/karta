@@ -193,6 +193,8 @@ impl Default for DreamConfig {
                 "abduction".into(),
                 "consolidation".into(),
                 "contradiction".into(),
+                "episode_digest".into(),
+                "cross_episode_digest".into(),
             ],
         }
     }

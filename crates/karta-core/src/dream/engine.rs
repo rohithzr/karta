@@ -176,6 +176,52 @@ impl DreamEngine {
             }
         }
 
+        // --- Episode Digests (Phase Next) ---
+        if enabled.contains(&DreamType::EpisodeDigest) {
+            let undigested = self.graph_store.get_undigested_episode_ids().await?;
+            debug!(count = undigested.len(), "Undigested episodes found");
+
+            for episode_id in &undigested {
+                if let Ok(Some(episode)) = self.graph_store.get_episode(&episode_id).await {
+                    if episode.note_ids.len() >= 2 {
+                        let note_refs: Vec<&str> = episode.note_ids.iter().map(|s| s.as_str()).collect();
+                        if let Ok(ep_notes) = self.vector_store.get_many(&note_refs).await {
+                            match self.dream_episode_digest(&episode, &ep_notes).await {
+                                Ok((dream, tokens)) => {
+                                    total_tokens += tokens;
+                                    if dream.would_write {
+                                        let _ = self.persist_dream(&dream).await;
+                                    }
+                                    dreams.push(dream);
+                                }
+                                Err(e) => debug!(episode_id = %episode_id, error = %e, "Episode digest failed"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Cross-Episode Digests (Phase Next) ---
+        if enabled.contains(&DreamType::CrossEpisodeDigest) {
+            let all_digests = self.graph_store.get_all_episode_digests().await?;
+            if all_digests.len() >= 3 {
+                for chunk in all_digests.chunks(10) {
+                    if chunk.len() < 3 { continue; }
+                    match self.dream_cross_episode_digest(chunk).await {
+                        Ok((dream, tokens)) => {
+                            total_tokens += tokens;
+                            if dream.would_write && !self.is_duplicate_dream(&dream).await.unwrap_or(false) {
+                                let _ = self.persist_dream(&dream).await;
+                            }
+                            dreams.push(dream);
+                        }
+                        Err(e) => debug!(error = %e, "Cross-episode digest failed"),
+                    }
+                }
+            }
+        }
+
         // Update dream cursor
         self.graph_store.set_dream_cursor(Utc::now()).await?;
 
@@ -659,5 +705,226 @@ impl DreamEngine {
         );
 
         Ok(())
+    }
+
+    // --- Episode Digest Dreams (Phase Next) ---
+
+    async fn dream_episode_digest(
+        &self,
+        episode: &crate::note::Episode,
+        notes: &[MemoryNote],
+    ) -> Result<(DreamRecord, u64)> {
+        use crate::llm::Prompts;
+        use crate::note::{
+            AggregationEntry, DateRange, EntityMention, EpisodeDigest, NoteStatus, Provenance,
+        };
+
+        let notes_text: String = notes.iter().enumerate()
+            .map(|(i, n)| format!("[{}] {}\n    Context: {}", i + 1, n.content, n.context))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let prompt = Prompts::episode_digest(&notes_text);
+        let messages = vec![crate::llm::ChatMessage {
+            role: crate::llm::Role::User,
+            content: prompt,
+        }];
+        let config = crate::llm::GenConfig {
+            max_tokens: 4096,
+            temperature: 0.0,
+            json_mode: true,
+            json_schema: None,
+        };
+
+        let response = self.llm.chat(&messages, &config).await?;
+        let tokens = response.tokens_used;
+        let parsed: serde_json::Value = serde_json::from_str(&response.content).unwrap_or_default();
+
+        let confidence = parsed["confidence"].as_f64().unwrap_or(0.7) as f32;
+        let digest_text = parsed["digest_text"].as_str().unwrap_or("").to_string();
+
+        // Parse structured fields
+        let entities: Vec<EntityMention> = parsed["entities"].as_array()
+            .map(|a| a.iter().filter_map(|v| {
+                Some(EntityMention {
+                    name: v["name"].as_str()?.to_string(),
+                    entity_type: v["type"].as_str().unwrap_or("other").to_string(),
+                    count: v["count"].as_u64().unwrap_or(1) as u32,
+                    latest_value: v["latest_value"].as_str().map(String::from),
+                })
+            }).collect())
+            .unwrap_or_default();
+
+        let date_range = parsed["date_range"].as_object().and_then(|obj| {
+            Some(DateRange {
+                earliest: obj.get("earliest")?.as_str()?.to_string(),
+                latest: obj.get("latest")?.as_str()?.to_string(),
+            })
+        });
+
+        let aggregations: Vec<AggregationEntry> = parsed["aggregations"].as_array()
+            .map(|a| a.iter().filter_map(|v| {
+                Some(AggregationEntry {
+                    label: v["label"].as_str()?.to_string(),
+                    count: v["count"].as_u64().unwrap_or(0) as u32,
+                    items: v["items"].as_array()
+                        .map(|arr| arr.iter().filter_map(|i| i.as_str().map(String::from)).collect())
+                        .unwrap_or_default(),
+                })
+            }).collect())
+            .unwrap_or_default();
+
+        let topic_sequence: Vec<String> = parsed["topic_sequence"].as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        // Create digest note for ANN searchability
+        let mut digest_note_id = None;
+        if !digest_text.is_empty() {
+            let embedding = self.llm.embed(&[&digest_text]).await?
+                .into_iter().next().unwrap_or_default();
+
+            let note = MemoryNote {
+                id: Uuid::new_v4().to_string(),
+                content: digest_text.clone(),
+                context: format!("Episode digest for episode {}", episode.id),
+                keywords: vec!["digest".to_string(), "episode".to_string()],
+                tags: vec!["digest".to_string()],
+                links: Vec::new(),
+                embedding,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                evolution_history: Vec::new(),
+                provenance: Provenance::Digest { episode_id: episode.id.clone() },
+                confidence,
+                status: NoteStatus::Active,
+                last_accessed_at: Utc::now(),
+                turn_index: None,
+                source_timestamp: None,
+            };
+
+            digest_note_id = Some(note.id.clone());
+            self.vector_store.upsert(&note).await?;
+        }
+
+        // Store structured digest in SQLite
+        let digest = EpisodeDigest {
+            id: Uuid::new_v4().to_string(),
+            episode_id: episode.id.clone(),
+            entities,
+            date_range,
+            aggregations,
+            topic_sequence,
+            digest_text: digest_text.clone(),
+            digest_note_id: digest_note_id.clone(),
+            created_at: Utc::now(),
+        };
+        self.graph_store.upsert_episode_digest(&digest).await?;
+
+        debug!(
+            episode_id = %episode.id,
+            entities = digest.entities.len(),
+            aggregations = digest.aggregations.len(),
+            "Episode digest created"
+        );
+
+        let dream = DreamRecord {
+            id: Uuid::new_v4().to_string(),
+            dream_type: DreamType::EpisodeDigest,
+            source_note_ids: notes.iter().map(|n| n.id.clone()).collect(),
+            reasoning: format!("Digest for episode {} with {} notes", episode.id, notes.len()),
+            dream_content: digest_text,
+            confidence,
+            would_write: digest_note_id.is_some(),
+            written_note_id: digest_note_id,
+            created_at: Utc::now(),
+        };
+
+        Ok((dream, tokens))
+    }
+
+    async fn dream_cross_episode_digest(
+        &self,
+        digests: &[crate::note::EpisodeDigest],
+    ) -> Result<(DreamRecord, u64)> {
+        use crate::llm::Prompts;
+
+        let digests_text: String = digests.iter().enumerate()
+            .map(|(i, d)| format!(
+                "[Episode {} ({})] {}\n  Entities: {}\n  Topics: {}",
+                i + 1,
+                d.episode_id,
+                d.digest_text,
+                d.entities.iter().map(|e| format!("{}({})", e.name, e.count)).collect::<Vec<_>>().join(", "),
+                d.topic_sequence.join(" → "),
+            ))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let prompt = Prompts::cross_episode_digest(&digests_text);
+        let messages = vec![crate::llm::ChatMessage {
+            role: crate::llm::Role::User,
+            content: prompt,
+        }];
+        let config = crate::llm::GenConfig {
+            max_tokens: 4096,
+            temperature: 0.0,
+            json_mode: true,
+            json_schema: None,
+        };
+
+        let response = self.llm.chat(&messages, &config).await?;
+        let tokens = response.tokens_used;
+        let parsed: serde_json::Value = serde_json::from_str(&response.content).unwrap_or_default();
+
+        let confidence = parsed["confidence"].as_f64().unwrap_or(0.6) as f32;
+        let digest_text = parsed["digest_text"].as_str().unwrap_or("").to_string();
+
+        // Create episode links from entity timelines
+        if let Some(timelines) = parsed["entity_timeline"].as_array() {
+            for timeline in timelines {
+                let entity_name = timeline["name"].as_str().unwrap_or("");
+                if let Some(changes) = timeline["changes"].as_array() {
+                    let episode_ids: Vec<&str> = changes.iter()
+                        .filter_map(|c| c["episode_id"].as_str())
+                        .collect();
+
+                    // Link each pair of episodes for this entity
+                    for window in episode_ids.windows(2) {
+                        if window.len() == 2 {
+                            let has_value_change = changes.iter()
+                                .filter(|c| c["episode_id"].as_str() == Some(window[0]) || c["episode_id"].as_str() == Some(window[1]))
+                                .map(|c| c["value"].as_str().unwrap_or(""))
+                                .collect::<std::collections::HashSet<_>>()
+                                .len() > 1;
+
+                            let link_type = if has_value_change { "value_update" } else { "entity_continuity" };
+                            let reason = format!("{} appears in both episodes", entity_name);
+                            let _ = self.graph_store.add_episode_link(
+                                window[0], window[1], link_type, Some(entity_name), &reason
+                            ).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        let source_ids: Vec<String> = digests.iter()
+            .filter_map(|d| d.digest_note_id.clone())
+            .collect();
+
+        let dream = DreamRecord {
+            id: Uuid::new_v4().to_string(),
+            dream_type: DreamType::CrossEpisodeDigest,
+            source_note_ids: source_ids,
+            reasoning: format!("Cross-episode digest across {} episodes", digests.len()),
+            dream_content: digest_text,
+            confidence,
+            would_write: confidence >= self.config.write_threshold,
+            written_note_id: None,
+            created_at: Utc::now(),
+        };
+
+        Ok((dream, tokens))
     }
 }
