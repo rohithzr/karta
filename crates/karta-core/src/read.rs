@@ -394,14 +394,18 @@ impl ReadEngine {
             QueryMode::Recency => 0.60,
             _ => self.config.recency_weight,
         };
-        // Parallel search: notes + atomic facts
+        // Parallel search: notes + atomic facts (if enabled)
         let fact_k = fetch_k / 2;
-        let (direct_result, fact_hits_result) = tokio::join!(
-            self.vector_store.find_similar(&query_embedding, fetch_k, &[]),
-            self.vector_store.find_similar_facts(&query_embedding, fact_k, &[])
-        );
-        let direct = direct_result?;
-        let fact_hits = fact_hits_result.unwrap_or_default();
+        let (direct, fact_hits) = if self.config.fact_retrieval_enabled {
+            let (direct_result, fact_hits_result) = tokio::join!(
+                self.vector_store.find_similar(&query_embedding, fetch_k, &[]),
+                self.vector_store.find_similar_facts(&query_embedding, fact_k, &[])
+            );
+            (direct_result?, fact_hits_result.unwrap_or_default())
+        } else {
+            let direct = self.vector_store.find_similar(&query_embedding, fetch_k, &[]).await?;
+            (direct, Vec::new())
+        };
 
         // Collect active foresight source note IDs for boosting
         let active_foresight_note_ids: std::collections::HashSet<String> = self
@@ -548,7 +552,7 @@ impl ReadEngine {
         for r in &flat_results { seen_note_ids.insert(r.note.id.clone()); }
         for id in &episode_note_ids { seen_note_ids.insert(id.clone()); }
 
-        let fact_boost = 0.1f32;
+        let fact_boost = self.config.fact_match_boost;
         for (fact, score) in &fact_hits {
             if *score < 0.3 { continue; }
             if seen_note_ids.contains(&fact.source_note_id) { continue; }
