@@ -464,6 +464,20 @@ impl WriteEngine {
                         .collect()
                 })
                 .unwrap_or_default(),
+            atomic_facts: parsed["atomic_facts"]
+                .as_array()
+                .or_else(|| parsed["atomicFacts"].as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| {
+                            Some(crate::note::AtomicFactExtraction {
+                                content: v["content"].as_str()?.to_string(),
+                                subject: v["subject"].as_str().map(String::from),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 

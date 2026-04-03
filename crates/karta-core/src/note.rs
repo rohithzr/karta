@@ -110,6 +110,14 @@ pub enum Provenance {
     Episode {
         episode_id: String,
     },
+    /// Atomic fact extracted from a note.
+    Fact {
+        source_note_id: String,
+    },
+    /// Episode digest produced by dream engine.
+    Digest {
+        episode_id: String,
+    },
 }
 
 /// Result of a similarity search.
@@ -156,6 +164,16 @@ pub struct NoteAttributes {
     /// Forward-looking statements extracted from the content.
     #[serde(default)]
     pub foresight_signals: Vec<ForesightExtraction>,
+    /// Atomic facts extracted from the content (1-5 discrete statements).
+    #[serde(default)]
+    pub atomic_facts: Vec<AtomicFactExtraction>,
+}
+
+/// A single atomic fact as extracted by the LLM (before embedding/storage).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtomicFactExtraction {
+    pub content: String,
+    pub subject: Option<String>,
 }
 
 /// LLM decision about whether to link two notes.
@@ -239,6 +257,91 @@ impl Episode {
             narrative_note_id: None,
         }
     }
+}
+
+// ─── Atomic Facts (Phase Next) ─────────────────────────────────────────────
+
+/// A single, independently verifiable statement extracted from a MemoryNote.
+/// Each fact gets its own embedding in a dedicated LanceDB table for fine-grained retrieval.
+/// Intentionally lightweight: the fact IS the embedding unit. No context/keywords/tags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtomicFact {
+    pub id: String,
+    /// The atomic statement text.
+    pub content: String,
+    /// ID of the parent MemoryNote this fact was extracted from.
+    pub source_note_id: String,
+    /// Position within the source note's fact list (0-indexed, preserves micro-ordering).
+    pub ordinal: u32,
+    /// Primary entity or topic for aggregation grouping (e.g., "Flask", "budget", "Coco").
+    pub subject: Option<String>,
+    /// Embedding vector (stored in LanceDB atomic_facts table).
+    #[serde(skip)]
+    pub embedding: Vec<f32>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl AtomicFact {
+    pub fn new(content: String, source_note_id: String, ordinal: u32) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            content,
+            source_note_id,
+            ordinal,
+            subject: None,
+            embedding: Vec::new(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+// ─── Episode Digests (Phase Next) ──────────────────────────────────────────
+
+/// Structured metadata produced by dream-time analysis of an episode.
+/// Contains pre-computed entities, date ranges, aggregations, and topic ordering.
+/// The digest_text is also stored as a MemoryNote for ANN searchability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeDigest {
+    pub id: String,
+    pub episode_id: String,
+    /// Named entities with their types and mention counts.
+    pub entities: Vec<EntityMention>,
+    /// Date range covered by the episode (extracted from note content, not timestamps).
+    pub date_range: Option<DateRange>,
+    /// Pre-computed aggregation summaries (e.g., "5 movies discussed: [list]").
+    pub aggregations: Vec<AggregationEntry>,
+    /// Topics in the order they appeared in the episode.
+    pub topic_sequence: Vec<String>,
+    /// Retrieval-optimized summary text (also stored as a MemoryNote).
+    pub digest_text: String,
+    /// ID of the MemoryNote storing the digest_text (for vector search).
+    pub digest_note_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityMention {
+    pub name: String,
+    /// Type: "person", "tool", "framework", "project", "date", "number", "other".
+    pub entity_type: String,
+    pub count: u32,
+    /// Most recent value if this entity was updated during the episode.
+    pub latest_value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DateRange {
+    pub earliest: String, // ISO date string
+    pub latest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregationEntry {
+    /// Human-readable label (e.g., "movies discussed").
+    pub label: String,
+    pub count: u32,
+    /// The individual items (e.g., ["Inception", "Matrix", "Coco"]).
+    pub items: Vec<String>,
 }
 
 // ─── Note Lifecycle (Phase 3.1) ─────────────────────────────────────────────

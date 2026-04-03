@@ -758,6 +758,12 @@ impl ReadEngine {
                 Provenance::Episode { episode_id } => {
                     format!("EPISODE:{}", episode_id)
                 }
+                Provenance::Fact { source_note_id } => {
+                    format!("FACT:from-{}", &source_note_id[..8.min(source_note_id.len())])
+                }
+                Provenance::Digest { episode_id } => {
+                    format!("DIGEST:{}", &episode_id[..8.min(episode_id.len())])
+                }
             };
             // Use source_timestamp (real conversation date) if available, fall back to created_at
             let display_time = note.source_timestamp.unwrap_or(note.created_at);
