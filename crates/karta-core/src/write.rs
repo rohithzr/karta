@@ -178,6 +178,42 @@ impl WriteEngine {
             }
         }
 
+        // 10. Store atomic facts (each with its own embedding for fine-grained retrieval)
+        if !attrs.atomic_facts.is_empty() {
+            let fact_texts: Vec<&str> = attrs.atomic_facts.iter()
+                .take(5) // Cap at 5 facts per note
+                .map(|f| f.content.as_str())
+                .collect();
+
+            match self.llm.embed(&fact_texts).await {
+                Ok(fact_embeddings) => {
+                    for (i, (extraction, embedding)) in attrs.atomic_facts.iter()
+                        .take(5)
+                        .zip(fact_embeddings)
+                        .enumerate()
+                    {
+                        let mut fact = crate::note::AtomicFact::new(
+                            extraction.content.clone(),
+                            note.id.clone(),
+                            i as u32,
+                        );
+                        fact.subject = extraction.subject.clone();
+                        fact.embedding = embedding;
+                        fact.created_at = note.created_at;
+
+                        let _ = self.vector_store.upsert_fact(&fact).await;
+                        let _ = self.graph_store.record_fact(
+                            &fact.id, &note.id, i as u32, fact.subject.as_deref()
+                        ).await;
+                    }
+                    debug!(count = fact_texts.len(), note_id = %note.id, "Stored atomic facts");
+                }
+                Err(e) => {
+                    debug!(error = %e, "Failed to embed atomic facts, skipping");
+                }
+            }
+        }
+
         info!(note_id = %note.id, links = note.links.len(), "Note stored");
 
         Ok(note)
