@@ -12,27 +12,29 @@
 | P1-fix | 56.4% | +reranker reorder, mode-specific fetch_k | 2026-04-01 |
 | All-fixes | 57.8% | +embed classifier, note sorting, source timestamps, parallel questions | 2026-04-02 |
 | A.3 (retry) | **57.7%** | +insufficient-info retry for Computation/Temporal | 2026-04-02 |
+| Phase Next (unfiltered) | 50.7% | +atomic facts, episode digests, episode links | 2026-04-03 (regression) |
+| Phase Next + ANN filter | 52.2% | Filter Dream/Digest/Fact from direct ANN | 2026-04-03 |
+| Phase Next + wired digests | 53.0% | +structured digest query for Computation/Breadth | 2026-04-04 |
 | Honcho reference | 63.0% | Their system | Published number |
 
 Note: 57.7-57.8% are within LLM non-determinism range (~3pp variance between identical runs).
 The true improvement from Day 2 optimal (51.3%) to Day 4 is +6.4pp.
+Phase Next runs use re-ingested data (different notes from expanded attribute prompt).
 
-### Per-Ability Comparison (All Runs)
+### Per-Ability Comparison (Key Runs)
 
-| Ability | Day 2 Opt (51.3%) | P0 (56.8%) | P0+P1+P2 (55.3%) | All-fixes (57.8%) | Best |
-|---------|-------------------|------------|-------------------|-------------------|------|
-| preference_following | 80% | 84% | 80% | 78% | **84% (P0)** |
-| contradiction_resolution | 52% | 61% | 63% | **71%** | **71% (all-fixes)** |
-| instruction_following | 54% | 66% | 68% | 68% | **68%** |
-| abstention | 60% | 65% | 62% | 68% | **68% (all-fixes)** |
-| information_extraction | 50% | 58% | 51% | **63%** | **63% (all-fixes)** |
-| summarization | 64% | 61% | 64% | 62% | **64%** |
-| multi_session_reasoning | 53% | 71% | 62% | 61% | **71% (P0)** |
-| temporal_reasoning | 40% | 49% | 41% | 45% | **49% (P0)** |
-| knowledge_update | 45% | 40% | 40% | 38% | **45% (Day 2)** |
-| event_ordering | 31% | 35% | 35% | 37% | **37% (all-fixes)** |
-| knowledge_update | 45% | 40% | 40% | **45% (Day 2)** |
-| event_ordering | 31% | 35% | 35% | **35%** |
+| Ability | Day 2 (51.3%) | Best pre-PN (57.7%) | PN unfiltered (50.7%) | PN wired (53.0%) | All-time Best |
+|---------|---------------|----------------------|-----------------------|------------------|---------------|
+| preference_following | 80% | 78% | 70% | 70% | **84% (P0)** |
+| abstention | 60% | 68% | 70% | 68% | **72% (P1-fix)** |
+| contradiction_resolution | 52% | 67% | 52% | 50% | **71% (all-fixes)** |
+| multi_session_reasoning | 53% | 66% | 65% | **66%** | **71% (P0)** |
+| instruction_following | 54% | 64% | 56% | 56% | **68% (all-fixes)** |
+| summarization | 64% | 61% | 57% | **64%** | **64%** |
+| information_extraction | 50% | 63% | 53% | 58% | **63% (all-fixes)** |
+| temporal_reasoning | 40% | 53% | 36% | 39% | **53% (A.3)** |
+| knowledge_update | 45% | 40% | 33% | 33% | **45% (Day 2)** |
+| event_ordering | 31% | 36% | 33% | **36%** | **37% (all-fixes)** |
 
 ---
 
@@ -452,4 +454,92 @@ All runs on identical BEAM 100K dataset, same judge model, same ingested data (f
 | All-fixes | 57.8% | +1.4pp (note sorting + source timestamps) |
 | A.3 (retry) | 57.7% | flat (temporal +8pp offset by noise) |
 
-True signal: **51.3% → ~57.5% (+6.2pp)** after removing noise. Remaining gap to Honcho (63%): 5.5pp. Next phase: atomic facts + episode digests.
+True signal: **51.3% → ~57.5% (+6.2pp)** after removing noise. Remaining gap to Honcho (63%): 5.5pp.
+
+---
+
+## Phase Next: Atomic Facts + Episode Digests (2026-04-03 to 2026-04-04)
+
+### What Was Built
+
+7 commit groups implementing:
+- **Atomic facts**: each note decomposed into 1-5 independently embedded facts in a separate LanceDB table
+- **Episode digests**: dream engine produces structured metadata per episode (entities with types/counts/latest_value, date ranges, aggregations, topic sequences)
+- **Episode links**: cross-episode digest creates entity_continuity and value_update links between episodes
+- **Three-level retrieval**: parallel note + fact ANN search, fact-to-note expansion, episode link traversal, structured digest query
+
+### Results
+
+| Run | Score | Delta from Baseline | What Changed |
+|-----|-------|--------------------|-|
+| Baseline (Day 4 best) | 57.7% | — | Pre-Phase Next |
+| Phase Next (unfiltered) | 50.7% | -7.0pp | Dream/digest/fact notes crowded ANN |
+| + ANN filter | 52.2% | -5.5pp | Filter Dream/Digest/Fact from direct ANN |
+| + Structured digest query | 53.0% | -4.7pp | Keyword match against digest aggregations/entities |
+
+### Root Causes of Regression
+
+**RC1: Dream/digest notes diluted ANN results (-7pp, fixed -5.5pp by filter)**
+Each conversation produced 60-95 dream/digest notes stored in the same `notes` LanceDB table. These competed with original user notes for top-K ANN slots. When the system retrieved 5 notes, 2-3 were digests/dreams instead of originals with specific details.
+
+Fix: filter `Provenance::Dream`, `Provenance::Digest`, `Provenance::Fact` from direct ANN results. These note types are surfaced through dedicated paths (contradiction force-retrieval, episode drilldown, fact-to-note expansion).
+
+**RC2: Expanded attribute prompt changed note quality (-4.7pp, partially mitigated)**
+Adding "Extract 1-5 atomic facts" to the attribute extraction prompt changed the LLM's output for ALL fields (context, keywords, tags), not just facts. The same note content produces slightly different (not better) attributes when the LLM juggles 6 output fields instead of 5. This is a re-ingestion effect: the baseline data dirs have different notes from the Phase Next data dirs.
+
+Evidence: 57% of regressions occurred at the same note count with different note content. Zero UUID overlap between runs (expected with fresh ingestion).
+
+**RC3: Atomic fact decomposition fractures contradiction context (-19pp contradiction)**
+When a note says "I use Excel" and later "I have never used Excel", the baseline kept both in rich context fields. Phase Next splits them into separate atomic facts. Retrieval may find only one side, breaking contradiction detection.
+
+Evidence: 8 of 40 contradiction questions lost their `has_contradiction` flag between runs.
+
+### Bugs Found and Fixed
+
+**Bug 1: Episode links used "Episode 1" instead of UUIDs.** The cross-episode digest LLM returned display labels instead of real episode IDs. All episode links pointed to nonexistent episodes. Fixed: build label-to-UUID mapping and resolve before creating links.
+
+**Bug 2: Only 38-46% of episodes had digests.** The `>= 2 notes` guard excluded single-note episodes. Fixed: changed to `>= 1`.
+
+**Bug 3: Structured digest data never queried.** The episode digests contained the answers ("250ms", "165 commits", "78%") but the read path only used digests through ANN search (filtered out) or episode link traversal (broken by Bug 1). Fixed: added structured keyword query against `entities_json` and `aggregations_json` for Computation/Breadth/Recency queries.
+
+### What the Structured Data Actually Contains
+
+Per the data analysis of stored digests:
+- **Entities are rich**: named entities with types, counts, latest values. Numbers, frameworks, tools, dates, people tracked.
+- **Aggregations are populated**: labeled groups with counts and item lists (e.g., "classification problems completed (count=15)").
+- **Most rubric answers ARE findable** in digest data: "250ms" found in 3 digests, "165" in 2 digests, "78%" in digests.
+- **Some answers missing**: "Four features" not found as "four", date "April 5" not found (but "2024" found).
+
+### Architectural Lessons
+
+1. **Never store derived notes (dreams, digests, facts) in the same ANN table as original notes.** They crowd out the originals that contain the actual user information. Derived notes must be surfaced through dedicated paths only.
+
+2. **Expanding structured output fields degrades quality across ALL fields.** The LLM has a fixed "quality budget" per call. Adding atomic_facts to the attribute prompt didn't just add facts — it slightly degraded context, keywords, and tags. The fix is to split fact extraction into a separate parallel LLM call.
+
+3. **Features that aren't wired into the read path don't exist.** The episode digests contained the answers for weeks of development. But the read path never queried the structured JSON fields. Building storage without retrieval is wasted work.
+
+4. **Episode link IDs must be validated against real data.** LLMs hallucinate IDs. Any system that creates graph edges from LLM output must validate that the referenced nodes exist.
+
+5. **Re-ingestion changes the baseline.** Any change to the write path (even adding a field to the prompt) creates a new baseline. You can't compare Phase Next results against pre-Phase Next baselines because the underlying notes are different. Apples to oranges.
+
+### What Would Move the Needle
+
+1. **Split fact extraction into parallel LLM call** — restore attribute quality, keep facts as supplementary
+2. **Validate Phase Next against its own baseline** — run pre-Phase Next code on Phase Next data to isolate the prompt effect
+3. **Improve structured digest query** — current keyword matching is crude. Entity-type-aware matching ("movies" should match entities with type="movie") would be more precise
+4. **Fix fact-to-note expansion threshold** — current 0.3 score threshold may be too aggressive. Lower it and see if facts actually surface relevant parent notes
+5. **Cache structured digest query results** — loading all digests from SQLite on every search is slow. Cache in memory.
+
+### Variance Tracker (Updated)
+
+| Run | Score | Notes |
+|-----|-------|-------|
+| Day 2 Opt | 51.3% | Starting point |
+| P0 | 56.8% | +5.5pp (structural) |
+| All-fixes | 57.8% | +1.4pp (note sorting + timestamps) |
+| A.3 (retry) | 57.7% | Best pre-Phase Next |
+| PN unfiltered | 50.7% | -7.0pp (ANN dilution) |
+| PN + filter | 52.2% | +1.5pp (filter fix) |
+| PN + wired | 53.0% | +0.8pp (structured query) |
+
+Phase Next on re-ingested data stabilizes at ~53%. The ~4.7pp gap to baseline (57.7%) is from re-ingestion variance (different notes from expanded prompt). The structural features (facts, digests, links) add ~2.3pp back when properly wired but can't overcome the base note quality change.
