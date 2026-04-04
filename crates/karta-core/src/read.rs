@@ -611,8 +611,86 @@ impl ReadEngine {
             debug!(count = linked_digest_results.len(), "Episode-linked digest notes");
         }
 
-        // Merge: profiles → linked digests → episode-drilled → fact-expanded → flat hits
+        // --- Structured digest query ---
+        // For Computation/Breadth queries, search episode digests' structured data directly.
+        // Digests contain pre-computed aggregations, entity counts, and date ranges
+        // that answer "how many X" and "what is the current Y" questions directly.
+        let mut digest_matched_results: Vec<SearchResult> = Vec::new();
+        if matches!(mode, QueryMode::Computation | QueryMode::Breadth | QueryMode::Recency) {
+            let all_digests = self.graph_store.get_all_episode_digests().await?;
+            let query_lower = query.to_lowercase();
+
+            for digest in &all_digests {
+                // Check if digest entities or aggregations mention query terms
+                let mut matched = false;
+
+                // Search entities
+                for entity in &digest.entities {
+                    if query_lower.contains(&entity.name.to_lowercase())
+                        || entity.name.to_lowercase().contains(&query_lower.split_whitespace()
+                            .filter(|w| w.len() > 3)
+                            .next().unwrap_or(""))
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+
+                // Search aggregations
+                if !matched {
+                    for agg in &digest.aggregations {
+                        if query_lower.contains(&agg.label.to_lowercase()) {
+                            matched = true;
+                            break;
+                        }
+                        for item in &agg.items {
+                            if query_lower.contains(&item.to_lowercase()) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Search digest text for query keywords
+                if !matched && !digest.digest_text.is_empty() {
+                    let digest_lower = digest.digest_text.to_lowercase();
+                    let query_words: Vec<&str> = query_lower.split_whitespace()
+                        .filter(|w| w.len() > 3)
+                        .collect();
+                    let match_count = query_words.iter()
+                        .filter(|w| digest_lower.contains(*w))
+                        .count();
+                    if match_count >= 2 || (query_words.len() <= 3 && match_count >= 1) {
+                        matched = true;
+                    }
+                }
+
+                if matched {
+                    if let Some(ref note_id) = digest.digest_note_id {
+                        if seen_note_ids.insert(note_id.clone()) {
+                            if let Ok(Some(digest_note)) = self.vector_store.get(note_id).await {
+                                if digest_note.is_active() {
+                                    digest_matched_results.push(SearchResult {
+                                        note: digest_note,
+                                        score: 0.8, // High score: structured match is strong signal
+                                        linked_notes: Vec::new(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !digest_matched_results.is_empty() {
+                debug!(count = digest_matched_results.len(), "Structurally matched episode digests");
+            }
+        }
+
+        // Merge: profiles → structurally matched digests → linked digests → episode-drilled → fact-expanded → flat hits
         let mut results = profile_results;
+        results.extend(digest_matched_results);
         results.extend(linked_digest_results);
         results.extend(episode_results);
         results.extend(fact_expanded);

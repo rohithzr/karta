@@ -183,7 +183,7 @@ impl DreamEngine {
 
             for episode_id in &undigested {
                 if let Ok(Some(episode)) = self.graph_store.get_episode(&episode_id).await {
-                    if episode.note_ids.len() >= 2 {
+                    if !episode.note_ids.is_empty() {
                         let note_refs: Vec<&str> = episode.note_ids.iter().map(|s| s.as_str()).collect();
                         if let Ok(ep_notes) = self.vector_store.get_many(&note_refs).await {
                             match self.dream_episode_digest(&episode, &ep_notes).await {
@@ -854,9 +854,17 @@ impl DreamEngine {
     ) -> Result<(DreamRecord, u64)> {
         use crate::llm::Prompts;
 
+        // Build mapping from display labels to real episode UUIDs
+        // The LLM may return "Episode 1" or the UUID — we need to resolve both
+        let mut label_to_uuid: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for (i, d) in digests.iter().enumerate() {
+            label_to_uuid.insert(format!("Episode {}", i + 1), d.episode_id.clone());
+            label_to_uuid.insert(d.episode_id.clone(), d.episode_id.clone()); // UUID maps to itself
+        }
+
         let digests_text: String = digests.iter().enumerate()
             .map(|(i, d)| format!(
-                "[Episode {} ({})] {}\n  Entities: {}\n  Topics: {}",
+                "[Episode {} (id={})] {}\n  Entities: {}\n  Topics: {}",
                 i + 1,
                 d.episode_id,
                 d.digest_text,
@@ -886,19 +894,28 @@ impl DreamEngine {
         let digest_text = parsed["digest_text"].as_str().unwrap_or("").to_string();
 
         // Create episode links from entity timelines
+        // Resolve LLM-returned episode IDs ("Episode 1" or UUID) to real UUIDs
         if let Some(timelines) = parsed["entity_timeline"].as_array() {
             for timeline in timelines {
                 let entity_name = timeline["name"].as_str().unwrap_or("");
                 if let Some(changes) = timeline["changes"].as_array() {
-                    let episode_ids: Vec<&str> = changes.iter()
-                        .filter_map(|c| c["episode_id"].as_str())
+                    // Resolve each episode_id through the label mapping
+                    let episode_ids: Vec<String> = changes.iter()
+                        .filter_map(|c| {
+                            let raw = c["episode_id"].as_str()?;
+                            label_to_uuid.get(raw).cloned()
+                        })
                         .collect();
 
                     // Link each pair of episodes for this entity
                     for window in episode_ids.windows(2) {
                         if window.len() == 2 {
                             let has_value_change = changes.iter()
-                                .filter(|c| c["episode_id"].as_str() == Some(window[0]) || c["episode_id"].as_str() == Some(window[1]))
+                                .filter(|c| {
+                                    let resolved = c["episode_id"].as_str()
+                                        .and_then(|r| label_to_uuid.get(r));
+                                    resolved == Some(&window[0]) || resolved == Some(&window[1])
+                                })
                                 .map(|c| c["value"].as_str().unwrap_or(""))
                                 .collect::<std::collections::HashSet<_>>()
                                 .len() > 1;
@@ -906,7 +923,7 @@ impl DreamEngine {
                             let link_type = if has_value_change { "value_update" } else { "entity_continuity" };
                             let reason = format!("{} appears in both episodes", entity_name);
                             let _ = self.graph_store.add_episode_link(
-                                window[0], window[1], link_type, Some(entity_name), &reason
+                                &window[0], &window[1], link_type, Some(entity_name), &reason
                             ).await;
                         }
                     }
