@@ -180,24 +180,41 @@ fn check_must_contain(answer: &str, pattern: &str) -> bool {
         .any(|alt| answer_norm.contains(&normalize_for_matching(alt)))
 }
 
-/// Flatten all user messages from sessions into individual notes for ingestion.
-/// In a real BEAM run, you'd ingest conversation turns chronologically.
-fn sessions_to_notes(sessions: &[Session]) -> Vec<String> {
-    let mut notes = Vec::new();
+/// Ingest all user messages from sessions into Karta with session-aware episode creation.
+async fn ingest_sessions(karta: &Karta, sessions: &[Session]) -> usize {
+    let mut count = 0usize;
+    let mut global_turn: u32 = 0;
     for session in sessions {
+        let session_id = format!("session-{}", session.session_id);
+
+        // Parse session label as date for source_timestamp
+        let source_timestamp = if session.label.is_empty() {
+            None
+        } else {
+            chrono::NaiveDate::parse_from_str(session.label, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|dt| dt.and_utc())
+        };
+
         for msg in &session.messages {
             if msg.role == "user" {
-                // Prefix with session label for temporal context
                 let note = if session.label.is_empty() {
                     msg.content.to_string()
                 } else {
                     format!("[{}] {}", session.label, msg.content)
                 };
-                notes.push(note);
+                let result = karta
+                    .add_note_with_metadata(&note, &session_id, Some(global_turn), source_timestamp)
+                    .await
+                    .unwrap();
+                count += 1;
+                global_turn += 1;
+                println!("  Note {}: {} links", count, result.links.len());
             }
         }
     }
-    notes
+    count
 }
 
 fn data_dir(prefix: &str, scenario_name: &str) -> String {
@@ -221,7 +238,8 @@ async fn create_karta_mock(scenario_name: &str) -> Karta {
         Arc::new(SqliteGraphStore::new(&dir).unwrap()) as Arc<dyn GraphStore>;
     let llm = Arc::new(MockLlmProvider::new()) as Arc<dyn LlmProvider>;
 
-    let config = KartaConfig::default();
+    let mut config = KartaConfig::default();
+    config.episode.enabled = true;
     Karta::new(vector_store, graph_store, llm, config)
         .await
         .unwrap()
@@ -235,6 +253,7 @@ async fn create_karta_real(scenario_name: &str) -> Karta {
 
     let mut config = KartaConfig::default();
     config.storage.data_dir = dir;
+    config.episode.enabled = true;
 
     Karta::with_defaults(config)
         .await
@@ -686,14 +705,9 @@ async fn run_beam_benchmark(scenarios: &[BeamScenario], use_real_llm: bool) -> B
             create_karta_mock(scenario.name).await
         };
 
-        // --- Ingest phase ---
-        let notes = sessions_to_notes(&scenario.sessions);
+        // --- Ingest phase (session-aware for episode creation) ---
         let ingest_start = Instant::now();
-
-        for (i, note) in notes.iter().enumerate() {
-            let result = karta.add_note(note).await.unwrap();
-            println!("  Note {}: {} links", i + 1, result.links.len());
-        }
+        ingest_sessions(&karta, &scenario.sessions).await;
 
         let ingest_ms = ingest_start.elapsed().as_millis();
         let note_count = karta.note_count().await.unwrap();
@@ -723,7 +737,7 @@ async fn run_beam_benchmark(scenarios: &[BeamScenario], use_real_llm: bool) -> B
             metrics.questions_total += 1;
 
             let query_start = Instant::now();
-            let answer = karta.ask(q.question, 5).await.unwrap();
+            let answer = karta.ask(q.question, 5).await.unwrap().answer;
             let query_ms = query_start.elapsed().as_millis();
             metrics.query_latencies_ms.push(query_ms);
             report.total_query_ms += query_ms;
@@ -954,11 +968,8 @@ async fn beam_real_with_dreaming() {
 
         let karta = create_karta_real(&format!("dream-{}", scenario.name)).await;
 
-        // Ingest
-        let notes = sessions_to_notes(&scenario.sessions);
-        for note in &notes {
-            karta.add_note(note).await.unwrap();
-        }
+        // Ingest (session-aware for episode creation)
+        ingest_sessions(&karta, &scenario.sessions).await;
 
         let pre_dream_count = karta.note_count().await.unwrap();
         println!("  Notes before dreaming: {}", pre_dream_count);
@@ -988,7 +999,7 @@ async fn beam_real_with_dreaming() {
 
         // Query (post-dream)
         for q in &scenario.questions {
-            let answer = karta.ask(q.question, 5).await.unwrap();
+            let answer = karta.ask(q.question, 5).await.unwrap().answer;
             println!(
                 "\n  [{}] Q: {}",
                 q.ability.as_str(),

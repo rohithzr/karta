@@ -42,8 +42,8 @@ impl Default for RerankerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            abstention_threshold: 0.1, // Jina raw scores: >0.5 = relevant, <0.1 = abstain
-            max_rerank: 10,
+            abstention_threshold: 0.01, // Jina raw scores: low threshold to avoid false abstention
+            max_rerank: 20,
         }
     }
 }

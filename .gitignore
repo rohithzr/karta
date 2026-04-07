@@ -26,6 +26,8 @@ SKILL.md
 # Test results
 .results/
 *.txt
+findings.md
+plan.md
 
 # OS
 .DS_Store

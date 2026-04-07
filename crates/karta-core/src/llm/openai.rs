@@ -14,7 +14,7 @@ use tracing::warn;
 use super::traits::*;
 use crate::error::{KartaError, Result};
 
-const MAX_RETRIES: u32 = 3;
+const MAX_RETRIES: u32 = 5;
 const INITIAL_BACKOFF_MS: u64 = 1000;
 
 /// Internal enum to hold either OpenAI or Azure client.

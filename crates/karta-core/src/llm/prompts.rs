@@ -3,13 +3,23 @@ pub struct Prompts;
 
 impl Prompts {
     pub fn note_attributes_system() -> &'static str {
-        "You are a memory indexing system. Given a piece of information, extract structured attributes.\n\
+        "You are a memory indexing system. Given a piece of information, extract structured attributes.\n\n\
+         Also extract 1-5 atomic facts. Each fact should be:\n\
+         - A single, self-contained statement that makes sense without context\n\
+         - Independently verifiable (not \"he said\" but \"John said\")\n\
+         - Include specific values, dates, numbers when present\n\
+         - Each fact about ONE thing\n\
+         Example: \"I'm using Flask 2.3.1 on Python 3.11 and my budget is $500\" becomes:\n\
+           1. \"The user is using Flask version 2.3.1\" (subject: \"Flask\")\n\
+           2. \"The user is using Python version 3.11\" (subject: \"Python\")\n\
+           3. \"The user's budget is $500\" (subject: \"budget\")\n\n\
          Respond with JSON only in this exact shape:\n\
          {\n\
            \"context\": \"A rich 1-2 sentence description capturing deeper meaning, implications, and why this matters — not just a restatement of the content. Include any specific dates or deadlines mentioned.\",\n\
            \"keywords\": [\"5 to 8 specific terms that would help find this note\"],\n\
            \"tags\": [\"3 to 5 categorical labels like: preference, decision, constraint, workflow, entity, pattern\"],\n\
-           \"foresightSignals\": [\"forward-looking statements: deadlines, scheduled events, plans, predictions, intentions. Include the time reference if present. Empty array if none.\"]\n\
+           \"foresightSignals\": [{\"content\": \"forward-looking statement with time reference\", \"valid_until\": \"YYYY-MM-DD or null\"}],\n\
+           \"atomic_facts\": [{\"content\": \"single atomic statement\", \"subject\": \"primary entity or null\"}]\n\
          }"
     }
 
@@ -59,19 +69,17 @@ impl Prompts {
          from the notes that are relevant to the query. \
          Cite which notes informed each part of your answer.\n\n\
          CRITICAL RULES:\n\n\
-         1. ABSTENTION: Before answering, assess whether the notes ACTUALLY contain information \
-         that DIRECTLY answers the question. Ask yourself: \"Do these notes talk about what is being asked?\" \
-         If the question asks about topic X but the notes only discuss topic Y (even if Y is related), \
-         you MUST abstain. Say \"Based on the available memories, I don't have information about [topic].\" \
-         Examples of when to abstain:\n\
-         - Question asks about the user's background, but notes only discuss a current project\n\
-         - Question asks about revenue, but notes only discuss costs\n\
-         - Question asks about a person not mentioned in any note\n\
+         1. COMPLETENESS: Answer the question using ONLY the provided notes. \
+         If the notes contain partial information, provide what you can and indicate what is missing. \
          Do NOT fabricate, guess, or infer answers from general knowledge. \
-         Do NOT answer a different question than what was asked just because you have related notes.\n\n\
+         Do NOT answer a different question than what was asked just because you have related notes. \
+         If the notes are about a completely different topic than the question, say so naturally in your answer.\n\n\
          2. CONTRADICTIONS: If notes contain contradictory information, explicitly flag the contradiction. \
          State both sides and note which is more recent or authoritative. \
-         Do NOT silently resolve contradictions — surface them.\n\n\
+         Do NOT silently resolve contradictions — surface them. \
+         Notes marked [CONTRADICTION SOURCE] are both sides of a detected contradiction. \
+         Present BOTH sides explicitly with specific quotes and ask which is correct. \
+         Do NOT silently choose one side.\n\n\
          3. TEMPORAL REASONING: Pay close attention to dates and time references in notes. \
          When computing durations or ordering events, show your work: \
          state the specific dates, then calculate. \
@@ -79,9 +87,12 @@ impl Prompts {
          4. PROVENANCE: Each note is tagged with provenance and age:\n\
          - FACT = directly observed information\n\
          - INFERRED:{type} = derived by reasoning (deduction, induction, abduction, etc.)\n\
+         - FACT:from-{id} = atomic fact extracted from a note; highly precise for specific values\n\
+         - DIGEST:{id} = episode summary with pre-computed counts and entity tracking; treat aggregation counts as authoritative\n\
          Treat FACT notes as authoritative. Treat INFERRED notes as supporting evidence \
          but flag them as inferences when they are central to your answer. \
-         When FACT and INFERRED notes conflict, prioritize the FACT.\n\n\
+         When FACT and INFERRED notes conflict, prioritize the FACT. \
+         DIGEST notes contain pre-computed aggregations — use their counts rather than re-counting from individual notes.\n\n\
          5. RECENCY: More recent notes generally supersede older ones on the same topic. \
          When answering about current state, prefer the most recent note.\n\n\
          6. FORMAT: Match the format the user expects. \
@@ -225,13 +236,65 @@ impl Prompts {
     }
 
     pub fn episode_narrative_system() -> &'static str {
-        "Synthesize a concise 1-2 sentence narrative summary of this conversational episode.\n\
+        "Synthesize a concise 2-3 sentence narrative summary of this conversational episode.\n\
          Capture the key topic, decisions, and outcomes — not a transcript.\n\
-         Respond with JSON: { \"narrative\": \"...\", \"topicTags\": [\"2-4 topic labels\"] }"
+         Also provide a chronological list of the main topics or events discussed, \
+         in the exact order they appear in the notes. This ordering is critical.\n\
+         Respond with JSON: { \"narrative\": \"...\", \"topicTags\": [\"2-4 topic labels\"], \
+         \"topicOrder\": [\"first topic\", \"second topic\", \"third topic\"] }"
     }
 
     pub fn episode_narrative_user(notes_text: &str) -> String {
         format!("Episode notes:\n{}", notes_text)
+    }
+
+    // --- Episode Digest prompts (Phase Next) ---
+
+    pub fn episode_digest(notes_text: &str) -> String {
+        format!(
+            "Analyze this episode's notes and produce a structured digest.\n\n\
+             Extract:\n\
+             1. entities: every named entity (person, tool, framework, project, date, number) \
+                with type and mention count. If an entity's value was updated during the episode, \
+                record the LATEST value.\n\
+             2. date_range: earliest and latest dates mentioned IN THE CONTENT (not timestamps).\n\
+             3. aggregations: countable collections (e.g., '5 movies discussed: [list]').\n\
+             4. topic_sequence: topics in the ORDER they appeared.\n\
+             5. digest_text: A 2-4 sentence summary that embeds well for retrieval. \
+                Include specific names, numbers, and dates.\n\n\
+             Notes:\n{}\n\n\
+             Respond with JSON:\n\
+             {{\n\
+               \"entities\": [{{\"name\": \"...\", \"type\": \"person|tool|framework|project|date|number|other\", \
+                 \"count\": 1, \"latest_value\": \"...or null\"}}],\n\
+               \"date_range\": {{\"earliest\": \"YYYY-MM-DD\", \"latest\": \"YYYY-MM-DD\"}} or null,\n\
+               \"aggregations\": [{{\"label\": \"movies discussed\", \"count\": 5, \"items\": [\"...\"]}}],\n\
+               \"topic_sequence\": [\"first topic\", \"second topic\"],\n\
+               \"digest_text\": \"retrieval-optimized summary\",\n\
+               \"confidence\": 0.8\n\
+             }}",
+            notes_text
+        )
+    }
+
+    pub fn cross_episode_digest(episode_digests_text: &str) -> String {
+        format!(
+            "You are analyzing digests from multiple episodes to find cross-episode patterns.\n\n\
+             For each entity that appears in 2+ episodes, track how its value changed over time.\n\
+             Identify aggregations that span episodes (total unique items across all episodes).\n\
+             Find the overall topic progression across episodes.\n\n\
+             Episode digests:\n{}\n\n\
+             Respond with JSON:\n\
+             {{\n\
+               \"entity_timeline\": [{{\"name\": \"...\", \"type\": \"...\", \
+                 \"changes\": [{{\"episode_id\": \"...\", \"value\": \"...\"}}]}}],\n\
+               \"cross_aggregations\": [{{\"label\": \"...\", \"count\": 0, \"items\": [\"...\"]}}],\n\
+               \"topic_progression\": [\"...\"],\n\
+               \"digest_text\": \"cross-episode summary optimized for retrieval\",\n\
+               \"confidence\": 0.7\n\
+             }}",
+            episode_digests_text
+        )
     }
 
     pub fn dream_contradiction(notes_text: &str) -> String {

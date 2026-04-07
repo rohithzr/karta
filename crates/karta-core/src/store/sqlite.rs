@@ -115,6 +115,45 @@ impl crate::store::GraphStore for SqliteGraphStore {
                 PRIMARY KEY (note_id, episode_id)
             );
             CREATE INDEX IF NOT EXISTS idx_note_episodes_episode ON note_episodes(episode_id);
+
+            -- Atomic facts metadata (Phase Next)
+            CREATE TABLE IF NOT EXISTS atomic_facts (
+                id TEXT PRIMARY KEY,
+                source_note_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL DEFAULT 0,
+                subject TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_facts_source ON atomic_facts(source_note_id);
+            CREATE INDEX IF NOT EXISTS idx_facts_subject ON atomic_facts(subject);
+
+            -- Episode digests (Phase Next)
+            CREATE TABLE IF NOT EXISTS episode_digests (
+                id TEXT PRIMARY KEY,
+                episode_id TEXT NOT NULL UNIQUE,
+                entities_json TEXT NOT NULL DEFAULT '[]',
+                date_range_json TEXT,
+                aggregations_json TEXT NOT NULL DEFAULT '[]',
+                topic_sequence_json TEXT NOT NULL DEFAULT '[]',
+                digest_text TEXT NOT NULL DEFAULT '',
+                digest_note_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_digests_episode ON episode_digests(episode_id);
+
+            -- Episode links (Phase Next)
+            CREATE TABLE IF NOT EXISTS episode_links (
+                from_episode_id TEXT NOT NULL,
+                to_episode_id TEXT NOT NULL,
+                link_type TEXT NOT NULL,
+                entity TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (from_episode_id, to_episode_id, link_type, entity)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ep_links_from ON episode_links(from_episode_id);
+            CREATE INDEX IF NOT EXISTS idx_ep_links_to ON episode_links(to_episode_id);
+            CREATE INDEX IF NOT EXISTS idx_ep_links_entity ON episode_links(entity);
             ",
         )
         .map_err(|e| KartaError::GraphStore(e.to_string()))?;
@@ -546,5 +585,146 @@ impl crate::store::GraphStore for SqliteGraphStore {
             )
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         Ok(count as usize)
+    }
+
+    // --- Episode Digests (Phase Next) ---
+
+    async fn upsert_episode_digest(&self, digest: &crate::note::EpisodeDigest) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let entities_json = serde_json::to_string(&digest.entities)?;
+        let date_range_json = digest.date_range.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default());
+        let aggregations_json = serde_json::to_string(&digest.aggregations)?;
+        let topic_sequence_json = serde_json::to_string(&digest.topic_sequence)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO episode_digests (id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest_text, digest_note_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![digest.id, digest.episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest.digest_text, digest.digest_note_id, digest.created_at.to_rfc3339()],
+        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_episode_digest(&self, episode_id: &str) -> Result<Option<crate::note::EpisodeDigest>> {
+        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest_text, digest_note_id, created_at FROM episode_digests WHERE episode_id = ?1"
+        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+
+        let result = stmt.query_row(rusqlite::params![episode_id], |row| {
+            let entities_str: String = row.get(2)?;
+            let date_range_str: Option<String> = row.get(3)?;
+            let agg_str: String = row.get(4)?;
+            let topic_str: String = row.get(5)?;
+            let created_str: String = row.get(8)?;
+            Ok(crate::note::EpisodeDigest {
+                id: row.get(0)?,
+                episode_id: row.get(1)?,
+                entities: serde_json::from_str(&entities_str).unwrap_or_default(),
+                date_range: date_range_str.and_then(|s| serde_json::from_str(&s).ok()),
+                aggregations: serde_json::from_str(&agg_str).unwrap_or_default(),
+                topic_sequence: serde_json::from_str(&topic_str).unwrap_or_default(),
+                digest_text: row.get(6)?,
+                digest_note_id: row.get(7)?,
+                created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                    .unwrap_or_default().with_timezone(&chrono::Utc),
+            })
+        });
+
+        match result {
+            Ok(digest) => Ok(Some(digest)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(KartaError::GraphStore(e.to_string())),
+        }
+    }
+
+    async fn get_all_episode_digests(&self) -> Result<Vec<crate::note::EpisodeDigest>> {
+        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest_text, digest_note_id, created_at FROM episode_digests ORDER BY created_at"
+        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+
+        let digests = stmt.query_map([], |row| {
+            let entities_str: String = row.get(2)?;
+            let date_range_str: Option<String> = row.get(3)?;
+            let agg_str: String = row.get(4)?;
+            let topic_str: String = row.get(5)?;
+            let created_str: String = row.get(8)?;
+            Ok(crate::note::EpisodeDigest {
+                id: row.get(0)?,
+                episode_id: row.get(1)?,
+                entities: serde_json::from_str(&entities_str).unwrap_or_default(),
+                date_range: date_range_str.and_then(|s| serde_json::from_str(&s).ok()),
+                aggregations: serde_json::from_str(&agg_str).unwrap_or_default(),
+                topic_sequence: serde_json::from_str(&topic_str).unwrap_or_default(),
+                digest_text: row.get(6)?,
+                digest_note_id: row.get(7)?,
+                created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                    .unwrap_or_default().with_timezone(&chrono::Utc),
+            })
+        }).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+
+        Ok(digests.filter_map(|r| r.ok()).collect())
+    }
+
+    async fn get_undigested_episode_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT e.id FROM episodes e LEFT JOIN episode_digests d ON e.id = d.episode_id WHERE d.id IS NULL"
+        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+
+        let ids = stmt.query_map([], |row| row.get(0))
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        Ok(ids.filter_map(|r| r.ok()).collect())
+    }
+
+    // --- Atomic Fact Metadata (Phase Next) ---
+
+    async fn record_fact(&self, fact_id: &str, source_note_id: &str, ordinal: u32, subject: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO atomic_facts (id, source_note_id, ordinal, subject) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![fact_id, source_note_id, ordinal, subject],
+        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_facts_by_subject(&self, subject: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM atomic_facts WHERE subject = ?1 ORDER BY created_at"
+        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let ids = stmt.query_map(rusqlite::params![subject], |row| row.get(0))
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        Ok(ids.filter_map(|r| r.ok()).collect())
+    }
+
+    // --- Episode Links (Phase Next) ---
+
+    async fn add_episode_link(&self, from_id: &str, to_id: &str, link_type: &str, entity: Option<&str>, reason: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO episode_links (from_episode_id, to_episode_id, link_type, entity, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![from_id, to_id, link_type, entity, reason],
+        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_episode_links(&self, episode_id: &str) -> Result<Vec<(String, String, Option<String>)>> {
+        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT to_episode_id, link_type, entity FROM episode_links WHERE from_episode_id = ?1 UNION SELECT from_episode_id, link_type, entity FROM episode_links WHERE to_episode_id = ?1"
+        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let links = stmt.query_map(rusqlite::params![episode_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        }).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        Ok(links.filter_map(|r| r.ok()).collect())
+    }
+
+    async fn get_episodes_for_entity(&self, entity: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT from_episode_id FROM episode_links WHERE entity = ?1 AND link_type = 'entity_continuity' UNION SELECT DISTINCT to_episode_id FROM episode_links WHERE entity = ?1 AND link_type = 'entity_continuity'"
+        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let ids = stmt.query_map(rusqlite::params![entity], |row| row.get(0))
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        Ok(ids.filter_map(|r| r.ok()).collect())
     }
 }

@@ -46,13 +46,13 @@ async fn real_eval_user_preference_linking() {
     }
 
     println!("\n--- Query 1 ---");
-    let answer = karta.ask("What should I know before building a notification system for Sarah?", 5).await.unwrap();
+    let answer = karta.ask("What should I know before building a notification system for Sarah?", 5).await.unwrap().answer;
     println!("A: {}\n", answer);
     assert!(check_contains(&answer, "Slack"), "Should mention Slack");
     assert!(check_contains(&answer, "Sarah"), "Should mention Sarah");
 
     println!("--- Query 2 ---");
-    let answer = karta.ask("What constraints exist for Brightline integrations?", 5).await.unwrap();
+    let answer = karta.ask("What constraints exist for Brightline integrations?", 5).await.unwrap().answer;
     println!("A: {}\n", answer);
     assert!(check_contains(&answer, "vendor|approved"), "Should mention vendor list");
 
@@ -77,7 +77,7 @@ async fn real_eval_retroactive_evolution() {
     }
 
     println!("\n--- Query ---");
-    let answer = karta.ask("What compliance requirements affect the TechCorp contractor onboarding automation?", 5).await.unwrap();
+    let answer = karta.ask("What compliance requirements affect the TechCorp contractor onboarding automation?", 5).await.unwrap().answer;
     println!("A: {}\n", answer);
     assert!(check_contains(&answer, "audit|S3"), "Should mention audit/S3");
     assert!(check_contains(&answer, "SOC|compliance"), "Should mention SOC 2/compliance");
@@ -102,7 +102,7 @@ async fn real_eval_cross_entity() {
     }
 
     println!("\n--- Query ---");
-    let answer = karta.ask("What technical issues should I warn Marcus about before building the Acme CRM sync?", 5).await.unwrap();
+    let answer = karta.ask("What technical issues should I warn Marcus about before building the Acme CRM sync?", 5).await.unwrap().answer;
     println!("A: {}\n", answer);
     assert!(check_contains(&answer, "dedup|deduplication"), "Should mention deduplication");
     assert!(check_contains(&answer, "conflict"), "Should mention conflict resolution");
@@ -127,7 +127,7 @@ async fn real_eval_contradiction() {
     }
 
     println!("\n--- Query ---");
-    let answer = karta.ask("Where should Vanguard Logistics data be processed?", 5).await.unwrap();
+    let answer = karta.ask("Where should Vanguard Logistics data be processed?", 5).await.unwrap().answer;
     println!("A: {}\n", answer);
     assert!(check_contains(&answer, "EU|Frankfurt|eu-central"), "Should mention EU");
     assert!(check_contains(&answer, "US-East|Virginia|us-east"), "Should mention US-East");
@@ -167,7 +167,7 @@ async fn real_eval_long_chain() {
     }
 
     println!("\n--- Query ---");
-    let answer = karta.ask("Can ClearView meet their 2-minute claims processing target? What's blocking it?", 5).await.unwrap();
+    let answer = karta.ask("Can ClearView meet their 2-minute claims processing target? What's blocking it?", 5).await.unwrap().answer;
     println!("A: {}\n", answer);
     assert!(check_contains(&answer, "AS/400|AS400|legacy"), "Should mention AS/400");
     assert!(check_contains(&answer, "nightly|batch|SFTP"), "Should mention batch/SFTP constraint");

@@ -117,6 +117,18 @@ pub struct ReadConfig {
     /// Top-K multiplier for summarization queries (detected by keywords).
     /// Summarization needs broader coverage than factual queries.
     pub summarization_top_k_multiplier: usize,
+    /// Whether to use two-level episode retrieval (ANN on episode narratives → drill into notes).
+    pub episode_retrieval_enabled: bool,
+    /// Max episodes to drill into per query.
+    pub max_episode_drilldowns: usize,
+    /// Max notes to include per drilled episode.
+    pub max_notes_per_episode: usize,
+    /// Min ANN score for an episode narrative to trigger drilldown.
+    pub episode_drilldown_min_score: f32,
+    /// Whether to search atomic facts alongside notes.
+    pub fact_retrieval_enabled: bool,
+    /// Score boost for notes found via fact match.
+    pub fact_match_boost: f32,
 }
 
 impl Default for ReadConfig {
@@ -130,6 +142,12 @@ impl Default for ReadConfig {
             hop_decay_factor: 0.5,
             abstention_threshold: 0.20,
             summarization_top_k_multiplier: 3,
+            episode_retrieval_enabled: true,
+            max_episode_drilldowns: 3,
+            max_notes_per_episode: 10,
+            episode_drilldown_min_score: 0.25,
+            fact_retrieval_enabled: true,
+            fact_match_boost: 0.1,
         }
     }
 }
@@ -144,6 +162,12 @@ pub struct WriteConfig {
     pub evolve_linked_notes: bool,
     /// Max evolutions before a note is flagged for consolidation instead.
     pub max_evolutions_per_note: usize,
+    /// Default TTL in days for foresight signals when no explicit expiry is extracted.
+    pub foresight_default_ttl_days: i64,
+    /// Whether to extract and store atomic facts during note ingestion.
+    pub extract_atomic_facts: bool,
+    /// Maximum number of atomic facts to extract per note.
+    pub max_facts_per_note: usize,
 }
 
 impl Default for WriteConfig {
@@ -153,6 +177,9 @@ impl Default for WriteConfig {
             similarity_threshold: 0.3,
             evolve_linked_notes: true,
             max_evolutions_per_note: 5,
+            foresight_default_ttl_days: 90,
+            extract_atomic_facts: true,
+            max_facts_per_note: 5,
         }
     }
 }
@@ -178,6 +205,8 @@ impl Default for DreamConfig {
                 "abduction".into(),
                 "consolidation".into(),
                 "contradiction".into(),
+                "episode_digest".into(),
+                "cross_episode_digest".into(),
             ],
         }
     }

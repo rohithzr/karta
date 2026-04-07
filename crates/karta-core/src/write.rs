@@ -37,7 +37,13 @@ impl WriteEngine {
     }
 
     pub async fn add_note(&self, content: &str) -> Result<MemoryNote> {
-        info!("Adding note: \"{}...\"", &content[..content.len().min(60)]);
+        let preview_end = {
+            let max = 60;
+            let mut end = content.len().min(max);
+            while end > 0 && !content.is_char_boundary(end) { end -= 1; }
+            end
+        };
+        info!("Adding note: \"{}...\"", &content[..preview_end]);
 
         // 1. Generate attributes + embed raw content in parallel
         let content_owned = content.to_string();
@@ -147,15 +153,64 @@ impl WriteEngine {
         note.links = link_decisions.iter().map(|d| d.note_id.clone()).collect();
 
         // 9. Store foresight signals extracted during attribute generation
+        let default_ttl = chrono::Duration::days(self.config.foresight_default_ttl_days);
         for signal in &attrs.foresight_signals {
-            if !signal.is_empty() {
+            if !signal.content.is_empty() {
+                // Parse valid_until from LLM extraction, fall back to default TTL
+                let valid_until = signal
+                    .valid_until
+                    .as_deref()
+                    .and_then(|s| {
+                        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                            .ok()
+                            .and_then(|d| d.and_hms_opt(23, 59, 59))
+                            .map(|dt| dt.and_utc())
+                    })
+                    .or_else(|| Some(Utc::now() + default_ttl));
+
                 let fs = crate::note::ForesightSignal::new(
-                    signal.clone(),
+                    signal.content.clone(),
                     note.id.clone(),
-                    None, // TODO: parse time references from signal text
+                    valid_until,
                 );
                 self.graph_store.upsert_foresight(&fs).await?;
-                debug!(signal = %signal, "Stored foresight signal");
+                debug!(signal = %signal.content, "Stored foresight signal");
+            }
+        }
+
+        // 10. Store atomic facts (each with its own embedding for fine-grained retrieval)
+        if !attrs.atomic_facts.is_empty() {
+            let fact_texts: Vec<&str> = attrs.atomic_facts.iter()
+                .take(self.config.max_facts_per_note)
+                .map(|f| f.content.as_str())
+                .collect();
+
+            match self.llm.embed(&fact_texts).await {
+                Ok(fact_embeddings) => {
+                    for (i, (extraction, embedding)) in attrs.atomic_facts.iter()
+                        .take(5)
+                        .zip(fact_embeddings)
+                        .enumerate()
+                    {
+                        let mut fact = crate::note::AtomicFact::new(
+                            extraction.content.clone(),
+                            note.id.clone(),
+                            i as u32,
+                        );
+                        fact.subject = extraction.subject.clone();
+                        fact.embedding = embedding;
+                        fact.created_at = note.created_at;
+
+                        let _ = self.vector_store.upsert_fact(&fact).await;
+                        let _ = self.graph_store.record_fact(
+                            &fact.id, &note.id, i as u32, fact.subject.as_deref()
+                        ).await;
+                    }
+                    debug!(count = fact_texts.len(), note_id = %note.id, "Stored atomic facts");
+                }
+                Err(e) => {
+                    debug!(error = %e, "Failed to embed atomic facts, skipping");
+                }
             }
         }
 
@@ -376,6 +431,8 @@ impl WriteEngine {
             confidence: 1.0,
             status: crate::note::NoteStatus::Active,
             last_accessed_at: Utc::now(),
+            turn_index: None,
+            source_timestamp: None,
         };
 
         self.vector_store.upsert(&note).await?;
@@ -422,7 +479,40 @@ impl WriteEngine {
             foresight_signals: parsed["foresight_signals"]
                 .as_array()
                 .or_else(|| parsed["foresightSignals"].as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| {
+                            // Handle both old string format and new object format
+                            if let Some(s) = v.as_str() {
+                                Some(crate::note::ForesightExtraction {
+                                    content: s.to_string(),
+                                    valid_until: None,
+                                })
+                            } else {
+                                Some(crate::note::ForesightExtraction {
+                                    content: v["content"].as_str()?.to_string(),
+                                    valid_until: v["valid_until"]
+                                        .as_str()
+                                        .map(String::from),
+                                })
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            atomic_facts: parsed["atomic_facts"]
+                .as_array()
+                .or_else(|| parsed["atomicFacts"].as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| {
+                            Some(crate::note::AtomicFactExtraction {
+                                content: v["content"].as_str()?.to_string(),
+                                subject: v["subject"].as_str().map(String::from),
+                            })
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
         })
     }

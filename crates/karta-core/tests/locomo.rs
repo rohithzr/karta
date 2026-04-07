@@ -316,7 +316,7 @@ async fn eval_conversation(conv: &LocomoConversation) -> ConvResult {
     for (qi, q) in conv.questions.iter().enumerate() {
         let q_start = Instant::now();
         let answer = match karta.ask(&q.question, 5).await {
-            Ok(a) => a,
+            Ok(result) => result.answer,
             Err(e) => {
                 eprintln!("  Query {} failed: {}", qi + 1, e);
                 continue;

@@ -13,9 +13,11 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use karta_core::config::KartaConfig;
+use karta_core::note::AskResult;
 use karta_core::Karta;
 
 #[derive(serde::Deserialize)]
@@ -49,6 +51,36 @@ struct BeamQuestion {
     question: String,
     reference_answer: String,
     rubric: serde_json::Value,
+}
+
+/// Parse BEAM time_anchor strings into DateTime<Utc>.
+/// BEAM uses formats like "March-15-2024", "2024-03-15", "March 15, 2024", etc.
+fn parse_time_anchor(anchor: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::NaiveDate;
+
+    let anchor = anchor.trim();
+
+    // Try ISO format: "2024-03-15"
+    if let Ok(d) = NaiveDate::parse_from_str(anchor, "%Y-%m-%d") {
+        return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    }
+
+    // Try "March-15-2024"
+    if let Ok(d) = NaiveDate::parse_from_str(anchor, "%B-%d-%Y") {
+        return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    }
+
+    // Try "March 15, 2024"
+    if let Ok(d) = NaiveDate::parse_from_str(anchor, "%B %d, %Y") {
+        return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    }
+
+    // Try "15-March-2024"
+    if let Ok(d) = NaiveDate::parse_from_str(anchor, "%d-%B-%Y") {
+        return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    }
+
+    None
 }
 
 fn load_dataset(path: &str) -> BeamDataset {
@@ -129,6 +161,16 @@ Return your evaluation in JSON format with two fields:
 
 NOTE: ONLY output the json object, without any explanation before or after that"#;
 
+/// LLM-as-judge (Arc version for parallel execution).
+async fn llm_judge_rubric_arc(
+    karta: &Arc<Karta>,
+    question: &str,
+    answer: &str,
+    rubric_item: &str,
+) -> f64 {
+    llm_judge_rubric(karta.as_ref(), question, answer, rubric_item).await
+}
+
 /// LLM-as-judge using the exact BEAM official prompt and 3-tier scoring (1.0/0.5/0.0).
 /// Returns score 0.0, 0.5, or 1.0.
 async fn llm_judge_rubric(
@@ -174,17 +216,102 @@ async fn llm_judge_rubric(
     }
 }
 
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key).ok().map(|s| s == "1" || s == "true").unwrap_or(default)
+}
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn apply_config_env(config: &mut KartaConfig) {
+    config.episode.enabled = env_bool("K_EPISODE", true);
+    config.read.episode_retrieval_enabled = env_bool("K_EPISODE_RETRIEVAL", true);
+    config.read.graph_weight = env_f32("K_GRAPH_WEIGHT", 0.0);
+    config.read.foresight_boost = env_f32("K_FORESIGHT_BOOST", 0.1);
+    config.read.max_episode_drilldowns = env_usize("K_MAX_DRILLDOWNS", 3);
+    config.read.max_notes_per_episode = env_usize("K_MAX_NOTES_EPISODE", 10);
+    config.read.episode_drilldown_min_score = env_f32("K_DRILLDOWN_MIN", 0.25);
+    config.read.recency_weight = env_f32("K_RECENCY_WEIGHT", 0.15);
+    config.read.summarization_top_k_multiplier = env_usize("K_SUMM_TOPK_MULT", 3);
+    config.reranker.enabled = env_bool("K_RERANKER", true);
+    config.reranker.abstention_threshold = env_f32("K_ABSTENTION_THRESH", 0.01);
+    config.reranker.max_rerank = env_usize("K_MAX_RERANK", 20);
+    config.write.foresight_default_ttl_days = env_usize("K_FORESIGHT_TTL", 90) as i64;
+    config.write.extract_atomic_facts = env_bool("K_EXTRACT_FACTS", true);
+    config.read.fact_retrieval_enabled = env_bool("K_FACT_RETRIEVAL", true);
+    config.read.fact_match_boost = env_f32("K_FACT_BOOST", 0.1);
+
+    let exp = std::env::var("K_EXPERIMENT").unwrap_or_else(|_| "default".to_string());
+    println!("  Config [{}]: episode={}, ep_retrieval={}, graph={}, foresight={}, reranker={}, abstention_thresh={}",
+        exp, config.episode.enabled, config.read.episode_retrieval_enabled,
+        config.read.graph_weight, config.read.foresight_boost,
+        config.reranker.enabled, config.reranker.abstention_threshold);
+}
+
+/// Find a data directory for a conversation ID.
+/// If BEAM_DATA_SUFFIX is set, use that exact suffix. Otherwise find the most recently created.
+fn find_latest_data_dir(conv_id: &str) -> Option<String> {
+    // Allow explicit suffix: BEAM_DATA_SUFFIX=8cfad35c → /tmp/karta-beam100k-1-8cfad35c
+    if let Ok(suffix) = std::env::var("BEAM_DATA_SUFFIX") {
+        let path = format!("/tmp/karta-beam100k-{}-{}", conv_id, suffix);
+        if std::path::Path::new(&path).is_dir() {
+            return Some(path);
+        }
+    }
+
+    // Find by birth time (creation time), not modification time.
+    // macOS: std::fs::Metadata has created(). Linux: falls back to modified().
+    let mut dirs: Vec<_> = std::fs::read_dir("/tmp")
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name().to_string_lossy().starts_with(&format!("karta-beam100k-{}-", conv_id))
+                && e.path().is_dir()
+        })
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            let created = meta.created().ok().or_else(|| meta.modified().ok())?;
+            // Verify the dir has actual data (lance table exists)
+            let lance_path = e.path().join("lance/notes.lance/data");
+            let has_data = lance_path.exists();
+            if has_data {
+                Some((e.path().to_string_lossy().to_string(), created))
+            } else {
+                None
+            }
+        })
+        .collect();
+    dirs.sort_by(|a, b| b.1.cmp(&a.1)); // most recently created first
+    dirs.into_iter().next().map(|(path, _)| path)
+}
+
 async fn create_karta(conv_id: &str) -> Karta {
+    // If BEAM_SKIP_INGEST is set, reuse the most recent data dir
+    if env_bool("BEAM_SKIP_INGEST", false) {
+        if let Some(existing_dir) = find_latest_data_dir(conv_id) {
+            println!("  Reusing data dir: {}", existing_dir);
+            let mut config = KartaConfig::default();
+            config.storage.data_dir = existing_dir;
+            apply_config_env(&mut config);
+            return Karta::with_defaults(config)
+                .await
+                .expect("Failed to open existing Karta data dir");
+        } else {
+            panic!("BEAM_SKIP_INGEST=true but no data dir found for conv {}", conv_id);
+        }
+    }
+
     let suffix = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let data_dir = format!("/tmp/karta-beam100k-{}-{}", conv_id, suffix);
     let _ = std::fs::remove_dir_all(&data_dir);
 
     let mut config = KartaConfig::default();
     config.storage.data_dir = data_dir;
-    // Enable reranker for better abstention and relevance scoring
-    config.reranker.enabled = true;
-    config.reranker.abstention_threshold = 0.1; // Jina raw scores: <0.1 = abstain
-    config.reranker.max_rerank = 10;
+
+    apply_config_env(&mut config);
 
     Karta::with_defaults(config)
         .await
@@ -229,92 +356,142 @@ async fn eval_conversation(
     println!("{}", "=".repeat(70));
 
     let karta = create_karta(&conv.id).await;
+    let skip_ingest = env_bool("BEAM_SKIP_INGEST", false);
 
-    // --- Ingest phase ---
-    let ingest_start = Instant::now();
-    let mut ingested = 0;
-    let mut ingest_errors = 0;
+    if skip_ingest {
+        let note_count = karta.note_count().await.unwrap_or(0);
+        println!("  Skip ingest: reusing {} existing notes", note_count);
+    } else {
+        // --- Ingest phase (session-aware for episode creation) ---
+        let ingest_start = Instant::now();
+        let mut ingested = 0;
+        let mut ingest_errors = 0;
+        let mut current_session = 0usize;
+        let mut last_anchor = String::new();
 
-    for (i, msg) in conv.user_messages.iter().enumerate() {
-        if msg.content.trim().is_empty() {
-            continue;
-        }
-
-        // Add time anchor as prefix for temporal context
-        let content = if msg.time_anchor.is_empty() {
-            msg.content.clone()
-        } else {
-            format!("[{}] {}", msg.time_anchor, msg.content)
-        };
-
-        match karta.add_note(&content).await {
-            Ok(note) => {
-                ingested += 1;
-                if (i + 1) % 20 == 0 || i == 0 {
-                    println!("  Ingested {}/{} notes ({} links)", i + 1, conv.user_messages.len(), note.links.len());
-                }
-            }
-            Err(e) => {
-                ingest_errors += 1;
-                if ingest_errors <= 3 {
-                    eprintln!("  WARN: Note {} failed: {}", i + 1, e);
-                }
-            }
-        }
-    }
-
-    let ingest_ms = ingest_start.elapsed().as_millis();
-    println!(
-        "  Ingested {} notes in {:.1}s ({:.1}s/note, {} errors)",
-        ingested,
-        ingest_ms as f64 / 1000.0,
-        ingest_ms as f64 / 1000.0 / ingested.max(1) as f64,
-        ingest_errors
-    );
-
-    // --- Optional: run dreaming ---
-    let dream_start = Instant::now();
-    match karta.run_dreaming("beam100k", &conv.id).await {
-        Ok(run) => {
-            println!(
-                "  Dreaming: {} attempted, {} written ({:.1}s)",
-                run.dreams_attempted,
-                run.dreams_written,
-                dream_start.elapsed().as_millis() as f64 / 1000.0
-            );
-        }
-        Err(e) => eprintln!("  Dreaming failed: {}", e),
-    }
-
-    // --- Query phase ---
-    let mut ability_scores: HashMap<String, (usize, usize)> = HashMap::new();
-    let mut total_passed = 0;
-    let mut total_checks = 0;
-
-    for (qi, q) in conv.questions.iter().enumerate() {
-        let query_start = Instant::now();
-        let answer = match karta.ask(&q.question, 5).await {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("  Query {} failed: {}", qi + 1, e);
+        for (i, msg) in conv.user_messages.iter().enumerate() {
+            if msg.content.trim().is_empty() {
                 continue;
             }
+
+            // Derive session boundaries from time_anchor changes
+            if !msg.time_anchor.is_empty() && msg.time_anchor != last_anchor {
+                current_session += 1;
+                last_anchor = msg.time_anchor.clone();
+            }
+            let session_id = format!("session-{}", current_session);
+
+            // Parse time_anchor into structured timestamp instead of text prefix
+            let source_timestamp = if msg.time_anchor.is_empty() {
+                None
+            } else {
+                parse_time_anchor(&msg.time_anchor)
+            };
+
+            // Still include time_anchor as text prefix for LLM context
+            let content = if msg.time_anchor.is_empty() {
+                msg.content.clone()
+            } else {
+                format!("[{}] {}", msg.time_anchor, msg.content)
+            };
+
+            match karta.add_note_with_metadata(&content, &session_id, Some(i as u32), source_timestamp).await {
+                Ok(note) => {
+                    ingested += 1;
+                    if (i + 1) % 20 == 0 || i == 0 {
+                        println!("  Ingested {}/{} notes ({} links)", i + 1, conv.user_messages.len(), note.links.len());
+                    }
+                }
+                Err(e) => {
+                    ingest_errors += 1;
+                    if ingest_errors <= 3 {
+                        eprintln!("  WARN: Note {} failed: {}", i + 1, e);
+                    }
+                }
+            }
+        }
+
+        let ingest_ms = ingest_start.elapsed().as_millis();
+        println!(
+            "  Ingested {} notes in {:.1}s ({:.1}s/note, {} errors)",
+            ingested,
+            ingest_ms as f64 / 1000.0,
+            ingest_ms as f64 / 1000.0 / ingested.max(1) as f64,
+            ingest_errors
+        );
+
+        // --- Optional: run dreaming ---
+        let dream_start = Instant::now();
+        match karta.run_dreaming("beam100k", &conv.id).await {
+            Ok(run) => {
+                println!(
+                    "  Dreaming: {} attempted, {} written ({:.1}s)",
+                    run.dreams_attempted,
+                    run.dreams_written,
+                    dream_start.elapsed().as_millis() as f64 / 1000.0
+                );
+            }
+            Err(e) => eprintln!("  Dreaming failed: {}", e),
+        }
+    }
+
+    // --- Query phase (parallelized) ---
+    let karta = Arc::new(karta);
+
+    // JSONL debug log setup
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent().unwrap().parent().unwrap();
+    let results_dir = repo_root.join(".results");
+    let _ = std::fs::create_dir_all(&results_dir);
+    let run_ts = std::env::var("BEAM_RUN_ID").unwrap_or_else(|_| {
+        chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string()
+    });
+    let debug_path = std::env::var("BEAM_DEBUG_PATH")
+        .unwrap_or_else(|_| results_dir.join(format!("beam-debug-{}-{}.jsonl", conv.id, run_ts)).to_string_lossy().to_string());
+
+    // Phase 1: Ask questions with bounded concurrency via semaphore
+    let query_concurrency: usize = std::env::var("BEAM_QUERY_CONCURRENCY")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(query_concurrency));
+    let mut ask_handles = Vec::new();
+
+    for (qi, q) in conv.questions.iter().enumerate() {
+        let karta_ref = Arc::clone(&karta);
+        let sem = Arc::clone(&semaphore);
+        let question = q.question.clone();
+        ask_handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let start = Instant::now();
+            let result = karta_ref.ask(&question, 5).await;
+            let ms = start.elapsed().as_millis();
+            (qi, result, ms)
+        }));
+    }
+
+    // Collect all ask results
+    let mut ask_results: Vec<(usize, Option<AskResult>, u128)> = Vec::new();
+    for handle in ask_handles {
+        match handle.await {
+            Ok((qi, Ok(result), ms)) => ask_results.push((qi, Some(result), ms)),
+            Ok((qi, Err(e), ms)) => {
+                eprintln!("  Query {} failed: {}", qi + 1, e);
+                ask_results.push((qi, None, ms));
+            }
+            Err(e) => eprintln!("  Task panicked: {}", e),
+        }
+    }
+    ask_results.sort_by_key(|(qi, _, _)| *qi);
+
+    // Phase 2: Score rubrics in parallel for all questions
+    let mut judge_handles = Vec::new();
+    for (qi, ask_result, _) in &ask_results {
+        let qi = *qi;
+        let q = &conv.questions[qi];
+        let answer = match ask_result {
+            Some(r) => r.answer.clone(),
+            None => continue,
         };
-        let query_ms = query_start.elapsed().as_millis();
 
-        println!(
-            "\n  [{}] Q{}: {}",
-            q.ability,
-            qi + 1,
-            safe_truncate(&q.question, 80)
-        );
-        println!(
-            "  A ({:.1}s): {}",
-            query_ms as f64 / 1000.0,
-            safe_truncate(&answer, 200)
-        );
-
-        // Score against rubric items using LLM-as-judge (BEAM official methodology).
         let rubric_items: Vec<String> = match &q.rubric {
             serde_json::Value::Array(arr) => arr
                 .iter()
@@ -324,40 +501,120 @@ async fn eval_conversation(
             _ => Vec::new(),
         };
 
-        let entry = ability_scores.entry(q.ability.clone()).or_insert((0, 0));
+        for (ri, rubric) in rubric_items.into_iter().enumerate() {
+            let karta_ref = Arc::clone(&karta);
+            let question = q.question.clone();
+            let answer_clone = answer.clone();
+            judge_handles.push(tokio::spawn(async move {
+                let score = llm_judge_rubric_arc(&karta_ref, &question, &answer_clone, &rubric).await;
+                (qi, ri, rubric, score)
+            }));
+        }
+    }
 
-        if rubric_items.is_empty() {
+    // Collect all judge results
+    let mut judge_results: Vec<(usize, usize, String, f64)> = Vec::new();
+    for handle in judge_handles {
+        match handle.await {
+            Ok(result) => judge_results.push(result),
+            Err(e) => eprintln!("  Judge task panicked: {}", e),
+        }
+    }
+    judge_results.sort_by_key(|(qi, ri, _, _)| (*qi, *ri));
+
+    // Phase 3: Aggregate scores and write output (sequential, for consistent logging)
+    let mut ability_scores: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut total_passed = 0;
+    let mut total_checks = 0;
+    let mut debug_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&debug_path)
+        .ok();
+
+    for (qi, ask_result, query_ms) in &ask_results {
+        let q = &conv.questions[*qi];
+        let ask_result = match ask_result {
+            Some(r) => r,
+            None => continue,
+        };
+        let answer = &ask_result.answer;
+
+        println!(
+            "\n  [{}] Q{}: {}",
+            q.ability, qi + 1, safe_truncate(&q.question, 80)
+        );
+        println!(
+            "  A ({:.1}s): {}",
+            *query_ms as f64 / 1000.0, safe_truncate(answer, 200)
+        );
+
+        let entry = ability_scores.entry(q.ability.clone()).or_insert((0, 0));
+        let mut rubric_scores_debug: Vec<serde_json::Value> = Vec::new();
+
+        // Get rubric scores for this question from collected results
+        let q_rubric_scores: Vec<&(usize, usize, String, f64)> = judge_results
+            .iter()
+            .filter(|(qidx, _, _, _)| *qidx == *qi)
+            .collect();
+
+        let beam_score: f64 = if q_rubric_scores.is_empty() {
             entry.1 += 1;
             total_checks += 1;
             if answer.len() > 50 {
                 total_passed += 1;
                 entry.0 += 1;
                 println!("    [PASS] (no rubric, non-trivial answer)");
+                1.0
             } else {
                 println!("    [FAIL] (no rubric, trivial answer)");
+                0.0
             }
         } else {
             let mut rubric_score_sum = 0.0;
-
-            for (ri, rubric) in rubric_items.iter().enumerate() {
+            for (_, ri, rubric, score) in &q_rubric_scores {
                 total_checks += 1;
                 entry.1 += 1;
-
-                // LLM-as-judge scores this rubric item
-                let score = llm_judge_rubric(&karta, &q.question, &answer, rubric).await;
                 rubric_score_sum += score;
 
-                let label = if score >= 1.0 { "FULL" } else if score >= 0.5 { "PART" } else { "FAIL" };
-                // Count >= 0.5 as passed for the binary tally
-                if score >= 0.5 {
+                let label = if *score >= 1.0 { "FULL" } else if *score >= 0.5 { "PART" } else { "FAIL" };
+                if *score >= 0.5 {
                     total_passed += 1;
                     entry.0 += 1;
                 }
                 println!("    [{}] R{}: {:.1} ({})", label, ri + 1, score, safe_truncate(rubric, 70));
-            }
 
-            let avg_score = rubric_score_sum / rubric_items.len() as f64;
-            println!("    → Q{} BEAM score: {:.2}", qi + 1, avg_score);
+                rubric_scores_debug.push(serde_json::json!({
+                    "item": rubric, "score": score, "grade": label,
+                }));
+            }
+            let score = rubric_score_sum / q_rubric_scores.len() as f64;
+            println!("    → Q{} BEAM score: {:.2}", qi + 1, score);
+            score
+        };
+
+        // Write JSONL debug line
+        if let Some(ref mut f) = debug_file {
+            use std::io::Write;
+            let debug_entry = serde_json::json!({
+                "conv_id": conv.id,
+                "category": conv.category,
+                "q_index": qi,
+                "ability": q.ability,
+                "question": q.question,
+                "reference_answer": q.reference_answer,
+                "system_answer": answer,
+                "query_mode": ask_result.query_mode,
+                "notes_used": ask_result.notes_used,
+                "note_ids": ask_result.note_ids,
+                "contradiction_injected": ask_result.contradiction_injected,
+                "has_contradiction": ask_result.has_contradiction,
+                "reranker_best_score": ask_result.reranker_best_score,
+                "rubric_scores": rubric_scores_debug,
+                "beam_score": beam_score,
+                "query_time_ms": query_ms,
+            });
+            let _ = writeln!(f, "{}", debug_entry);
         }
     }
 
@@ -431,22 +688,86 @@ async fn beam_100k_full() {
     println!("BEAM 100K Full Benchmark: {} conversations, {} questions",
         dataset.num_conversations, dataset.total_questions);
 
+    let concurrency: usize = std::env::var("BEAM_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+
+    println!("  Concurrency: {} conversations at a time", concurrency);
+
     let full_start = Instant::now();
     let mut grand_total_q = 0;
     let mut grand_total_passed = 0;
     let mut grand_total_checks = 0;
     let mut grand_ability: HashMap<String, (usize, usize)> = HashMap::new();
 
-    for conv in &dataset.conversations {
-        let (questions, passed, total, ability_scores) = eval_conversation(conv).await;
-        grand_total_q += questions;
-        grand_total_passed += passed;
-        grand_total_checks += total;
+    // Run conversations in parallel batches using tokio JoinSet
+    for chunk in dataset.conversations.chunks(concurrency) {
+        let mut set = tokio::task::JoinSet::new();
+        for conv in chunk {
+            // Clone data into owned types for 'static lifetime
+            let conv_id = conv.id.clone();
+            let conv_category = conv.category.clone();
+            let msgs: Vec<(String, String, String)> = conv
+                .user_messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone(), m.time_anchor.clone()))
+                .collect();
+            let questions: Vec<(String, String, String, serde_json::Value)> = conv
+                .questions
+                .iter()
+                .map(|q| {
+                    (
+                        q.ability.clone(),
+                        q.question.clone(),
+                        q.reference_answer.clone(),
+                        q.rubric.clone(),
+                    )
+                })
+                .collect();
 
-        for (ability, (p, t)) in ability_scores {
-            let entry = grand_ability.entry(ability).or_insert((0, 0));
-            entry.0 += p;
-            entry.1 += t;
+            set.spawn(async move {
+                // Reconstruct the conv reference types
+                let owned_msgs: Vec<BeamMessage> = msgs
+                    .iter()
+                    .map(|(r, c, t)| BeamMessage {
+                        role: r.clone(),
+                        content: c.clone(),
+                        time_anchor: t.clone(),
+                    })
+                    .collect();
+                let owned_qs: Vec<BeamQuestion> = questions
+                    .iter()
+                    .map(|(a, q, ra, rub)| BeamQuestion {
+                        ability: a.clone(),
+                        question: q.clone(),
+                        reference_answer: ra.clone(),
+                        rubric: rub.clone(),
+                    })
+                    .collect();
+                let owned_conv = BeamConversation {
+                    id: conv_id,
+                    category: conv_category,
+                    title: String::new(),
+                    user_messages: owned_msgs,
+                    total_turns: 0,
+                    questions: owned_qs,
+                };
+                eval_conversation(&owned_conv).await
+            });
+        }
+
+        while let Some(result) = set.join_next().await {
+            let (questions, passed, total, ability_scores) = result.expect("task panicked");
+            grand_total_q += questions;
+            grand_total_passed += passed;
+            grand_total_checks += total;
+
+            for (ability, (p, t)) in ability_scores {
+                let entry = grand_ability.entry(ability).or_insert((0, 0));
+                entry.0 += p;
+                entry.1 += t;
+            }
         }
     }
 
