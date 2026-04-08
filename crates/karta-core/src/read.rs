@@ -368,8 +368,16 @@ impl ReadEngine {
         Ok(weighted_notes.into_iter().map(|(n, _)| n).collect())
     }
 
-    /// Embed query, find top-K with two-level episode retrieval, apply temporal scoring, follow links.
+    /// Public search: returns exactly top_k results. For external callers.
     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+        let mut results = self.search_wide(query, top_k).await?;
+        results.truncate(top_k);
+        Ok(results)
+    }
+
+    /// Internal search: returns the full expanded candidate pool (not truncated).
+    /// Used by ask() so the reranker can see the full pool before truncation.
+    async fn search_wide(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         info!("Searching: \"{}\"", query);
 
         let embeddings = self.llm.embed(&[query]).await?;
@@ -569,16 +577,18 @@ impl ReadEngine {
         for (fact, score) in &fact_hits {
             if *score < 0.3 { continue; }
             if seen_note_ids.insert(fact.source_note_id.clone()) {
-                if let Ok(Some(mut parent)) = self.vector_store.get(&fact.source_note_id).await {
+                if let Ok(Some(parent)) = self.vector_store.get(&fact.source_note_id).await {
                     if parent.is_active() {
-                        // Prepend the matched atomic fact so the synthesis LLM sees
-                        // the exact value/date/name that matched, not just the full note.
-                        parent.content = format!(
+                        // Clone the parent and prepend the matched fact text so the
+                        // synthesis LLM sees the exact value. The clone prevents
+                        // the access-tracking upsert from corrupting stored content.
+                        let mut annotated = parent.clone();
+                        annotated.content = format!(
                             "[Matched fact: {}]\n\n{}",
-                            fact.content, parent.content
+                            fact.content, annotated.content
                         );
                         fact_expanded.push(SearchResult {
-                            note: parent,
+                            note: annotated,
                             score: score + fact_boost,
                             linked_notes: Vec::new(),
                         });
@@ -707,11 +717,14 @@ impl ReadEngine {
         results.extend(fact_expanded);
         results.extend(flat_results);
 
-        // Update last_accessed_at for all returned notes (access tracking for forgetting)
+        // Update last_accessed_at for all returned notes (access tracking for forgetting).
+        // Fetch the original note by ID to avoid persisting any in-memory mutations
+        // (e.g., fact annotation prefixes) back to storage.
         for result in &results {
-            let mut accessed = result.note.clone();
-            accessed.last_accessed_at = Utc::now();
-            let _ = self.vector_store.upsert(&accessed).await;
+            if let Ok(Some(mut original)) = self.vector_store.get(&result.note.id).await {
+                original.last_accessed_at = Utc::now();
+                let _ = self.vector_store.upsert(&original).await;
+            }
         }
 
         info!(
@@ -727,16 +740,10 @@ impl ReadEngine {
     /// Search + deduplicate + synthesize an answer with provenance markers.
     /// Includes abstention calibration: if no notes are sufficiently relevant, abstains.
     pub async fn ask(&self, query: &str, top_k: usize) -> Result<AskResult> {
-        // Use the same classifier as search() for consistent mode across both stages.
-        // Embedding classifier when centroids are available, keyword fallback otherwise.
-        let embeddings = self.llm.embed(&[query]).await?;
-        let query_embedding = embeddings.into_iter().next().unwrap_or_default();
-        let classifier = self.get_classifier().await;
-        let mode = if classifier.centroids.is_empty() {
-            classify_query_keywords(query)
-        } else {
-            classifier.classify(&query_embedding)
-        };
+        // Keyword classification for top_k sizing. The embedding classifier runs
+        // inside search_wide() for retrieval mode selection. We use keywords here
+        // to avoid a duplicate embedding call (paid API, doubles latency).
+        let mode = classify_query_keywords(query);
 
         let effective_top_k = match mode {
             QueryMode::Breadth => top_k * self.config.summarization_top_k_multiplier,
@@ -748,7 +755,7 @@ impl ReadEngine {
         let mode_str = format!("{:?}", mode);
         let mut reranker_best: Option<f32> = None;
 
-        let mut results = self.search(query, effective_top_k).await?;
+        let mut results = self.search_wide(query, effective_top_k).await?;
 
         if results.is_empty() {
             return Ok(AskResult {
