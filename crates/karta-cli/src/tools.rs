@@ -129,9 +129,9 @@ fn format_note(note: &karta_core::note::MemoryNote) -> Value {
         "keywords": note.keywords,
         "tags": note.tags,
         "links": note.links,
-        "provenance": format!("{:?}", note.provenance),
+        "provenance": serde_json::to_value(&note.provenance).unwrap(),
         "confidence": note.confidence,
-        "status": format!("{:?}", note.status),
+        "status": serde_json::to_value(&note.status).unwrap(),
         "created_at": note.created_at.to_rfc3339(),
         "updated_at": note.updated_at.to_rfc3339(),
     })
@@ -246,7 +246,7 @@ pub async fn dispatch(karta: &Arc<Karta>, name: &str, args: &Value) -> Value {
                 None => return tool_error("id is required"),
             };
             match karta.get_note(id).await {
-                Ok(Some(note)) => tool_ok(format_note(&note)),
+                Ok(Some(note)) => tool_ok(json!({ "note": format_note(&note) })),
                 Ok(None) => tool_ok(json!({ "note": null })),
                 Err(e) => {
                     error!(error = %e, "get_note failed");

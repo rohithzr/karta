@@ -15,7 +15,7 @@ use karta_core::{Karta, config::KartaConfig};
 #[command(name = "karta-cli", about = "MCP server for Karta memory system")]
 struct Args {
     /// Data directory for LanceDB + SQLite storage
-    #[arg(long, default_value = "~/Projects/karta/.karta")]
+    #[arg(long, default_value = ".karta")]
     data_dir: String,
 }
 
@@ -56,7 +56,13 @@ async fn main() {
             p.ancestors().nth(3).map(|a| a.join(".env"))
         })
         .filter(|p| p.exists())
-        .unwrap_or_else(|| data_dir.parent().unwrap_or(&data_dir).join(".env"));
+        .unwrap_or_else(|| {
+            data_dir
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(".env")
+        });
+    debug!(env_path = %env_path.display(), "Resolved .env path");
     let _ = dotenvy::from_path(&env_path);
 
     info!(data_dir = %data_dir.display(), "Starting Karta MCP server");
