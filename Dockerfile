@@ -1,4 +1,5 @@
 FROM rust:latest AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p karta-server
