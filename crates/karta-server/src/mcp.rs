@@ -50,6 +50,30 @@ pub struct GetNoteParams {
     pub id: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DreamParams {
+    /// Dream scope type (default: "workspace")
+    #[serde(default = "default_scope_type")]
+    pub scope_type: String,
+    /// Scope identifier (default: "default")
+    #[serde(default = "default_scope_id")]
+    pub scope_id: String,
+}
+
+fn default_scope_type() -> String {
+    "workspace".into()
+}
+
+fn default_scope_id() -> String {
+    "default".into()
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetLinksParams {
+    /// The note ID to get links for
+    pub note_id: String,
+}
+
 // -- MCP Service --
 
 #[derive(Clone)]
@@ -93,6 +117,7 @@ impl KartaService {
                     "keywords": note.keywords,
                     "tags": note.tags,
                     "links": note.links,
+                    "confidence": note.confidence,
                     "created_at": note.created_at.to_rfc3339(),
                 });
                 Ok(CallToolResult::success(vec![Content::text(
@@ -122,6 +147,9 @@ impl KartaService {
                         serde_json::json!({
                             "id": r.note.id,
                             "content": r.note.content,
+                            "context": r.note.context,
+                            "keywords": r.note.keywords,
+                            "confidence": r.note.confidence,
                             "score": r.score,
                             "tags": r.note.tags,
                             "created_at": r.note.created_at.to_rfc3339(),
@@ -155,6 +183,7 @@ impl KartaService {
                     "notes_used": result.notes_used,
                     "note_ids": result.note_ids,
                     "has_contradiction": result.has_contradiction,
+                    "contradiction_injected": result.contradiction_injected,
                 });
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&response).unwrap_or_default(),
@@ -183,7 +212,10 @@ impl KartaService {
                     "keywords": note.keywords,
                     "tags": note.tags,
                     "links": note.links,
+                    "confidence": note.confidence,
+                    "status": note.status,
                     "created_at": note.created_at.to_rfc3339(),
+                    "updated_at": note.updated_at.to_rfc3339(),
                 });
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&response).unwrap_or_default(),
@@ -215,6 +247,60 @@ impl KartaService {
             )),
         }
     }
+
+    /// Run background reasoning over the knowledge graph.
+    #[tool(description = "Run background reasoning over the knowledge graph. Produces new inferred notes via deduction, induction, abduction, consolidation, contradiction detection, and episode digests.")]
+    async fn dream(
+        &self,
+        Parameters(params): Parameters<DreamParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.karta.run_dreaming(&params.scope_type, &params.scope_id).await {
+            Ok(run) => {
+                let types: Vec<String> = run.dreams.iter()
+                    .filter(|d| d.would_write)
+                    .map(|d| d.dream_type.as_str().to_string())
+                    .collect();
+                let response = serde_json::json!({
+                    "dreams_attempted": run.dreams_attempted,
+                    "dreams_written": run.dreams_written,
+                    "notes_inspected": run.notes_inspected,
+                    "types_produced": types,
+                    "total_tokens_used": run.total_tokens_used,
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&response).unwrap_or_default(),
+                )]))
+            }
+            Err(e) => Err(McpError::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Dream failed: {e}"),
+                None,
+            )),
+        }
+    }
+
+    /// Get all note IDs linked to a given note.
+    #[tool(description = "Get all note IDs linked to a given note in the knowledge graph.")]
+    async fn get_links(
+        &self,
+        Parameters(params): Parameters<GetLinksParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.karta.get_links(&params.note_id).await {
+            Ok(links) => {
+                let response = serde_json::json!({
+                    "linked_note_ids": links,
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&response).unwrap_or_default(),
+                )]))
+            }
+            Err(e) => Err(McpError::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Get links failed: {e}"),
+                None,
+            )),
+        }
+    }
 }
 
 #[tool_handler]
@@ -235,6 +321,6 @@ impl ServerHandler for KartaService {
                         .with_sizes(vec!["any".into()]),
                 ]),
         )
-        .with_instructions("Available tools: add_note (store a memory), search (semantic search), ask (RAG-powered Q&A), get_note (retrieve by ID), note_count (total notes)".to_string())
+        .with_instructions("Available tools: add_note (store a memory), search (semantic search), ask (RAG-powered Q&A), get_note (retrieve by ID), note_count (total notes), dream (background reasoning), get_links (linked note IDs)".to_string())
     }
 }
