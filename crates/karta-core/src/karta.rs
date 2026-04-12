@@ -124,7 +124,7 @@ impl Karta {
                 base_url,
             ))
         } else if let Ok(azure_key) = std::env::var("AZURE_OPENAI_API_KEY") {
-            // Azure OpenAI — uses native AzureConfig for correct URL construction
+            // Azure OpenAI
             let endpoint = std::env::var("AZURE_OPENAI_ENDPOINT")
                 .map_err(|_| KartaError::Config(
                     "AZURE_OPENAI_API_KEY is set but AZURE_OPENAI_ENDPOINT is missing".into(),
@@ -134,13 +134,25 @@ impl Karta {
             let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
                 .unwrap_or_else(|_| "2025-04-01-preview".to_string());
 
-            Arc::new(OpenAiProvider::azure(
-                &endpoint,
-                &azure_key,
-                &api_version,
-                &chat_model,
-                &embedding_model,
-            ))
+            // GPT-5.x models require the Responses API, not Chat Completions
+            if chat_model.starts_with("gpt-5") {
+                use crate::llm::AzureResponsesProvider;
+                Arc::new(AzureResponsesProvider::new(
+                    &endpoint,
+                    &azure_key,
+                    &api_version,
+                    &chat_model,
+                    &embedding_model,
+                ))
+            } else {
+                Arc::new(OpenAiProvider::azure(
+                    &endpoint,
+                    &azure_key,
+                    &api_version,
+                    &chat_model,
+                    &embedding_model,
+                ))
+            }
         } else {
             // Standard OpenAI (reads OPENAI_API_KEY from env automatically)
             Arc::new(OpenAiProvider::new(
