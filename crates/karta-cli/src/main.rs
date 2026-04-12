@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tracing::{debug, error, info};
 
 use karta_core::{Karta, config::KartaConfig};
