@@ -49,6 +49,7 @@ fn is_retryable(status: Option<u16>, err_msg: &str) -> bool {
     }
     let lower = err_msg.to_lowercase();
     lower.contains("timeout")
+        || lower.contains("timed out")
         || lower.contains("connection")
         || lower.contains("error sending request")
         || lower.contains("reset by peer")
@@ -101,6 +102,10 @@ impl LlmProvider for AzureResponsesProvider {
             "input": input,
             "max_output_tokens": config.max_tokens,
         });
+
+        if config.temperature != 0.0 {
+            body["temperature"] = json!(config.temperature);
+        }
 
         // Structured output via text.format
         if let Some(ref schema) = config.json_schema {
@@ -210,6 +215,7 @@ impl LlmProvider for AzureResponsesProvider {
                         let data: Value = serde_json::from_str(&text)
                             .map_err(|e| KartaError::Llm(format!("JSON parse error: {e}")))?;
 
+                        let empty = vec![];
                         let embeddings = data["data"]
                             .as_array()
                             .ok_or_else(|| {
@@ -219,7 +225,7 @@ impl LlmProvider for AzureResponsesProvider {
                             .map(|d| {
                                 d["embedding"]
                                     .as_array()
-                                    .unwrap_or(&vec![])
+                                    .unwrap_or(&empty)
                                     .iter()
                                     .filter_map(|v| v.as_f64().map(|f| f as f32))
                                     .collect()
