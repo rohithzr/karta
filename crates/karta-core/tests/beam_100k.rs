@@ -21,6 +21,7 @@ use karta_core::note::AskResult;
 use karta_core::Karta;
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)] // Some fields are parsed for schema completeness but unread by the harness.
 struct BeamDataset {
     split: String,
     num_conversations: usize,
@@ -29,6 +30,7 @@ struct BeamDataset {
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)] // Some fields are parsed for schema completeness but unread by the harness.
 struct BeamConversation {
     id: String,
     category: String,
@@ -87,6 +89,46 @@ fn load_dataset(path: &str) -> BeamDataset {
     let data = std::fs::read_to_string(path)
         .unwrap_or_else(|_| panic!("Cannot read {}. Run: python3 data/convert_beam.py data/beam-100k.parquet data/beam-100k.json", path));
     serde_json::from_str(&data).expect("Invalid JSON in BEAM dataset")
+}
+
+/// Resolve the BEAM dataset path in a CWD-independent way.
+///
+/// `cargo test -p karta-core` runs with CWD set to the crate dir, not the
+/// workspace root, so a bare `data/beam-100k.json` silently misses when the
+/// file actually lives at `<workspace>/data/beam-100k.json`. Resolve in order:
+///   1. `BEAM_DATASET_PATH` env (explicit override, absolute or relative)
+///   2. `data/beam-100k.json` relative to CWD
+///   3. `<CARGO_MANIFEST_DIR>/../../data/beam-100k.json` (workspace root)
+/// Panic loudly if none exist, so a missing dataset fails the test instead
+/// of making it pass with zero work.
+fn resolve_dataset_path() -> String {
+    if let Ok(explicit) = std::env::var("BEAM_DATASET_PATH") {
+        if !Path::new(&explicit).exists() {
+            panic!(
+                "BEAM_DATASET_PATH={} does not exist. Run: python3 data/convert_beam.py data/beam-100k.parquet data/beam-100k.json",
+                explicit
+            );
+        }
+        return explicit;
+    }
+
+    let cwd_relative = "data/beam-100k.json";
+    if Path::new(cwd_relative).exists() {
+        return cwd_relative.to_string();
+    }
+
+    let workspace_relative = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../data/beam-100k.json");
+    if workspace_relative.exists() {
+        return workspace_relative.to_string_lossy().into_owned();
+    }
+
+    panic!(
+        "BEAM dataset not found at any of: BEAM_DATASET_PATH (unset), {}, {}. \
+         Run: python3 data/convert_beam.py data/beam-100k.parquet data/beam-100k.json",
+        cwd_relative,
+        workspace_relative.display()
+    );
 }
 
 /// BEAM official judge prompt (verbatim from github.com/mohammadtavakoli78/BEAM src/prompts.py).
@@ -316,16 +358,6 @@ async fn create_karta(conv_id: &str) -> Karta {
     Karta::with_defaults(config)
         .await
         .expect("Failed to create Karta — check .env credentials")
-}
-
-fn is_stop_word(w: &str) -> bool {
-    matches!(
-        w,
-        "should" | "would" | "could" | "about" | "their"
-            | "there" | "which" | "where" | "these" | "those"
-            | "based" | "response" | "mention" | "state" | "related"
-            | "information" | "provided"
-    )
 }
 
 fn safe_truncate(s: &str, max_bytes: usize) -> &str {
@@ -628,15 +660,7 @@ async fn eval_conversation(
 #[tokio::test]
 #[ignore]
 async fn beam_100k_single() {
-    let dataset_path = std::env::var("BEAM_DATASET_PATH")
-        .unwrap_or_else(|_| "data/beam-100k.json".to_string());
-
-    if !Path::new(&dataset_path).exists() {
-        eprintln!("BEAM dataset not found at {}.", dataset_path);
-        eprintln!("Run: python3 data/convert_beam.py data/beam-100k.parquet data/beam-100k.json");
-        return;
-    }
-
+    let dataset_path = resolve_dataset_path();
     let dataset = load_dataset(&dataset_path);
     let conv_index: usize = std::env::var("BEAM_CONV_INDEX")
         .ok()
@@ -675,15 +699,7 @@ async fn beam_100k_single() {
 #[tokio::test]
 #[ignore]
 async fn beam_100k_full() {
-    let dataset_path = std::env::var("BEAM_DATASET_PATH")
-        .unwrap_or_else(|_| "data/beam-100k.json".to_string());
-
-    if !Path::new(&dataset_path).exists() {
-        eprintln!("BEAM dataset not found at {}.", dataset_path);
-        eprintln!("Run: python3 data/convert_beam.py data/beam-100k.parquet data/beam-100k.json");
-        return;
-    }
-
+    let dataset_path = resolve_dataset_path();
     let dataset = load_dataset(&dataset_path);
     println!("BEAM 100K Full Benchmark: {} conversations, {} questions",
         dataset.num_conversations, dataset.total_questions);
