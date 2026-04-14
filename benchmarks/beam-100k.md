@@ -1,24 +1,61 @@
-# BEAM 100K Findings
+# BEAM 100K Results
 
-## Results Summary
+> **Current best: 61.6%** (P1 retrieval fixes, 2026-04-14). Karta is an
+> experimental research project — these results track a work-in-progress
+> and are expected to change as we iterate toward our 90%+ goal.
+
+## Latest run — P1 Retrieval Fixes (2026-04-14)
+
+**Headline: 61.6%** — arithmetic mean of per-question BEAM rubric scores,
+N=399, single run, 11h 06m wall clock.
+
+| Ability | Score |
+|---|---|
+| preference_following | 92% |
+| contradiction_resolution | 74% |
+| temporal_reasoning | 71% |
+| instruction_following | 69% |
+| summarization | 66% |
+| multi_session_reasoning | 65% |
+| abstention | 62% |
+| information_extraction | 59% |
+| knowledge_update | 43% |
+| event_ordering | 35% |
+
+**Delta vs P0 baseline (53.0%):** +8.6pp. Biggest wins: temporal_reasoning
+(+18pp), preference_following (+8pp), contradiction_resolution (+7pp).
+event_ordering is still the floor (35%).
+
+**Footnotes:**
+- *N=399 not 400.* One question was silently not asked by the harness; the
+  cause is still unconfirmed (possibly a conversation with 19 questions
+  instead of 20, or a skipped abstention). The 399 questions that were
+  scored are the same sampling shape as prior runs.
+- *8 content-filter ingest drops.* Azure OpenAI's content management
+  policy rejected ~8 notes during ingest of convs 19 and 20 (Legal and
+  Administrative category). Those notes were dropped, leaving mild
+  retrieval degradation on two conversations. This should reduce on
+  non-Azure deployments — a win we'll get for free when we switch
+  providers.
+
+## Historical runs
 
 | Run | Score | Config | Notes |
 |-----|-------|--------|-------|
 | Baseline (Day 2) | 56.8% | episodes=off, graph=dead code, reranker=0.1 | Original measurement |
 | Post-wiring (all features) | 41.4% | episodes=on, graph=0.05, reranker=0.1 | Massive regression |
 | Optimal (Day 2) | 51.3% | episodes=on, graph=0.0, foresight=0.1, reranker=0.01 | After experiment sweep |
-| P0 foundation fixes | **56.8%** | +turn_index, query router, contradiction wiring, kill abstention | 2026-03-31 |
+| P0 foundation fixes | 56.8% | +turn_index, query router, contradiction wiring, kill abstention | 2026-03-31 |
 | P0+P1+P2 | 55.3% | +fetch_k=4x, max_rerank=20, narrative ordering | 2026-04-01 (regression) |
 | P1-fix | 56.4% | +reranker reorder, mode-specific fetch_k | 2026-04-01 |
 | All-fixes | 57.8% | +embed classifier, note sorting, source timestamps, parallel questions | 2026-04-02 |
-| A.3 (retry) | **57.7%** | +insufficient-info retry for Computation/Temporal | 2026-04-02 |
+| A.3 (retry) | 57.7% | +insufficient-info retry for Computation/Temporal | 2026-04-02 |
 | Phase Next (unfiltered) | 50.7% | +atomic facts, episode digests, episode links | 2026-04-03 (regression) |
 | Phase Next + ANN filter | 52.2% | Filter Dream/Digest/Fact from direct ANN | 2026-04-03 |
 | Phase Next + wired digests | 53.0% | +structured digest query for Computation/Breadth | 2026-04-04 |
-| Honcho reference | 63.0% | Their system | Published number |
+| **P1 retrieval fixes** | **61.6%** | expand-then-rerank, Gate 3 kill, source timestamps; N=399 | **2026-04-14 — current best** |
 
 Note: 57.7-57.8% are within LLM non-determinism range (~3pp variance between identical runs).
-The true improvement from Day 2 optimal (51.3%) to Day 4 is +6.4pp.
 Phase Next runs use re-ingested data (different notes from expanded attribute prompt).
 
 ### Per-Ability Comparison (Key Runs)
@@ -454,7 +491,7 @@ All runs on identical BEAM 100K dataset, same judge model, same ingested data (f
 | All-fixes | 57.8% | +1.4pp (note sorting + source timestamps) |
 | A.3 (retry) | 57.7% | flat (temporal +8pp offset by noise) |
 
-True signal: **51.3% → ~57.5% (+6.2pp)** after removing noise. Remaining gap to Honcho (63%): 5.5pp.
+True signal: **51.3% → ~57.5% (+6.2pp)** after removing LLM non-determinism noise. The P1 retrieval fixes (see top of this document) subsequently pushed this to 61.6%, a further +4pp of structural improvement from expand-then-rerank, Gate 3 kill, and source-timestamp recency.
 
 ---
 

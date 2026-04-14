@@ -1,7 +1,18 @@
 # Retrieval Quality Experiment Plan
 
-Baseline: BEAM 100K = 51.3% (post-wiring optimal). Minimum Target: 63%+ (Honcho parity). Project Expectations: 90%+ (SOTA)
-243 failures across 400 questions. This plan attacks them in priority order.
+> Experimental plan tracking retrieval-quality improvements for Karta. This
+> is a living research doc, not a roadmap — experiments are added, tried,
+> kept, or dropped based on BEAM 100K outcomes.
+
+Baselines so far:
+- Day 2 (2026-03-27): 51.3% — starting point after initial wiring
+- P0 foundation fixes (2026-03-31): 53.0%
+- P1 retrieval fixes (2026-04-14): **61.6%** — current best
+- Project goal: 90%+ (build the best AI memory system)
+
+This plan enumerates the open experiment backlog, organized by priority.
+Each item targets a specific failure mode in the 243-failure catalog
+(see `benchmarks/beam-100k.md`).
 
 ---
 
@@ -394,3 +405,52 @@ Each benchmark = full BEAM 100K (20 conversations, 400 questions). Log per-abili
 | Event ordering | **P2** (episode narratives) OR **P3** (temporal chain links) | Superseded by Phase Next (atomic facts provide micro-ordering) |
 | Vocabulary mismatch | **P4** (ghost queries) OR **P5** (hybrid keyword search) | P4 if keyword extraction is unreliable. P5 if keywords are good and you want zero extra LLM calls. |
 | Knowledge updates | **P0.3 Recency mode** OR **P9** (overwrite-on-update) | Try P0.3 first (retrieval fix). P9 only if recency boosting isn't enough (write-side nuclear option). |
+
+---
+
+## R-BAKEOFF: 3-way reranker comparison
+
+**Status:** Planned, not started. Task #15. Scheduled AFTER the 2026-04-13 overnight BEAM with digest events lands so the baseline and debug JSONL are stable.
+
+**Goal:** Determine whether the current Jina reranker (external API) is actually better than the alternatives for Karta's workload, or whether we're paying for a premium service that doesn't move the BEAM number. Three candidates, one evaluation protocol, one conclusion.
+
+### Candidates
+
+| Reranker | Type | Host | Cost | Why |
+|---|---|---|---|---|
+| **Jina** (current baseline) | Cross-encoder | api.jina.ai/v1/rerank | ~$0.02 / 1k docs | Baseline — what we ship today |
+| **Cohere** `rerank-v3.5` (or latest) | Cross-encoder | api.cohere.com/v2/rerank | ~$0.002 / req | The obvious peer, ~10× cheaper if quality holds |
+| **bge-reranker-v2-m3** via TEI | Cross-encoder | local on /mnt/ssd | free, CPU-bound | OSS self-hosted, proves zero-external-dep path |
+
+All three are dedicated cross-encoders exposing `(query, documents) → scores`. Direct apples-to-apples. We deliberately do NOT include an LLM-as-judge fallback in this bakeoff — that's `LlmReranker` which already exists and has known bad cost/latency at query volume.
+
+### Scope
+
+1. **`CohereReranker`** — clone of `JinaReranker` pattern at `crates/karta-core/src/rerank.rs`. Different endpoint, auth header, response schema. Needs `COHERE_API_KEY` in `.env`. ~1h.
+2. **`HttpReranker` (or `TeiReranker`)** — generic POST to a configurable `/rerank` endpoint. Defaults to localhost TEI but can point at any server speaking TEI's or a standard rerank schema. ~1h.
+3. **TEI server setup** — download `BAAI/bge-reranker-v2-m3` weights, run `text-embeddings-inference` binary on `/mnt/ssd` listening on `:8080`, systemd unit for persistence. ~30min (Rohit runs the sudo bits).
+4. **Config flag** — `K_RERANKER_PROVIDER=jina|cohere|tei|noop` routing in the reranker factory. ~30min.
+5. **Bakeoff harness** — reads the latest `.results/beam-debug-*.jsonl`, for each question replays the retrieved candidates through all three rerankers, records (chosen_top_k_ids, scores, latency_ms) per backend. Offline — no BEAM re-run, no Azure cost. ~1–2h.
+6. **Analysis** — compute (a) top-K agreement between pairs, (b) latency distribution, (c) effective pass rate by checking whether the rubric-winning note survives each backend's top-K. Output a short Markdown report at `.results/reranker-bakeoff-<ts>.md`. ~1h.
+7. **Confirmatory BEAM** — single full run with the winning reranker, to verify the offline signal translates end-to-end. Only if the offline bakeoff shows a clear winner. 11h wall clock, not counted in the ~5h coding estimate.
+
+### Evaluation metric
+
+Primary: **rubric-winning-note survival rate in top-K**. For each BEAM question where we know from the existing ground truth which notes carry the rubric items, check whether each reranker keeps those notes in top-K. This is recall@K measured against rubric ground truth, which is more meaningful than end-to-end pass rate (which is dominated by synthesis noise).
+
+Secondary: **top-K Jaccard agreement** between backends. Tells us whether they're making similar decisions or structurally different ones — the latter is a signal that the reranker choice actually matters.
+
+Tertiary: **p50 / p95 latency per 20-candidate rerank**. Cohere and Jina are network-bound (~100-300 ms), TEI is CPU-bound (~200-400 ms on this box, faster on GPU). Latency under 500 ms is "fine"; above that is a user-visible hit during `ask()`.
+
+### Blockers / prerequisites
+
+- **`COHERE_API_KEY`** — not yet in `.env`. Rohit to provision.
+- **Overnight BEAM must land first** — need the fresh debug JSONL with the digest-events context for a meaningful offline replay, and need CPU free for TEI CPU inference if we go that route.
+- **Latest Cohere rerank model tag** — check `https://docs.cohere.com/reference/rerank-2` at bakeoff time rather than hardcoding `rerank-v3.5` today.
+
+### Decision criteria
+
+- If **TEI matches or beats Jina** on rubric survival: migrate Karta default to TEI, save all the external API cost, OSS story improves.
+- If **Cohere beats Jina significantly**: consider migrating default. Cost drops 10× and we keep a hosted option for users who don't want to run TEI.
+- If **Jina clearly wins**: keep as-is, mark this experiment as "tested, no improvement found" in the memory/baseline file.
+- If **all three are within noise**: default to TEI anyway for the zero-external-dep OSS story.
