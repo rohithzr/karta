@@ -21,8 +21,8 @@ CLAUDE.local.md
 SKILL.md
 skill-lock.json
 skills-lock.json
-SKILL.md
 .agents/
+.context/
 
 # Test results
 .results/*
