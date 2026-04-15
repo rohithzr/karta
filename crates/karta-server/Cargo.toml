@@ -1,0 +1,53 @@
+[package]
+name = "karta-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP server with OAuth 2.1 for karta agentic memory"
+
+[dependencies]
+karta-core = { path = "../karta-core" }
+
+# MCP SDK
+rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "a64be231527f923e9f84d4dd7bf3c3bd695ee53e", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
+
+# Web framework
+axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.10", features = ["cookie-private"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# OAuth
+oauth2 = "5"
+openidconnect = "4"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1.0"
+
+# Storage
+rusqlite = { version = "0.35", features = ["bundled"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.9"
+sha2 = "0.10"
+base64 = "0.22"
+thiserror = "2"
+anyhow = "1"
+dotenvy = "0.15"
+url = "2"
+urlencoding = "2"
+subtle = "2"

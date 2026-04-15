@@ -20,8 +20,9 @@ impl SqliteGraphStore {
         let conn = Connection::open(&path)
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
-        // Enable WAL mode for concurrent reads during dream writes
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        // Use DELETE journal mode for compatibility with network filesystems (e.g. GCS FUSE).
+        // WAL requires shared memory / file locking that FUSE mounts don't support.
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA foreign_keys=ON;")
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
         let store = Self {

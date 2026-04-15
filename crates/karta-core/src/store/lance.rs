@@ -29,11 +29,13 @@ pub struct LanceVectorStore {
 }
 
 impl LanceVectorStore {
-    pub async fn new(data_dir: &str) -> Result<Self> {
-        let uri = format!("{}/lance", data_dir);
-        std::fs::create_dir_all(&uri)
-            .map_err(|e| KartaError::VectorStore(e.to_string()))?;
-        let conn = connect(&uri)
+    pub async fn new(uri: &str) -> Result<Self> {
+        // Only create local directories for local paths
+        if !uri.starts_with("gs://") && !uri.starts_with("s3://") && !uri.starts_with("az://") {
+            std::fs::create_dir_all(uri)
+                .map_err(|e| KartaError::VectorStore(e.to_string()))?;
+        }
+        let conn = connect(uri)
             .execute()
             .await
             .map_err(|e| KartaError::VectorStore(e.to_string()))?;

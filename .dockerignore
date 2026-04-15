@@ -1,0 +1,7 @@
+target/
+.git/
+.karta/
+graphify-out/
+*.db
+.env
+.env.*

@@ -98,8 +98,10 @@ impl Karta {
         // Load .env if present (silently ignore if missing)
         let _ = dotenvy::dotenv();
 
+        let lance_uri = config.storage.lance_uri.clone()
+            .unwrap_or_else(|| format!("{}/lance", config.storage.data_dir));
         let vector_store = Arc::new(
-            LanceVectorStore::new(&config.storage.data_dir).await?,
+            LanceVectorStore::new(&lance_uri).await?,
         ) as Arc<dyn VectorStore>;
 
         let graph_store = Arc::new(
