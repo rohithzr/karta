@@ -1,5 +1,5 @@
 use chrono::Utc;
-use karta_core::note::{MemoryNote, NoteStatus, Provenance};
+use karta_core::note::{AtomicFact, MemoryNote, NoteStatus, Provenance};
 use karta_core::store::sqlite_vec::SqliteVectorStore;
 use karta_core::store::VectorStore;
 use tempfile::TempDir;
@@ -159,6 +159,48 @@ async fn test_find_similar_empty_store() {
     let store = SqliteVectorStore::new(dir.path().to_str().unwrap(), 4).await.unwrap();
     let results = store.find_similar(&[1.0, 0.0, 0.0, 0.0], 5, &[]).await.unwrap();
     assert!(results.is_empty());
+}
+
+fn make_test_fact(id: &str, content: &str, source_note_id: &str, ordinal: u32, dim: usize) -> AtomicFact {
+    AtomicFact {
+        id: id.to_string(),
+        content: content.to_string(),
+        source_note_id: source_note_id.to_string(),
+        ordinal,
+        subject: Some("test-entity".to_string()),
+        embedding: vec![0.5; dim],
+        created_at: Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn test_upsert_and_get_facts() {
+    let dir = TempDir::new().unwrap();
+    let store = SqliteVectorStore::new(dir.path().to_str().unwrap(), 4).await.unwrap();
+    let f1 = make_test_fact("f1", "Cats have four legs", "n1", 0, 4);
+    let f2 = make_test_fact("f2", "Cats are mammals", "n1", 1, 4);
+    store.upsert_fact(&f1).await.unwrap();
+    store.upsert_fact(&f2).await.unwrap();
+    let facts = store.get_facts_for_note("n1").await.unwrap();
+    assert_eq!(facts.len(), 2);
+    assert_eq!(facts[0].ordinal, 0);
+    assert_eq!(facts[1].ordinal, 1);
+}
+
+#[tokio::test]
+async fn test_find_similar_facts() {
+    let dir = TempDir::new().unwrap();
+    let store = SqliteVectorStore::new(dir.path().to_str().unwrap(), 4).await.unwrap();
+    let mut f1 = make_test_fact("f1", "fact one", "n1", 0, 4);
+    f1.embedding = vec![1.0, 0.0, 0.0, 0.0];
+    store.upsert_fact(&f1).await.unwrap();
+    let mut f2 = make_test_fact("f2", "fact two", "n2", 0, 4);
+    f2.embedding = vec![0.0, 1.0, 0.0, 0.0];
+    store.upsert_fact(&f2).await.unwrap();
+    // Search near f1, exclude n1's source
+    let results = store.find_similar_facts(&[1.0, 0.0, 0.0, 0.0], 2, &["n1"]).await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0.id, "f2");
 }
 
 #[tokio::test]

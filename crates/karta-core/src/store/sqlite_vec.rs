@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json;
 
 use crate::error::{KartaError, Result};
-use crate::note::{MemoryNote, NoteStatus, Provenance};
+use crate::note::{AtomicFact, MemoryNote, NoteStatus, Provenance};
 
 pub struct SqliteVectorStore {
     conn: Arc<Mutex<Connection>>,
@@ -347,5 +347,139 @@ impl crate::store::VectorStore for SqliteVectorStore {
         conn.execute("DELETE FROM notes WHERE id = ?1", [id])?;
         conn.execute("DELETE FROM notes_vec WHERE id = ?1", [id])?;
         Ok(())
+    }
+
+    async fn upsert_fact(&self, fact: &AtomicFact) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+        let created_at = fact.created_at.to_rfc3339();
+        let embedding_blob = Self::embedding_to_blob(&fact.embedding);
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO atomic_facts
+             (id, content, source_note_id, ordinal, subject, created_at, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                fact.id, fact.content, fact.source_note_id,
+                fact.ordinal, fact.subject, created_at, embedding_blob,
+            ],
+        )?;
+        tx.execute("DELETE FROM facts_vec WHERE id = ?1", [&fact.id])?;
+        tx.execute(
+            "INSERT INTO facts_vec (id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![fact.id, embedding_blob],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    async fn find_similar_facts(
+        &self,
+        embedding: &[f32],
+        top_k: usize,
+        exclude_source_note_ids: &[&str],
+    ) -> Result<Vec<(AtomicFact, f32)>> {
+        let query_blob = Self::embedding_to_blob(embedding);
+        let limit = (top_k + exclude_source_note_ids.len() * 5) as i64;
+
+        // All DB work in one block — lock dropped before any await
+        let result: Vec<(AtomicFact, f32)> = {
+            let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+
+            // Step 1: kNN query
+            let mut stmt = conn.prepare(
+                "SELECT id, distance FROM facts_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+            )?;
+            let knn_rows: Vec<(String, f64)> = stmt
+                .query_map(rusqlite::params![query_blob, limit], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(stmt); // explicit drop to release borrow on conn
+
+            if knn_rows.is_empty() {
+                Vec::new()
+            } else {
+                // Step 2: Batch fetch all facts in one query
+                let distance_map: std::collections::HashMap<String, f64> = knn_rows
+                    .iter()
+                    .map(|(id, d)| (id.clone(), *d))
+                    .collect();
+                let placeholders: String = (1..=knn_rows.len())
+                    .map(|i| format!("?{}", i))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT id, content, source_note_id, ordinal, subject, created_at, embedding
+                     FROM atomic_facts WHERE id IN ({})",
+                    placeholders
+                );
+                let mut stmt2 = conn.prepare(&sql)?;
+                let ids: Vec<&str> = knn_rows.iter().map(|(id, _)| id.as_str()).collect();
+                let params: Vec<&dyn rusqlite::types::ToSql> =
+                    ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+
+                let facts: Vec<AtomicFact> = stmt2
+                    .query_map(params.as_slice(), |row| {
+                        let embedding_blob: Vec<u8> = row.get("embedding")?;
+                        let created_str: String = row.get("created_at")?;
+                        Ok(AtomicFact {
+                            id: row.get("id")?,
+                            content: row.get("content")?,
+                            source_note_id: row.get("source_note_id")?,
+                            ordinal: row.get("ordinal")?,
+                            subject: row.get("subject")?,
+                            embedding: Self::blob_to_embedding(&embedding_blob),
+                            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                                .unwrap_or_default()
+                                .with_timezone(&chrono::Utc),
+                        })
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                // Step 3: Filter by exclude + pair with scores
+                let mut scored: Vec<(AtomicFact, f32)> = facts
+                    .into_iter()
+                    .filter(|f| !exclude_source_note_ids.contains(&f.source_note_id.as_str()))
+                    .filter_map(|fact| {
+                        let distance = distance_map.get(&fact.id).copied().unwrap_or(0.0);
+                        Some((fact, 1.0 / (1.0 + distance as f32)))
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                scored.truncate(top_k);
+                scored
+            }
+        }; // lock dropped here
+
+        Ok(result)
+    }
+
+    async fn get_facts_for_note(&self, note_id: &str) -> Result<Vec<AtomicFact>> {
+        let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, content, source_note_id, ordinal, subject, created_at, embedding
+             FROM atomic_facts WHERE source_note_id = ?1 ORDER BY ordinal",
+        )?;
+        let facts = stmt
+            .query_map([note_id], |row| {
+                let embedding_blob: Vec<u8> = row.get("embedding")?;
+                let created_str: String = row.get("created_at")?;
+                Ok(AtomicFact {
+                    id: row.get("id")?,
+                    content: row.get("content")?,
+                    source_note_id: row.get("source_note_id")?,
+                    ordinal: row.get("ordinal")?,
+                    subject: row.get("subject")?,
+                    embedding: Self::blob_to_embedding(&embedding_blob),
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                        .unwrap_or_default()
+                        .with_timezone(&chrono::Utc),
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(facts)
     }
 }
