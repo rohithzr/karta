@@ -1,17 +1,23 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::dream::DreamRun;
 use crate::error::{KartaError, Result};
 use crate::note::EvolutionRecord;
 
 pub struct SqliteGraphStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteGraphStore {
+    /// Create with a shared connection (preferred — shares with SqliteVectorStore).
+    pub fn with_connection(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    /// Create with own connection (backwards compat for tests).
     pub fn new(data_dir: &str) -> Result<Self> {
         let path = format!("{}/karta.db", data_dir);
         std::fs::create_dir_all(data_dir)
@@ -24,11 +30,8 @@ impl SqliteGraphStore {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
         // We'll call init() from Karta::new()
-        Ok(store)
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 }
 
