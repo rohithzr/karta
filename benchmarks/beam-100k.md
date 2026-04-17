@@ -4,6 +4,27 @@
 > experimental research project — these results track a work-in-progress
 > and are expected to change as we iterate toward our 90%+ goal.
 
+## Methodology — fixed invariants
+
+For scores to be comparable across runs, two things never change:
+
+- **LLM-as-judge**: Azure deployment `gpt-5.4-mini`, invoked with the
+  verbatim BEAM `unified_llm_judge_base_prompt`, 3-tier scoring
+  (1.0 / 0.5 / 0.0 per rubric item). The judge is built independently of
+  the system-under-test via `beam_100k.rs::build_judge_llm()`, so swapping
+  `OPENAI_API_BASE` to point the SUT at Ollama or any other backend does
+  not affect the judge. Pinned via `KARTA_JUDGE_MODEL=gpt-5.4-mini` in
+  `.env`.
+- **Dataset**: `data/beam-100k.json`, derived from the official BEAM
+  parquet via `data/convert_beam.py`. All runs use the same 20
+  conversations and the same 400 questions.
+
+When the judge hits Azure's content filter (as it did on Legal / Admin
+conversations in the P1 run), the rubric item is tagged `FILTER_DROP` and
+excluded from the denominator — it is **not** scored as 0.0. Real judge API
+errors still score 0.0.
+
+
 ## Latest run — P1 Retrieval Fixes (2026-04-14)
 
 **Headline: 61.6%** — arithmetic mean of per-question BEAM rubric scores,

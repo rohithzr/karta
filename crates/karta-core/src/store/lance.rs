@@ -20,16 +20,21 @@ use crate::note::{MemoryNote, NoteStatus, Provenance};
 
 const TABLE_NAME: &str = "notes";
 const FACTS_TABLE_NAME: &str = "atomic_facts";
-const EMBEDDING_DIM: usize = 1536; // text-embedding-3-small default
+
+/// Historical default — 1536 matches `text-embedding-3-small`. Real embedding
+/// dim is now passed to `LanceVectorStore::new()` so callers can match their
+/// chosen backend (e.g. 768 for `nomic-embed-text`).
+pub const DEFAULT_EMBEDDING_DIM: usize = 1536;
 
 pub struct LanceVectorStore {
     conn: Connection,
     table: RwLock<Option<LanceTable>>,
     facts_table: RwLock<Option<LanceTable>>,
+    embedding_dim: usize,
 }
 
 impl LanceVectorStore {
-    pub async fn new(data_dir: &str) -> Result<Self> {
+    pub async fn new(data_dir: &str, embedding_dim: usize) -> Result<Self> {
         let uri = format!("{}/lance", data_dir);
         std::fs::create_dir_all(&uri)
             .map_err(|e| KartaError::VectorStore(e.to_string()))?;
@@ -42,13 +47,14 @@ impl LanceVectorStore {
             conn,
             table: RwLock::new(None),
             facts_table: RwLock::new(None),
+            embedding_dim,
         };
         store.ensure_table().await?;
         store.ensure_facts_table().await?;
         Ok(store)
     }
 
-    fn schema() -> Arc<Schema> {
+    fn schema(&self) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, false),
@@ -67,7 +73,7 @@ impl LanceVectorStore {
                 "vector",
                 DataType::FixedSizeList(
                     Arc::new(Field::new("item", DataType::Float32, true)),
-                    EMBEDDING_DIM as i32,
+                    self.embedding_dim as i32,
                 ),
                 false,
             ),
@@ -104,7 +110,7 @@ impl LanceVectorStore {
                 .await
                 .map_err(|e| KartaError::VectorStore(e.to_string()))?
         } else {
-            let schema = Self::schema();
+            let schema = self.schema();
             let empty_batch = RecordBatch::new_empty(schema.clone());
             let reader = Self::make_reader(vec![empty_batch], schema);
             self.conn
@@ -120,7 +126,7 @@ impl LanceVectorStore {
 
     // --- Atomic Facts table ---
 
-    fn facts_schema() -> Arc<Schema> {
+    fn facts_schema(&self) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, false),
@@ -132,7 +138,7 @@ impl LanceVectorStore {
                 "vector",
                 DataType::FixedSizeList(
                     Arc::new(Field::new("item", DataType::Float32, true)),
-                    EMBEDDING_DIM as i32,
+                    self.embedding_dim as i32,
                 ),
                 false,
             ),
@@ -152,7 +158,7 @@ impl LanceVectorStore {
             self.conn.open_table(FACTS_TABLE_NAME).execute().await
                 .map_err(|e| KartaError::VectorStore(e.to_string()))?
         } else {
-            let schema = Self::facts_schema();
+            let schema = self.facts_schema();
             let empty_batch = RecordBatch::new_empty(schema.clone());
             let reader = Self::make_reader(vec![empty_batch], schema);
             self.conn.create_table(FACTS_TABLE_NAME, reader).execute().await
@@ -163,16 +169,16 @@ impl LanceVectorStore {
         Ok(())
     }
 
-    fn fact_to_batch(fact: &crate::note::AtomicFact) -> Result<RecordBatch> {
-        let embedding = if fact.embedding.len() == EMBEDDING_DIM {
+    fn fact_to_batch(&self, fact: &crate::note::AtomicFact) -> Result<RecordBatch> {
+        let embedding = if fact.embedding.len() == self.embedding_dim {
             fact.embedding.clone()
         } else {
-            vec![0.0f32; EMBEDDING_DIM]
+            vec![0.0f32; self.embedding_dim]
         };
 
         let vector_array = arrow_array::FixedSizeListArray::try_new(
             Arc::new(Field::new("item", DataType::Float32, true)),
-            EMBEDDING_DIM as i32,
+            self.embedding_dim as i32,
             Arc::new(Float32Array::from(embedding)),
             None,
         ).map_err(|e| KartaError::VectorStore(e.to_string()))?;
@@ -182,7 +188,7 @@ impl LanceVectorStore {
         let subject_str = fact.subject.clone().unwrap_or_default();
 
         RecordBatch::try_new(
-            Self::facts_schema(),
+            self.facts_schema(),
             vec![
                 Arc::new(StringArray::from(vec![fact.id.as_str()])),
                 Arc::new(StringArray::from(vec![fact.content.as_str()])),
@@ -231,16 +237,16 @@ impl LanceVectorStore {
             .ok_or_else(|| KartaError::VectorStore("Facts table not initialized".into()))
     }
 
-    fn note_to_batch(note: &MemoryNote) -> Result<RecordBatch> {
-        let embedding = if note.embedding.len() == EMBEDDING_DIM {
+    fn note_to_batch(&self, note: &MemoryNote) -> Result<RecordBatch> {
+        let embedding = if note.embedding.len() == self.embedding_dim {
             note.embedding.clone()
         } else {
-            vec![0.0f32; EMBEDDING_DIM]
+            vec![0.0f32; self.embedding_dim]
         };
 
         let vector_array = arrow_array::FixedSizeListArray::try_new(
             Arc::new(Field::new("item", DataType::Float32, true)),
-            EMBEDDING_DIM as i32,
+            self.embedding_dim as i32,
             Arc::new(Float32Array::from(embedding)),
             None,
         )
@@ -258,7 +264,7 @@ impl LanceVectorStore {
         let source_timestamp_str = note.source_timestamp.map(|t| t.to_rfc3339()).unwrap_or_default();
 
         let batch = RecordBatch::try_new(
-            Self::schema(),
+            self.schema(),
             vec![
                 Arc::new(StringArray::from(vec![note.id.as_str()])),
                 Arc::new(StringArray::from(vec![note.content.as_str()])),
@@ -391,8 +397,8 @@ impl crate::store::VectorStore for LanceVectorStore {
             .delete(&format!("id = '{}'", note.id))
             .await;
 
-        let batch = Self::note_to_batch(note)?;
-        let schema = Self::schema();
+        let batch = self.note_to_batch(note)?;
+        let schema = self.schema();
         let reader = Self::make_reader(vec![batch], schema);
         table
             .add(reader)
@@ -468,11 +474,27 @@ impl crate::store::VectorStore for LanceVectorStore {
     }
 
     async fn get_many(&self, ids: &[&str]) -> Result<Vec<MemoryNote>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table = self.get_table().await?;
+
+        // Single Lance query with IN filter instead of N individual queries
+        let escaped: Vec<String> = ids.iter().map(|id| format!("'{}'", id.replace('\'', "''"))).collect();
+        let filter = format!("id IN ({})", escaped.join(", "));
+
+        let results = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(|e| KartaError::VectorStore(e.to_string()))?;
+
+        let batches = Self::collect_batches(results).await?;
         let mut notes = Vec::new();
-        for id in ids {
-            if let Some(note) = self.get(id).await? {
-                notes.push(note);
-            }
+        for batch in &batches {
+            notes.extend(Self::batch_to_notes(batch)?);
         }
         Ok(notes)
     }
@@ -518,8 +540,8 @@ impl crate::store::VectorStore for LanceVectorStore {
     async fn upsert_fact(&self, fact: &crate::note::AtomicFact) -> Result<()> {
         let table = self.get_facts_table().await?;
         let _ = table.delete(&format!("id = '{}'", fact.id)).await;
-        let batch = Self::fact_to_batch(fact)?;
-        let schema = Self::facts_schema();
+        let batch = self.fact_to_batch(fact)?;
+        let schema = self.facts_schema();
         let reader = Self::make_reader(vec![batch], schema);
         table.add(reader).execute().await
             .map_err(|e| KartaError::VectorStore(e.to_string()))?;

@@ -7,7 +7,7 @@ use tracing::{debug, info};
 use crate::config::ReadConfig;
 use crate::error::Result;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
-use crate::note::{AskResult, MemoryNote, Provenance, SearchResult};
+use crate::note::{AskResult, FetchedMemories, MemoryNote, Provenance, SearchResult};
 use crate::rerank::{Reranker, RerankerConfig};
 use crate::store::{GraphStore, VectorStore};
 
@@ -207,6 +207,7 @@ pub struct ReadEngine {
     vector_store: Arc<dyn VectorStore>,
     graph_store: Arc<dyn GraphStore>,
     llm: Arc<dyn LlmProvider>,
+    synthesis_llm: Option<Arc<dyn LlmProvider>>,
     reranker: Arc<dyn Reranker>,
     config: ReadConfig,
     reranker_config: RerankerConfig,
@@ -218,6 +219,7 @@ impl ReadEngine {
         vector_store: Arc<dyn VectorStore>,
         graph_store: Arc<dyn GraphStore>,
         llm: Arc<dyn LlmProvider>,
+        synthesis_llm: Option<Arc<dyn LlmProvider>>,
         reranker: Arc<dyn Reranker>,
         config: ReadConfig,
         reranker_config: RerankerConfig,
@@ -226,11 +228,23 @@ impl ReadEngine {
             vector_store,
             graph_store,
             llm,
+            synthesis_llm,
             reranker,
             config,
             reranker_config,
             classifier: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// LLM used for the final answer-synthesis call. Defaults to `self.llm`
+    /// (same as all internal Karta work) unless an explicit override was
+    /// configured — lets the caller route only the user-facing answer step
+    /// to a different model while keeping ingest/dream/retrieval on the
+    /// primary LLM.
+    fn synth_llm(&self) -> &dyn LlmProvider {
+        self.synthesis_llm
+            .as_deref()
+            .unwrap_or_else(|| self.llm.as_ref())
     }
 
     /// Get or initialize the embedding-based query classifier.
@@ -319,6 +333,11 @@ impl ReadEngine {
     /// BFS traversal through the link graph up to max_depth hops.
     /// Each hop applies a decay factor to the weight.
     /// Returns deduplicated notes sorted by traversal weight.
+    ///
+    /// Two-phase approach for latency: first traverse the graph (SQLite,
+    /// sub-millisecond per hop) to collect all reachable IDs + weights,
+    /// then fetch the notes in one batched vector-store call instead of
+    /// N individual get() calls (which are expensive on Lance).
     async fn multi_hop_traverse(
         &self,
         seed_id: &str,
@@ -331,9 +350,8 @@ impl ReadEngine {
         visited.insert(seed_id.to_string());
 
         let mut queue: VecDeque<(String, usize, f32)> = VecDeque::new();
-        let mut weighted_notes: Vec<(MemoryNote, f32)> = Vec::new();
+        let mut id_weights: Vec<(String, f32)> = Vec::new();
 
-        // Seed with direct links at depth 0
         let initial_links = self.graph_store.get_links(seed_id).await?;
         for link_id in initial_links {
             if visited.insert(link_id.clone()) {
@@ -343,14 +361,13 @@ impl ReadEngine {
 
         const MAX_TRAVERSED: usize = 50;
 
+        // Phase 1: graph-only BFS (SQLite, fast) — collect IDs + weights
         while let Some((current_id, depth, weight)) = queue.pop_front() {
-            if weighted_notes.len() >= MAX_TRAVERSED {
+            if id_weights.len() >= MAX_TRAVERSED {
                 break;
             }
 
-            if let Some(note) = self.vector_store.get(&current_id).await? {
-                weighted_notes.push((note, weight));
-            }
+            id_weights.push((current_id.clone(), weight));
 
             if depth < max_depth {
                 let next_weight = weight * decay;
@@ -363,7 +380,25 @@ impl ReadEngine {
             }
         }
 
-        // Sort by weight descending
+        if id_weights.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: batch fetch from vector store (one call instead of N)
+        let id_refs: Vec<&str> = id_weights.iter().map(|(id, _)| id.as_str()).collect();
+        let fetched = self.vector_store.get_many(&id_refs).await?;
+        let note_map: std::collections::HashMap<String, MemoryNote> = fetched
+            .into_iter()
+            .map(|n| (n.id.clone(), n))
+            .collect();
+
+        let mut weighted_notes: Vec<(MemoryNote, f32)> = Vec::new();
+        for (id, weight) in &id_weights {
+            if let Some(note) = note_map.get(id) {
+                weighted_notes.push((note.clone(), *weight));
+            }
+        }
+
         weighted_notes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(weighted_notes.into_iter().map(|(n, _)| n).collect())
     }
@@ -373,13 +408,17 @@ impl ReadEngine {
         let (mut results, _mode) = self.search_wide(query, top_k).await?;
         results.truncate(top_k);
 
-        // Access tracking only for notes actually returned to the caller
-        for result in &results {
-            if let Ok(Some(mut original)) = self.vector_store.get(&result.note.id).await {
-                original.last_accessed_at = Utc::now();
-                let _ = self.vector_store.upsert(&original).await;
+        // Access tracking (fire-and-forget — don't block the read path)
+        let vs = Arc::clone(&self.vector_store);
+        let ids: Vec<String> = results.iter().map(|r| r.note.id.clone()).collect();
+        tokio::spawn(async move {
+            for id in ids {
+                if let Ok(Some(mut note)) = vs.get(&id).await {
+                    note.last_accessed_at = Utc::now();
+                    let _ = vs.upsert(&note).await;
+                }
             }
-        }
+        });
 
         Ok(results)
     }
@@ -739,6 +778,254 @@ impl ReadEngine {
         Ok((results, mode))
     }
 
+    /// Public retrieve-only API. Runs Karta's full retrieval pipeline —
+    /// query classification, wide search, reranking, deduplication,
+    /// chronological ordering, contradiction force-retrieval, and context
+    /// assembly — then returns the assembled notes WITHOUT calling any LLM
+    /// for answer composition.
+    ///
+    /// Karta's job is to find and organize the right memories; the caller
+    /// decides what to do with them (run their own LLM, display them, pass
+    /// them to an agent, etc.). Use `ask()` if you want Karta to also
+    /// compose an answer via its configured answer-LLM.
+    pub async fn fetch_memories(&self, query: &str, top_k: usize) -> Result<FetchedMemories> {
+        let wide_k = top_k * self.config.summarization_top_k_multiplier.max(4);
+        let mut reranker_best: Option<f32> = None;
+
+        let (mut results, mode) = self.search_wide(query, wide_k).await?;
+
+        let effective_top_k = match mode {
+            QueryMode::Breadth => top_k * self.config.summarization_top_k_multiplier,
+            QueryMode::Temporal => top_k * 4,
+            QueryMode::Computation => top_k * 2,
+            _ => top_k,
+        };
+        let mode_str = format!("{:?}", mode);
+
+        if results.is_empty() {
+            return Ok(FetchedMemories {
+                query: query.to_string(),
+                context: String::new(),
+                notes: Vec::new(),
+                note_ids: Vec::new(),
+                query_mode: mode_str,
+                contradiction_injected: 0,
+                reranker_best_score: None,
+            });
+        }
+
+        // --- Reranker ---
+        if self.reranker_config.enabled {
+            let notes_for_rerank: Vec<(MemoryNote, f32)> = results
+                .iter()
+                .take(self.reranker_config.max_rerank)
+                .map(|r| (r.note.clone(), r.score))
+                .collect();
+
+            let reranked = self.reranker.rerank(query, notes_for_rerank).await?;
+            let best_relevance = reranked
+                .iter()
+                .map(|r| r.relevance_score)
+                .fold(0.0f32, f32::max);
+            reranker_best = Some(best_relevance);
+
+            if mode != QueryMode::Computation {
+                let reranked_ids: HashSet<String> =
+                    reranked.iter().map(|r| r.note.id.clone()).collect();
+                let mut reordered: Vec<SearchResult> = Vec::new();
+                for rr in &reranked {
+                    let linked = results
+                        .iter()
+                        .find(|r| r.note.id == rr.note.id)
+                        .map(|r| r.linked_notes.clone())
+                        .unwrap_or_default();
+                    reordered.push(SearchResult {
+                        note: rr.note.clone(),
+                        score: rr.relevance_score,
+                        linked_notes: linked,
+                    });
+                }
+                for r in &results {
+                    if !reranked_ids.contains(&r.note.id) {
+                        reordered.push(r.clone());
+                    }
+                }
+                results = reordered;
+            }
+        }
+
+        results.truncate(effective_top_k);
+
+        // Dedup unique notes (direct + linked)
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut all_notes: Vec<MemoryNote> = Vec::new();
+        for result in &results {
+            if seen.insert(result.note.id.clone()) {
+                all_notes.push(result.note.clone());
+            }
+            for linked in &result.linked_notes {
+                if seen.insert(linked.id.clone()) {
+                    all_notes.push(linked.clone());
+                }
+            }
+        }
+
+        if all_notes.is_empty() {
+            return Ok(FetchedMemories {
+                query: query.to_string(),
+                context: String::new(),
+                notes: Vec::new(),
+                note_ids: Vec::new(),
+                query_mode: mode_str,
+                contradiction_injected: 0,
+                reranker_best_score: reranker_best,
+            });
+        }
+
+        // Sort chronologically (turn_index > source_timestamp > created_at)
+        all_notes.sort_by(|a, b| match (a.turn_index, b.turn_index) {
+            (Some(ai), Some(bi)) => ai.cmp(&bi),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => match (a.source_timestamp, b.source_timestamp) {
+                (Some(at), Some(bt)) => at.cmp(&bt),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.created_at.cmp(&b.created_at),
+            },
+        });
+
+        // Contradiction force-retrieval
+        let mut contradiction_inject_ids: HashSet<String> = HashSet::new();
+        let seen_ids: HashSet<String> = all_notes.iter().map(|n| n.id.clone()).collect();
+
+        for note in all_notes.iter() {
+            if let Provenance::Dream { dream_type, source_note_ids, .. } = &note.provenance {
+                if dream_type == "contradiction" {
+                    for sid in source_note_ids {
+                        if !seen_ids.contains(sid) {
+                            contradiction_inject_ids.insert(sid.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        for note in all_notes.iter().take(10) {
+            if let Ok(links) = self.graph_store.get_links_with_reasons(&note.id).await {
+                for (linked_id, reason) in &links {
+                    if reason.contains("contradiction dream") && !seen_ids.contains(linked_id) {
+                        if let Ok(Some(dream_note)) = self.vector_store.get(linked_id).await {
+                            if let Provenance::Dream { source_note_ids, .. } = &dream_note.provenance {
+                                for sid in source_note_ids {
+                                    if !seen_ids.contains(sid) {
+                                        contradiction_inject_ids.insert(sid.clone());
+                                    }
+                                }
+                            }
+                            contradiction_inject_ids.insert(linked_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut inject_ids_vec: Vec<&str> = contradiction_inject_ids
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        inject_ids_vec.truncate(10);
+        let contradiction_notes: Vec<MemoryNote> = if inject_ids_vec.is_empty() {
+            Vec::new()
+        } else {
+            self.vector_store
+                .get_many(&inject_ids_vec)
+                .await
+                .unwrap_or_default()
+        };
+
+        // Build notes text with provenance markers
+        let mut note_entries: Vec<String> = Vec::new();
+        for (i, note) in all_notes.iter().enumerate() {
+            note_entries.push(Self::format_note_entry(i, note, false));
+        }
+        let base_count = all_notes.len();
+        for (i, note) in contradiction_notes.iter().enumerate() {
+            note_entries.push(Self::format_note_entry(base_count + i, note, true));
+        }
+        let joined_notes = note_entries.join("\n\n");
+
+        let events_block = self.build_events_block(mode).await;
+        let notes_text = if events_block.is_empty() {
+            joined_notes
+        } else {
+            format!("{}\n\n{}", events_block, joined_notes)
+        };
+
+        let contradiction_injected = contradiction_notes.len();
+        let mut ordered = all_notes;
+        ordered.extend(contradiction_notes);
+        let note_ids: Vec<String> = ordered.iter().map(|n| n.id.clone()).collect();
+
+        Ok(FetchedMemories {
+            query: query.to_string(),
+            context: notes_text,
+            notes: ordered,
+            note_ids,
+            query_mode: mode_str,
+            contradiction_injected,
+            reranker_best_score: reranker_best,
+        })
+    }
+
+    /// Format a single retrieved note as a context entry with provenance
+    /// markers, date, and recency annotation. Shared between the retrieval
+    /// path (`fetch_memories`) and the retry path inside `ask`.
+    fn format_note_entry(i: usize, note: &MemoryNote, is_contradiction_source: bool) -> String {
+        let provenance_marker = match &note.provenance {
+            Provenance::Observed => "FACT".to_string(),
+            Provenance::Dream { dream_type, confidence, .. } => {
+                format!("INFERRED:{} conf={:.0}%", dream_type, confidence * 100.0)
+            }
+            Provenance::Profile { entity_id } => format!("PROFILE:{}", entity_id),
+            Provenance::Episode { episode_id } => format!("EPISODE:{}", episode_id),
+            Provenance::Fact { source_note_id } => format!(
+                "FACT:from-{}",
+                &source_note_id[..8.min(source_note_id.len())]
+            ),
+            Provenance::Digest { episode_id } => {
+                format!("DIGEST:{}", &episode_id[..8.min(episode_id.len())])
+            }
+        };
+        let display_time = note.source_timestamp.unwrap_or(note.created_at);
+        let age = Utc::now()
+            .signed_duration_since(display_time)
+            .num_days();
+        let recency = if age == 0 {
+            "today".to_string()
+        } else if age == 1 {
+            "1 day ago".to_string()
+        } else {
+            format!("{} days ago", age)
+        };
+        let date_str = display_time.format("%Y-%m-%d");
+        let prefix = if is_contradiction_source {
+            "[CONTRADICTION SOURCE] "
+        } else {
+            ""
+        };
+        format!(
+            "[{}] {}({}, {}, {}) {}\n    Context: {}",
+            i + 1,
+            prefix,
+            provenance_marker,
+            date_str,
+            recency,
+            note.content,
+            note.context,
+        )
+    }
+
     /// Search + deduplicate + synthesize an answer with provenance markers.
     /// Includes abstention calibration: if no notes are sufficiently relevant, abstains.
     pub async fn ask(&self, query: &str, top_k: usize) -> Result<AskResult> {
@@ -833,12 +1120,18 @@ impl ReadEngine {
         // Now truncate to final top_k after reranking has reordered the full pool
         results.truncate(effective_top_k);
 
-        // Access tracking: only bump notes that will actually reach synthesis
-        for result in &results {
-            if let Ok(Some(mut original)) = self.vector_store.get(&result.note.id).await {
-                original.last_accessed_at = Utc::now();
-                let _ = self.vector_store.upsert(&original).await;
-            }
+        // Access tracking (fire-and-forget — don't block the read path)
+        {
+            let vs = Arc::clone(&self.vector_store);
+            let ids: Vec<String> = results.iter().map(|r| r.note.id.clone()).collect();
+            tokio::spawn(async move {
+                for id in ids {
+                    if let Ok(Some(mut note)) = vs.get(&id).await {
+                        note.last_accessed_at = Utc::now();
+                        let _ = vs.upsert(&note).await;
+                    }
+                }
+            });
         }
 
         // Deduplicate: collect all unique notes (direct + linked)
@@ -1025,7 +1318,7 @@ impl ReadEngine {
             json_schema: Some(crate::llm::schemas::synthesis_schema()),
         };
 
-        let response = self.llm.chat(&messages, &config).await?;
+        let response = self.synth_llm().chat(&messages, &config).await?;
 
         // Parse structured response
         let parsed: serde_json::Value =
@@ -1142,7 +1435,7 @@ impl ReadEngine {
                     "Retry: synthesizing with wider note set"
                 );
 
-                if let Ok(retry_response) = self.llm.chat(&retry_messages, &config).await {
+                if let Ok(retry_response) = self.synth_llm().chat(&retry_messages, &config).await {
                     let retry_parsed: serde_json::Value =
                         serde_json::from_str(&retry_response.content).unwrap_or_default();
                     if let Some(retry_answer) = retry_parsed["answer"].as_str() {

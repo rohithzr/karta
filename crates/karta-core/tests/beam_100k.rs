@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use karta_core::config::KartaConfig;
+use karta_core::llm::{LlmProvider, OpenAiProvider};
 use karta_core::note::AskResult;
 use karta_core::Karta;
 
@@ -203,24 +204,95 @@ Return your evaluation in JSON format with two fields:
 
 NOTE: ONLY output the json object, without any explanation before or after that"#;
 
+/// Outcome of a single rubric judgement.
+///
+/// Separating `FilterDrop` from `Error` lets the aggregator exclude filter
+/// drops from the denominator (fair) while still counting real failures as
+/// 0.0 (which penalises a bad system, as intended).
+#[derive(Debug, Clone, Copy)]
+enum JudgeOutcome {
+    Scored(f64),
+    FilterDrop,
+    Error,
+}
+
+/// Build a dedicated judge `LlmProvider` from env vars, independent of the
+/// system-under-test's LLM. Precedence:
+///
+///   1. `KARTA_JUDGE_BASE_URL` — any OpenAI-compatible endpoint. Reads
+///      `KARTA_JUDGE_API_KEY` (defaults to `"placeholder"`) and
+///      `KARTA_JUDGE_MODEL`.
+///   2. `AZURE_OPENAI_*` — reuse Azure credentials already in `.env`. Uses
+///      `KARTA_JUDGE_MODEL` if set, else `AZURE_OPENAI_CHAT_MODEL`. This is
+///      the common case: SUT goes through `OPENAI_API_BASE=<ollama>` while
+///      the judge stays pinned to Azure GPT-5-mini for P1 comparability.
+///   3. Returns `None` — caller falls back to the SUT's LLM (and prints a
+///      warning) so the test still runs, just without judge isolation.
+fn build_judge_llm() -> Option<Arc<dyn LlmProvider>> {
+    // Judges don't need embeddings; pass a harmless placeholder.
+    let embed_placeholder = "text-embedding-3-small";
+
+    if let Ok(base_url) = std::env::var("KARTA_JUDGE_BASE_URL") {
+        let model = std::env::var("KARTA_JUDGE_MODEL").ok()?;
+        let api_key = std::env::var("KARTA_JUDGE_API_KEY")
+            .unwrap_or_else(|_| "placeholder".to_string());
+        return Some(Arc::new(OpenAiProvider::with_api_key(
+            &model,
+            embed_placeholder,
+            &api_key,
+            Some(&base_url),
+        )));
+    }
+
+    if let (Ok(endpoint), Ok(key)) = (
+        std::env::var("AZURE_OPENAI_ENDPOINT"),
+        std::env::var("AZURE_OPENAI_API_KEY"),
+    ) {
+        let model = std::env::var("KARTA_JUDGE_MODEL")
+            .or_else(|_| std::env::var("AZURE_OPENAI_CHAT_MODEL"))
+            .ok()?;
+        let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
+            .unwrap_or_else(|_| "2025-04-01-preview".to_string());
+        return Some(Arc::new(OpenAiProvider::azure(
+            &endpoint,
+            &key,
+            &api_version,
+            &model,
+            embed_placeholder,
+        )));
+    }
+
+    None
+}
+
+/// Returns `true` if the error message indicates an Azure content-policy
+/// rejection rather than a transient API/network error. Checked against the
+/// literal strings Azure OpenAI returns.
+fn is_content_filter_error(err: &karta_core::error::KartaError) -> bool {
+    let s = err.to_string().to_lowercase();
+    s.contains("content_filter")
+        || s.contains("content management policy")
+        || s.contains("responsibleaipolicyviolation")
+        || s.contains("jailbreak")
+}
+
 /// LLM-as-judge (Arc version for parallel execution).
 async fn llm_judge_rubric_arc(
-    karta: &Arc<Karta>,
+    judge: &Arc<dyn LlmProvider>,
     question: &str,
     answer: &str,
     rubric_item: &str,
-) -> f64 {
-    llm_judge_rubric(karta.as_ref(), question, answer, rubric_item).await
+) -> JudgeOutcome {
+    llm_judge_rubric(judge.as_ref(), question, answer, rubric_item).await
 }
 
 /// LLM-as-judge using the exact BEAM official prompt and 3-tier scoring (1.0/0.5/0.0).
-/// Returns score 0.0, 0.5, or 1.0.
 async fn llm_judge_rubric(
-    karta: &Karta,
+    judge: &dyn LlmProvider,
     question: &str,
     answer: &str,
     rubric_item: &str,
-) -> f64 {
+) -> JudgeOutcome {
     use karta_core::llm::{ChatMessage, GenConfig, Role};
 
     // Build the prompt exactly as BEAM does: substitute placeholders
@@ -241,19 +313,25 @@ async fn llm_judge_rubric(
         json_schema: None,
     };
 
-    match karta.llm_chat(&messages, &config).await {
+    match judge.chat(&messages, &config).await {
         Ok(response) => {
             let parsed: serde_json::Value =
                 serde_json::from_str(&response.content).unwrap_or_default();
             let score = parsed["score"].as_f64().unwrap_or(0.0);
             // Clamp to valid BEAM scores
-            if score >= 0.75 { 1.0 }
+            let clamped = if score >= 0.75 { 1.0 }
             else if score >= 0.25 { 0.5 }
-            else { 0.0 }
+            else { 0.0 };
+            JudgeOutcome::Scored(clamped)
         }
         Err(e) => {
-            eprintln!("    Judge error: {}", e);
-            0.0
+            if is_content_filter_error(&e) {
+                eprintln!("    Judge content-filter drop: {}", e);
+                JudgeOutcome::FilterDrop
+            } else {
+                eprintln!("    Judge error: {}", e);
+                JudgeOutcome::Error
+            }
         }
     }
 }
@@ -514,6 +592,24 @@ async fn eval_conversation(
     }
     ask_results.sort_by_key(|(qi, _, _)| *qi);
 
+    // Build the judge LLM once per conversation. Fall back to the SUT's
+    // LLM with a loud warning when no dedicated judge is configured.
+    let judge_llm: Arc<dyn LlmProvider> = match build_judge_llm() {
+        Some(j) => {
+            println!("  Judge: dedicated provider (env-configured)");
+            j
+        }
+        None => {
+            eprintln!(
+                "  WARN: no dedicated judge configured (set KARTA_JUDGE_BASE_URL or \
+                 AZURE_OPENAI_*). Falling back to SUT LLM — scores will NOT be \
+                 comparable to P1."
+            );
+            Arc::new(OpenAiProvider::new("placeholder", "text-embedding-3-small"))
+                as Arc<dyn LlmProvider>
+        }
+    };
+
     // Phase 2: Score rubrics in parallel for all questions
     let mut judge_handles = Vec::new();
     for (qi, ask_result, _) in &ask_results {
@@ -534,18 +630,18 @@ async fn eval_conversation(
         };
 
         for (ri, rubric) in rubric_items.into_iter().enumerate() {
-            let karta_ref = Arc::clone(&karta);
+            let judge_ref = Arc::clone(&judge_llm);
             let question = q.question.clone();
             let answer_clone = answer.clone();
             judge_handles.push(tokio::spawn(async move {
-                let score = llm_judge_rubric_arc(&karta_ref, &question, &answer_clone, &rubric).await;
-                (qi, ri, rubric, score)
+                let outcome = llm_judge_rubric_arc(&judge_ref, &question, &answer_clone, &rubric).await;
+                (qi, ri, rubric, outcome)
             }));
         }
     }
 
     // Collect all judge results
-    let mut judge_results: Vec<(usize, usize, String, f64)> = Vec::new();
+    let mut judge_results: Vec<(usize, usize, String, JudgeOutcome)> = Vec::new();
     for handle in judge_handles {
         match handle.await {
             Ok(result) => judge_results.push(result),
@@ -584,13 +680,13 @@ async fn eval_conversation(
         let entry = ability_scores.entry(q.ability.clone()).or_insert((0, 0));
         let mut rubric_scores_debug: Vec<serde_json::Value> = Vec::new();
 
-        // Get rubric scores for this question from collected results
-        let q_rubric_scores: Vec<&(usize, usize, String, f64)> = judge_results
+        // Get rubric outcomes for this question from collected results
+        let q_rubric_outcomes: Vec<&(usize, usize, String, JudgeOutcome)> = judge_results
             .iter()
             .filter(|(qidx, _, _, _)| *qidx == *qi)
             .collect();
 
-        let beam_score: f64 = if q_rubric_scores.is_empty() {
+        let beam_score: f64 = if q_rubric_outcomes.is_empty() {
             entry.1 += 1;
             total_checks += 1;
             if answer.len() > 50 {
@@ -604,24 +700,61 @@ async fn eval_conversation(
             }
         } else {
             let mut rubric_score_sum = 0.0;
-            for (_, ri, rubric, score) in &q_rubric_scores {
-                total_checks += 1;
-                entry.1 += 1;
-                rubric_score_sum += score;
+            let mut scored_count = 0usize;
+            let mut filter_drops = 0usize;
+            for (_, ri, rubric, outcome) in &q_rubric_outcomes {
+                match outcome {
+                    JudgeOutcome::Scored(score) => {
+                        total_checks += 1;
+                        entry.1 += 1;
+                        rubric_score_sum += score;
+                        scored_count += 1;
 
-                let label = if *score >= 1.0 { "FULL" } else if *score >= 0.5 { "PART" } else { "FAIL" };
-                if *score >= 0.5 {
-                    total_passed += 1;
-                    entry.0 += 1;
+                        let label = if *score >= 1.0 { "FULL" }
+                            else if *score >= 0.5 { "PART" }
+                            else { "FAIL" };
+                        if *score >= 0.5 {
+                            total_passed += 1;
+                            entry.0 += 1;
+                        }
+                        println!("    [{}] R{}: {:.1} ({})", label, ri + 1, score, safe_truncate(rubric, 70));
+
+                        rubric_scores_debug.push(serde_json::json!({
+                            "item": rubric, "score": score, "grade": label,
+                        }));
+                    }
+                    JudgeOutcome::FilterDrop => {
+                        // Filter drop: don't count toward denominator — we
+                        // can't score what the judge refused to grade. Log
+                        // it so it's visible in the debug JSONL.
+                        filter_drops += 1;
+                        println!("    [SKIP] R{}: content-filter drop ({})", ri + 1, safe_truncate(rubric, 70));
+                        rubric_scores_debug.push(serde_json::json!({
+                            "item": rubric, "score": null, "grade": "FILTER_DROP",
+                        }));
+                    }
+                    JudgeOutcome::Error => {
+                        // Real API error: counts as 0.0 (fair — we failed
+                        // to verify the answer, and retries already ran).
+                        total_checks += 1;
+                        entry.1 += 1;
+                        println!("    [ERROR] R{}: judge call failed ({})", ri + 1, safe_truncate(rubric, 70));
+                        rubric_scores_debug.push(serde_json::json!({
+                            "item": rubric, "score": 0.0, "grade": "ERROR",
+                        }));
+                    }
                 }
-                println!("    [{}] R{}: {:.1} ({})", label, ri + 1, score, safe_truncate(rubric, 70));
-
-                rubric_scores_debug.push(serde_json::json!({
-                    "item": rubric, "score": score, "grade": label,
-                }));
             }
-            let score = rubric_score_sum / q_rubric_scores.len() as f64;
-            println!("    → Q{} BEAM score: {:.2}", qi + 1, score);
+            let score = if scored_count > 0 {
+                rubric_score_sum / scored_count as f64
+            } else {
+                0.0
+            };
+            if filter_drops > 0 {
+                println!("    → Q{} BEAM score: {:.2} ({} filter drops excluded)", qi + 1, score, filter_drops);
+            } else {
+                println!("    → Q{} BEAM score: {:.2}", qi + 1, score);
+            }
             score
         };
 

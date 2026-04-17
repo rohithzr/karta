@@ -147,6 +147,38 @@ pub struct AskResult {
     pub reranker_best_score: Option<f32>,
 }
 
+/// Retrieved memory context for a query, without calling any LLM.
+///
+/// This is the "retrieve only" output Karta produces — the caller is
+/// responsible for feeding `context` (plus their own prompt, their own
+/// model, their own generation settings) into whatever downstream LLM
+/// they want. Separates retrieval from answer composition so callers
+/// keep full control over the generation step.
+#[derive(Debug, Clone, Serialize)]
+pub struct FetchedMemories {
+    /// Original query string, echoed back for convenience.
+    pub query: String,
+    /// Assembled, LLM-ready context string. Includes the optional EVENTS
+    /// block (for temporal/computation queries) plus the formatted notes
+    /// with provenance markers. Callers can drop this directly into a
+    /// synthesis prompt or post-process as they wish.
+    pub context: String,
+    /// Raw notes in the order they appear in `context`, including any
+    /// contradiction-injected source notes at the tail.
+    pub notes: Vec<MemoryNote>,
+    /// IDs of notes used in `context` (parallel to `notes`).
+    pub note_ids: Vec<String>,
+    /// Query classification mode used for retrieval, as a string (e.g.
+    /// "Breadth", "Temporal"). Useful for telemetry / debugging.
+    pub query_mode: String,
+    /// Number of contradiction source notes force-injected into `notes`.
+    pub contradiction_injected: usize,
+    /// Best reranker relevance score across the retrieved set. `None` if
+    /// the reranker is disabled. Callers can use this as an abstention
+    /// signal before spending LLM cost on composition.
+    pub reranker_best_score: Option<f32>,
+}
+
 /// A forward-looking statement extracted by the LLM during attribute generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForesightExtraction {

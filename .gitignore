@@ -5,6 +5,8 @@ Cargo.lock
 # Project data
 .karta/
 .amem-data/
+docs/superpowers/
+.superpowers
 
 # Environment & secrets
 .env
@@ -44,6 +46,8 @@ Thumbs.db
 data/*.parquet
 data/*.json
 data/*_raw.json
+scripts/gpu-ctl.sh
+scripts/beam-poll.sh
 
 # Legacy PoC artifacts
 *.html

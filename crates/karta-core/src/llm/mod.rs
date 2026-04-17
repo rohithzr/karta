@@ -6,6 +6,9 @@ mod openai;
 #[cfg(feature = "openai")]
 pub use openai::OpenAiProvider;
 
+mod split;
+pub use split::SplitProvider;
+
 mod prompts;
 pub(crate) use prompts::Prompts;
 
