@@ -112,6 +112,135 @@ impl Karta {
     /// OpenAI-compatible endpoint and embeddings go to Azure. This is the
     /// recommended BEAM config: local GPU for gen throughput, Azure for
     /// high-quality embeddings that match the P1 baseline's vector space.
+    #[cfg(all(feature = "sqlite-vec", feature = "sqlite", feature = "openai", not(feature = "lance")))]
+    pub async fn with_defaults(config: KartaConfig) -> Result<Self> {
+        use crate::llm::{OpenAiProvider, SplitProvider};
+        use crate::store::sqlite::SqliteGraphStore;
+        use crate::store::sqlite_vec::SqliteVectorStore;
+
+        // Load .env if present (silently ignore if missing)
+        let _ = dotenvy::dotenv();
+
+        let model_ref = &config.llm.default;
+
+        let chat_model_base = std::env::var("KARTA_CORE_MODEL")
+            .or_else(|_| std::env::var("KARTA_CHAT_MODEL"))
+            .unwrap_or_else(|_| model_ref.model.clone());
+
+        let embedding_model = std::env::var("KARTA_EMBEDDING_MODEL")
+            .unwrap_or_else(|_| {
+                std::env::var("AZURE_OPENAI_EMBEDDING_MODEL")
+                    .unwrap_or_else(|_| "text-embedding-3-small".to_string())
+            });
+
+        let openai_base = model_ref
+            .base_url
+            .clone()
+            .or_else(|| std::env::var("OPENAI_API_BASE").ok());
+        let azure_creds = match (
+            std::env::var("AZURE_OPENAI_API_KEY").ok(),
+            std::env::var("AZURE_OPENAI_ENDPOINT").ok(),
+        ) {
+            (Some(key), Some(endpoint)) => Some((key, endpoint)),
+            (Some(_), None) => {
+                return Err(KartaError::Config(
+                    "AZURE_OPENAI_API_KEY is set but AZURE_OPENAI_ENDPOINT is missing".into(),
+                ));
+            }
+            _ => None,
+        };
+
+        let chat_llm: Arc<dyn LlmProvider> = if let Some(ref base_url) = openai_base {
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .unwrap_or_else(|_| "ollama".to_string());
+            Arc::new(OpenAiProvider::with_api_key(
+                &chat_model_base,
+                &embedding_model,
+                &api_key,
+                Some(base_url),
+            ))
+        } else if let Some((azure_key, endpoint)) = azure_creds.clone() {
+            let chat_model = std::env::var("AZURE_OPENAI_CHAT_MODEL")
+                .unwrap_or_else(|_| chat_model_base.clone());
+            let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
+                .unwrap_or_else(|_| "2025-04-01-preview".to_string());
+            Arc::new(OpenAiProvider::azure(
+                &endpoint,
+                &azure_key,
+                &api_version,
+                &chat_model,
+                &embedding_model,
+            ))
+        } else {
+            Arc::new(OpenAiProvider::new(&chat_model_base, &embedding_model))
+        };
+
+        let answer_model_opt = std::env::var("KARTA_ANSWER_MODEL").ok();
+        let mut synthesis_llm: Option<Arc<dyn LlmProvider>> = None;
+
+        let llm: Arc<dyn LlmProvider> = if openai_base.is_some() {
+            if let Some((azure_key, endpoint)) = azure_creds.clone() {
+                let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
+                    .unwrap_or_else(|_| "2025-04-01-preview".to_string());
+                let azure_chat_model = std::env::var("AZURE_OPENAI_CHAT_MODEL")
+                    .unwrap_or_else(|_| chat_model_base.clone());
+                let azure_embedding_model = std::env::var("AZURE_OPENAI_EMBEDDING_MODEL")
+                    .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+                let embed_llm: Arc<dyn LlmProvider> = Arc::new(OpenAiProvider::azure(
+                    &endpoint,
+                    &azure_key,
+                    &api_version,
+                    &azure_chat_model,
+                    &azure_embedding_model,
+                ));
+                Arc::new(SplitProvider::new(chat_llm, embed_llm))
+            } else {
+                chat_llm
+            }
+        } else {
+            chat_llm
+        };
+
+        if let Some(answer_model) = answer_model_opt {
+            if let Ok(answer_base) = std::env::var("KARTA_ANSWER_BASE_URL") {
+                let answer_key = std::env::var("KARTA_ANSWER_API_KEY")
+                    .unwrap_or_else(|_| "placeholder".to_string());
+                synthesis_llm = Some(Arc::new(OpenAiProvider::with_api_key(
+                    &answer_model,
+                    &embedding_model,
+                    &answer_key,
+                    Some(&answer_base),
+                )));
+            } else if let Some((azure_key, endpoint)) = azure_creds {
+                let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
+                    .unwrap_or_else(|_| "2025-04-01-preview".to_string());
+                let azure_embedding_model = std::env::var("AZURE_OPENAI_EMBEDDING_MODEL")
+                    .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+                synthesis_llm = Some(Arc::new(OpenAiProvider::azure(
+                    &endpoint,
+                    &azure_key,
+                    &api_version,
+                    &answer_model,
+                    &azure_embedding_model,
+                )));
+            }
+        }
+
+        const DEFAULT_DIM: usize = 1536;
+        let embedding_dim = match llm.embed(&["karta-init-probe"]).await {
+            Ok(vectors) if !vectors.is_empty() && !vectors[0].is_empty() => vectors[0].len(),
+            _ => DEFAULT_DIM,
+        };
+
+        let sqlite_vec_store =
+            SqliteVectorStore::new(&config.storage.data_dir, embedding_dim).await?;
+        let shared_conn = sqlite_vec_store.connection();
+        let vector_store = Arc::new(sqlite_vec_store) as Arc<dyn VectorStore>;
+        let graph_store = Arc::new(SqliteGraphStore::with_connection(shared_conn)) as Arc<dyn GraphStore>;
+
+        Self::new_with_synthesis(vector_store, graph_store, llm, synthesis_llm, config).await
+    }
+
     #[cfg(all(feature = "lance", feature = "sqlite", feature = "openai"))]
     pub async fn with_defaults(config: KartaConfig) -> Result<Self> {
         use crate::llm::{OpenAiProvider, SplitProvider};
