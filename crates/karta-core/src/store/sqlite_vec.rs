@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json;
 
 use crate::error::{KartaError, Result};
@@ -112,11 +112,11 @@ impl SqliteVectorStore {
 
     // ── Embedding helpers ─────────────────────────────────────────────────────
 
-    fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
+    pub fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
         embedding.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
-    fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
+    pub fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
         blob.chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect()
@@ -193,7 +193,44 @@ impl crate::store::VectorStore for SqliteVectorStore {
         Ok(count as usize)
     }
 
-    async fn upsert(&self, _note: &MemoryNote) -> Result<()> {
+    async fn upsert(&self, note: &MemoryNote) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+
+        let keywords_json = serde_json::to_string(&note.keywords)?;
+        let tags_json = serde_json::to_string(&note.tags)?;
+        let provenance_json = serde_json::to_string(&note.provenance)?;
+        let status_json = serde_json::to_string(&note.status)?;
+        let created_at = note.created_at.to_rfc3339();
+        let updated_at = note.updated_at.to_rfc3339();
+        let last_accessed_at = note.last_accessed_at.to_rfc3339();
+        let source_timestamp = note.source_timestamp.map(|t| t.to_rfc3339());
+        let embedding_blob = Self::embedding_to_blob(&note.embedding);
+
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO notes
+             (id, content, context, keywords_json, tags_json, provenance_json,
+              confidence, created_at, updated_at, status_json, last_accessed_at,
+              turn_index, source_timestamp, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                note.id, note.content, note.context,
+                keywords_json, tags_json, provenance_json,
+                note.confidence, created_at, updated_at,
+                status_json, last_accessed_at,
+                note.turn_index, source_timestamp,
+                embedding_blob,
+            ],
+        )?;
+
+        tx.execute("DELETE FROM notes_vec WHERE id = ?1", [&note.id])?;
+        tx.execute(
+            "INSERT INTO notes_vec (id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![note.id, embedding_blob],
+        )?;
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -206,19 +243,67 @@ impl crate::store::VectorStore for SqliteVectorStore {
         Ok(Vec::new())
     }
 
-    async fn get(&self, _id: &str) -> Result<Option<MemoryNote>> {
-        Ok(None)
+    async fn get(&self, id: &str) -> Result<Option<MemoryNote>> {
+        let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+        let result = conn
+            .prepare_cached(
+                "SELECT id, content, context, keywords_json, tags_json, provenance_json,
+                        confidence, created_at, updated_at, status_json, last_accessed_at,
+                        turn_index, source_timestamp, embedding
+                 FROM notes WHERE id = ?1",
+            )?
+            .query_row([id], Self::row_to_note)
+            .optional()?;
+        Ok(result)
     }
 
-    async fn get_many(&self, _ids: &[&str]) -> Result<Vec<MemoryNote>> {
-        Ok(Vec::new())
+    async fn get_many(&self, ids: &[&str]) -> Result<Vec<MemoryNote>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+        let placeholders: String = (1..=ids.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, content, context, keywords_json, tags_json, provenance_json,
+                    confidence, created_at, updated_at, status_json, last_accessed_at,
+                    turn_index, source_timestamp, embedding
+             FROM notes WHERE id IN ({})",
+            placeholders
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), Self::row_to_note)?;
+        let mut notes = Vec::new();
+        for row in rows {
+            notes.push(row?);
+        }
+        Ok(notes)
     }
 
     async fn get_all(&self) -> Result<Vec<MemoryNote>> {
-        Ok(Vec::new())
+        let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, content, context, keywords_json, tags_json, provenance_json,
+                    confidence, created_at, updated_at, status_json, last_accessed_at,
+                    turn_index, source_timestamp, embedding
+             FROM notes",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_note)?;
+        let mut notes = Vec::new();
+        for row in rows {
+            notes.push(row?);
+        }
+        Ok(notes)
     }
 
-    async fn delete(&self, _id: &str) -> Result<()> {
+    async fn delete(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+        conn.execute("DELETE FROM notes WHERE id = ?1", [id])?;
+        conn.execute("DELETE FROM notes_vec WHERE id = ?1", [id])?;
         Ok(())
     }
 }
