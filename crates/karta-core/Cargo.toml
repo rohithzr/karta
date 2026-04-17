@@ -6,9 +6,10 @@ license.workspace = true
 description = "Agentic memory system that thinks, not just stores"
 
 [features]
-default = ["lance", "sqlite", "openai"]
+default = ["sqlite-vec", "sqlite", "openai"]
 lance = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
 sqlite = ["dep:rusqlite"]
+sqlite-vec = ["dep:sqlite-vec", "dep:rusqlite"]
 openai = ["dep:async-openai"]
 
 [dependencies]
@@ -46,6 +47,9 @@ arrow-schema = { version = "57", optional = true }
 
 # Graph store: SQLite
 rusqlite = { version = "0.35", features = ["bundled"], optional = true }
+
+# Vector store: sqlite-vec
+sqlite-vec = { version = "=0.1.10-alpha.3", optional = true }
 
 # LLM: OpenAI-compatible
 async-openai = { version = "0.27", optional = true }

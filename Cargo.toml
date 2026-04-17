@@ -9,3 +9,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+
+[patch.crates-io]
+# 0.1.10-alpha.3 published package is missing sqlite-vec-diskann.c; use local vendored copy
+sqlite-vec = { path = "vendor/sqlite-vec" }

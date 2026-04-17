@@ -6,3 +6,6 @@ pub mod lance;
 
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+
+#[cfg(feature = "sqlite-vec")]
+pub mod sqlite_vec;
