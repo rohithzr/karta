@@ -110,3 +110,68 @@ async fn test_get_all() {
     let all = store.get_all().await.unwrap();
     assert_eq!(all.len(), 2);
 }
+
+#[tokio::test]
+async fn test_find_similar() {
+    let dir = TempDir::new().unwrap();
+    let store = SqliteVectorStore::new(dir.path().to_str().unwrap(), 4).await.unwrap();
+
+    let mut n1 = make_test_note("n1", "cats are great", 4);
+    n1.embedding = vec![1.0, 0.0, 0.0, 0.0];
+    store.upsert(&n1).await.unwrap();
+
+    let mut n2 = make_test_note("n2", "dogs are great", 4);
+    n2.embedding = vec![0.9, 0.1, 0.0, 0.0];
+    store.upsert(&n2).await.unwrap();
+
+    let mut n3 = make_test_note("n3", "fish are great", 4);
+    n3.embedding = vec![0.0, 0.0, 1.0, 0.0];
+    store.upsert(&n3).await.unwrap();
+
+    let results = store.find_similar(&[1.0, 0.0, 0.0, 0.0], 2, &[]).await.unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0.id, "n1");
+    assert_eq!(results[1].0.id, "n2");
+    assert!(results[0].1 > results[1].1);
+}
+
+#[tokio::test]
+async fn test_find_similar_with_excludes() {
+    let dir = TempDir::new().unwrap();
+    let store = SqliteVectorStore::new(dir.path().to_str().unwrap(), 4).await.unwrap();
+
+    let mut n1 = make_test_note("n1", "cats", 4);
+    n1.embedding = vec![1.0, 0.0, 0.0, 0.0];
+    store.upsert(&n1).await.unwrap();
+
+    let mut n2 = make_test_note("n2", "dogs", 4);
+    n2.embedding = vec![0.9, 0.1, 0.0, 0.0];
+    store.upsert(&n2).await.unwrap();
+
+    let results = store.find_similar(&[1.0, 0.0, 0.0, 0.0], 2, &["n1"]).await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0.id, "n2");
+}
+
+#[tokio::test]
+async fn test_find_similar_empty_store() {
+    let dir = TempDir::new().unwrap();
+    let store = SqliteVectorStore::new(dir.path().to_str().unwrap(), 4).await.unwrap();
+    let results = store.find_similar(&[1.0, 0.0, 0.0, 0.0], 5, &[]).await.unwrap();
+    assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn test_delete_removes_from_knn() {
+    let dir = TempDir::new().unwrap();
+    let store = SqliteVectorStore::new(dir.path().to_str().unwrap(), 4).await.unwrap();
+
+    let mut n1 = make_test_note("n1", "cat", 4);
+    n1.embedding = vec![1.0, 0.0, 0.0, 0.0];
+    store.upsert(&n1).await.unwrap();
+
+    store.delete("n1").await.unwrap();
+
+    let results = store.find_similar(&[1.0, 0.0, 0.0, 0.0], 5, &[]).await.unwrap();
+    assert!(results.is_empty());
+}

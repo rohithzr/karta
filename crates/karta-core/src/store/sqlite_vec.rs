@@ -236,11 +236,53 @@ impl crate::store::VectorStore for SqliteVectorStore {
 
     async fn find_similar(
         &self,
-        _embedding: &[f32],
-        _top_k: usize,
-        _exclude_ids: &[&str],
+        embedding: &[f32],
+        top_k: usize,
+        exclude_ids: &[&str],
     ) -> Result<Vec<(MemoryNote, f32)>> {
-        Ok(Vec::new())
+        let query_blob = Self::embedding_to_blob(embedding);
+        let limit = (top_k + exclude_ids.len()) as i64;
+
+        // Scope the lock so conn and stmt are dropped before any await point.
+        let filtered: Vec<(String, f64)> = {
+            let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+            let mut stmt = conn.prepare(
+                "SELECT id, distance FROM notes_vec \
+                 WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+            )?;
+            let rows: Vec<(String, f64)> = stmt
+                .query_map(rusqlite::params![query_blob, limit], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows.into_iter()
+                .filter(|(id, _)| !exclude_ids.contains(&id.as_str()))
+                .take(top_k)
+                .collect()
+        }; // conn and stmt dropped here
+
+        if filtered.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let distance_map: std::collections::HashMap<String, f64> =
+            filtered.iter().map(|(id, d)| (id.clone(), *d)).collect();
+        let ids: Vec<&str> = filtered.iter().map(|(id, _)| id.as_str()).collect();
+
+        let notes = self.get_many(&ids).await?;
+
+        let mut scored: Vec<(MemoryNote, f32)> = notes
+            .into_iter()
+            .map(|note| {
+                let distance = distance_map.get(&note.id).copied().unwrap_or(0.0);
+                (note, 1.0 / (1.0 + distance as f32))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        Ok(scored)
     }
 
     async fn get(&self, id: &str) -> Result<Option<MemoryNote>> {
