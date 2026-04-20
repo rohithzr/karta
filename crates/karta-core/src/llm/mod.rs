@@ -6,6 +6,9 @@ mod openai;
 #[cfg(feature = "openai")]
 pub use openai::OpenAiProvider;
 
+mod azure_responses;
+pub use azure_responses::AzureResponsesProvider;
+
 mod prompts;
 pub(crate) use prompts::Prompts;
 
