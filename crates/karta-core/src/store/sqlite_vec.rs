@@ -67,6 +67,9 @@ impl SqliteVectorStore {
         let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
         let dim = self.embedding_dim;
 
+        // Schema is recreated from scratch on first run of the new code.
+        // No migration support — existing data dirs (`/tmp/karta-*`, etc.)
+        // must be deleted and re-ingested. We're experimental; this is fine.
         let ddl = format!(
             "
             CREATE TABLE IF NOT EXISTS notes (
@@ -82,7 +85,8 @@ impl SqliteVectorStore {
                 status_json TEXT NOT NULL DEFAULT '\"Active\"',
                 last_accessed_at TEXT NOT NULL,
                 turn_index INTEGER,
-                source_timestamp TEXT,
+                source_timestamp TEXT NOT NULL,
+                session_id TEXT,
                 embedding BLOB NOT NULL
             );
             CREATE TABLE IF NOT EXISTS atomic_facts (
@@ -137,7 +141,8 @@ impl SqliteVectorStore {
         let status_json: String = row.get("status_json")?;
         let last_accessed_at: String = row.get("last_accessed_at")?;
         let turn_index: Option<u32> = row.get("turn_index")?;
-        let source_timestamp: Option<String> = row.get("source_timestamp")?;
+        let source_timestamp: String = row.get("source_timestamp")?;
+        let session_id: Option<String> = row.get("session_id")?;
         let embedding_blob: Vec<u8> = row.get("embedding")?;
 
         let keywords: Vec<String> =
@@ -159,9 +164,8 @@ impl SqliteVectorStore {
             .parse()
             .unwrap_or_else(|_| chrono::Utc::now());
         let source_timestamp = source_timestamp
-            .as_deref()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(chrono::Utc::now);
+            .parse()
+            .unwrap_or_else(|_| chrono::Utc::now());
 
         Ok(MemoryNote {
             id,
@@ -180,7 +184,7 @@ impl SqliteVectorStore {
             last_accessed_at,
             turn_index,
             source_timestamp,
-            session_id: None,
+            session_id,
         })
     }
 }
@@ -214,14 +218,14 @@ impl crate::store::VectorStore for SqliteVectorStore {
             "INSERT OR REPLACE INTO notes
              (id, content, context, keywords_json, tags_json, provenance_json,
               confidence, created_at, updated_at, status_json, last_accessed_at,
-              turn_index, source_timestamp, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              turn_index, source_timestamp, session_id, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 note.id, note.content, note.context,
                 keywords_json, tags_json, provenance_json,
                 note.confidence, created_at, updated_at,
                 status_json, last_accessed_at,
-                note.turn_index, source_timestamp,
+                note.turn_index, source_timestamp, note.session_id,
                 embedding_blob,
             ],
         )?;
@@ -293,7 +297,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
             .prepare_cached(
                 "SELECT id, content, context, keywords_json, tags_json, provenance_json,
                         confidence, created_at, updated_at, status_json, last_accessed_at,
-                        turn_index, source_timestamp, embedding
+                        turn_index, source_timestamp, session_id, embedding
                  FROM notes WHERE id = ?1",
             )?
             .query_row([id], Self::row_to_note)
@@ -313,7 +317,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
         let sql = format!(
             "SELECT id, content, context, keywords_json, tags_json, provenance_json,
                     confidence, created_at, updated_at, status_json, last_accessed_at,
-                    turn_index, source_timestamp, embedding
+                    turn_index, source_timestamp, session_id, embedding
              FROM notes WHERE id IN ({})",
             placeholders
         );
@@ -333,7 +337,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
         let mut stmt = conn.prepare(
             "SELECT id, content, context, keywords_json, tags_json, provenance_json,
                     confidence, created_at, updated_at, status_json, last_accessed_at,
-                    turn_index, source_timestamp, embedding
+                    turn_index, source_timestamp, session_id, embedding
              FROM notes",
         )?;
         let rows = stmt.query_map([], Self::row_to_note)?;
