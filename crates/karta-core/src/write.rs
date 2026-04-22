@@ -250,7 +250,9 @@ impl WriteEngine {
         // Both default TTL and DOA filter anchor to ctx.reference_time(), not
         // Utc::now() — a foresight extracted from a 2024 message must be
         // judged against 2024's "now", not the wall clock at replay time.
-        let default_ttl = chrono::Duration::days(self.config.foresight_default_ttl_days);
+        let default_ttl = chrono::Duration::milliseconds(
+            (self.config.foresight_default_ttl_days * 86_400_000.0) as i64,
+        );
         let doa_window = chrono::Duration::milliseconds(
             (self.config.foresight_doa_threshold_days * 86_400_000.0) as i64,
         );

@@ -204,8 +204,12 @@ async fn ingest_sessions(karta: &Karta, sessions: &[Session]) -> usize {
                 } else {
                     format!("[{}] {}", session.label, msg.content)
                 };
+                let ctx = match source_timestamp {
+                    Some(t) => karta_core::ClockContext::at(t),
+                    None => karta_core::ClockContext::now(),
+                };
                 let result = karta
-                    .add_note_with_metadata(&note, &session_id, Some(global_turn), source_timestamp)
+                    .add_note_with_clock(&note, Some(&session_id), Some(global_turn), ctx)
                     .await
                     .unwrap();
                 count += 1;

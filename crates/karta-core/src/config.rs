@@ -163,7 +163,7 @@ pub struct WriteConfig {
     /// Max evolutions before a note is flagged for consolidation instead.
     pub max_evolutions_per_note: usize,
     /// Default TTL in days for foresight signals when no explicit expiry is extracted.
-    pub foresight_default_ttl_days: i64,
+    pub foresight_default_ttl_days: f64,
     /// Whether to extract and store atomic facts during note ingestion.
     pub extract_atomic_facts: bool,
     /// Maximum number of atomic facts to extract per note.
@@ -193,7 +193,7 @@ impl Default for WriteConfig {
             similarity_threshold: 0.3,
             evolve_linked_notes: true,
             max_evolutions_per_note: 5,
-            foresight_default_ttl_days: 90,
+            foresight_default_ttl_days: 90.0,
             extract_atomic_facts: true,
             max_facts_per_note: 5,
             foresight_doa_threshold_days: 1.0,
