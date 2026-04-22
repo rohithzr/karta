@@ -435,7 +435,7 @@ impl Karta {
         session_id: &str,
     ) -> Result<MemoryNote> {
         self.write_engine
-            .add_note_with_session(content, session_id)
+            .add_note_with_clock(content, Some(session_id), None, crate::clock::ClockContext::now())
             .await
     }
 
@@ -449,20 +449,13 @@ impl Karta {
         turn_index: Option<u32>,
         source_timestamp: Option<DateTime<Utc>>,
     ) -> Result<MemoryNote> {
-        let mut note = self
-            .write_engine
-            .add_note_with_session(content, session_id)
-            .await?;
-
-        if turn_index.is_some() || source_timestamp.is_some() {
-            note.turn_index = turn_index;
-            if let Some(ts) = source_timestamp {
-                note.source_timestamp = ts;
-            }
-            self.vector_store.upsert(&note).await?;
-        }
-
-        Ok(note)
+        let ctx = match source_timestamp {
+            Some(ts) => crate::clock::ClockContext::at(ts),
+            None => crate::clock::ClockContext::now(),
+        };
+        self.write_engine
+            .add_note_with_clock(content, Some(session_id), turn_index, ctx)
+            .await
     }
 
     // --- Read ---

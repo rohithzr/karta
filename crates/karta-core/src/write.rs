@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::clock::ClockContext;
 use crate::config::{EpisodeConfig, WriteConfig};
 use crate::error::Result;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
@@ -37,7 +38,54 @@ impl WriteEngine {
         }
     }
 
+    /// Live-default sugar over `add_note_with_clock`. Used by smoke tests
+    /// and quick scripts that don't need to express a session, turn index, or
+    /// reference time.
     pub async fn add_note(&self, content: &str) -> Result<MemoryNote> {
+        self.add_note_with_clock(content, None, None, ClockContext::now())
+            .await
+    }
+
+    /// Canonical write entrypoint. `session_id` carries through to episode
+    /// segmentation; `turn_index` lets the read path order chronologically;
+    /// `ctx.reference_time()` becomes the note's `source_timestamp` and the
+    /// anchor for foresight TTL math at this turn.
+    pub async fn add_note_with_clock(
+        &self,
+        content: &str,
+        session_id: Option<&str>,
+        turn_index: Option<u32>,
+        ctx: ClockContext,
+    ) -> Result<MemoryNote> {
+        let note = self.add_note_inner(content, session_id, turn_index, ctx).await?;
+        if session_id.is_some() {
+            self.maybe_extend_episode(session_id.unwrap(), &note, ctx).await?;
+        }
+        Ok(note)
+    }
+
+    async fn add_note_inner(
+        &self,
+        content: &str,
+        session_id: Option<&str>,
+        turn_index: Option<u32>,
+        ctx: ClockContext,
+    ) -> Result<MemoryNote> {
+        // Future-skew warning (codex #2). If the data's reference_time is
+        // more than `future_skew_threshold_days` ahead of the wall clock,
+        // log it but don't reject — production may have legitimate
+        // client/server clock skew. Recency math clamps the negative-age
+        // case at read time.
+        let skew_days =
+            (ctx.reference_time() - Utc::now()).num_seconds() as f64 / 86400.0;
+        if skew_days > self.config.future_skew_threshold_days {
+            warn!(
+                skew_days,
+                reference_time = %ctx.reference_time(),
+                "ingest received future-dated reference_time"
+            );
+        }
+
         let preview_end = {
             let max = 60;
             let mut end = content.len().min(max);
@@ -57,11 +105,17 @@ impl WriteEngine {
         let raw_embedding = raw_embeddings?.into_iter().next().unwrap_or_default();
         debug!(context = %attrs.context, "Generated attributes");
 
-        // 2. Create the note
+        // 2. Create the note. source_timestamp = ctx.reference_time() —
+        // every note carries the data's "now" at ingest. Live mode passes
+        // ClockContext::now() so this matches Utc::now(); replay passes a
+        // parsed source-clock instant.
         let mut note = MemoryNote::new(content.to_string());
         note.context = attrs.context;
         note.keywords = attrs.keywords;
         note.tags = attrs.tags;
+        note.source_timestamp = ctx.reference_time();
+        note.turn_index = turn_index;
+        note.session_id = session_id.map(String::from);
 
         // 3. Use raw embedding for candidate search (fast path)
         let candidates = trace::stage("knn", async {
@@ -192,11 +246,17 @@ impl WriteEngine {
 
         note.links = link_decisions.iter().map(|d| d.note_id.clone()).collect();
 
-        // 9. Store foresight signals extracted during attribute generation
+        // 9. Store foresight signals extracted during attribute generation.
+        // Both default TTL and DOA filter anchor to ctx.reference_time(), not
+        // Utc::now() — a foresight extracted from a 2024 message must be
+        // judged against 2024's "now", not the wall clock at replay time.
         let default_ttl = chrono::Duration::days(self.config.foresight_default_ttl_days);
+        let doa_window = chrono::Duration::milliseconds(
+            (self.config.foresight_doa_threshold_days * 86_400_000.0) as i64,
+        );
+        let doa_horizon = ctx.reference_time() + doa_window;
         for signal in &attrs.foresight_signals {
             if !signal.content.is_empty() {
-                // Parse valid_until from LLM extraction, fall back to default TTL
                 let valid_until = signal
                     .valid_until
                     .as_deref()
@@ -206,7 +266,23 @@ impl WriteEngine {
                             .and_then(|d| d.and_hms_opt(23, 59, 59))
                             .map(|dt| dt.and_utc())
                     })
-                    .or_else(|| Some(Utc::now() + default_ttl));
+                    .or_else(|| Some(ctx.reference_time() + default_ttl));
+
+                // Foresight DOA filter (codex #2 partial): drop signals
+                // whose valid_until is already inside the DOA window from
+                // reference_time. Storing a foresight that's expired (or
+                // about to expire) wastes a row and pollutes the active set
+                // until the next dream cycle catches it.
+                if let Some(until) = valid_until {
+                    if until <= doa_horizon {
+                        warn!(
+                            valid_until = %until,
+                            reference_time = %ctx.reference_time(),
+                            "dropping DOA foresight"
+                        );
+                        continue;
+                    }
+                }
 
                 let fs = crate::note::ForesightSignal::new(
                     signal.content.clone(),
@@ -281,41 +357,39 @@ impl WriteEngine {
         Ok(note)
     }
 
-    /// Add a note within a session context. Handles episode boundary detection
-    /// and narrative synthesis when episodes are enabled.
-    pub async fn add_note_with_session(
+    /// Episode segmentation step. Called by `add_note_with_clock` when a
+    /// session_id is supplied. Time-gap math anchors to `ctx.reference_time()`
+    /// so replay sessions split into episodes the same way live ones do —
+    /// without this, a 2024 message replayed in 2026 looks like a 2-year gap
+    /// from any pre-existing episode and force-splits every turn.
+    async fn maybe_extend_episode(
         &self,
-        content: &str,
         session_id: &str,
-    ) -> Result<MemoryNote> {
-        // First, add the note normally
-        let note = self.add_note(content).await?;
-
+        note: &MemoryNote,
+        ctx: ClockContext,
+    ) -> Result<()> {
         if !self.episode_config.enabled {
-            return Ok(note);
+            return Ok(());
         }
 
-        // Get existing episodes for this session
+        let content = note.content.as_str();
         let episodes = self
             .graph_store
             .get_episodes_for_session(session_id)
             .await?;
-
         let current_episode = episodes.last();
 
-        // Decide: extend current episode or create new one?
         let should_new_episode = match current_episode {
             None => true,
             Some(ep) => {
-                let time_gap = Utc::now()
+                let time_gap = ctx
+                    .reference_time()
                     .signed_duration_since(ep.end_time)
                     .num_seconds();
 
-                // Hard boundary: time gap exceeds threshold
                 if time_gap > self.episode_config.time_gap_threshold_secs {
                     true
                 } else {
-                    // Soft boundary: ask LLM about thematic shift
                     let last_note_content = if let Some(last_id) = ep.note_ids.last() {
                         self.vector_store
                             .get(last_id)
@@ -340,20 +414,20 @@ impl WriteEngine {
         };
 
         if should_new_episode {
-            // Create new episode
             let mut episode = Episode::new(session_id.to_string());
             episode.note_ids.push(note.id.clone());
-            episode.end_time = Utc::now();
+            episode.start_time = ctx.reference_time();
+            episode.end_time = ctx.reference_time();
 
-            // Synthesize narrative for this first note
             let (narrative, tags) = trace::stage("narrative_synth",
                 self.synthesize_narrative(&[content])).await?;
             episode.narrative = narrative.clone();
             episode.topic_tags = tags;
 
-            // Create narrative note
+            // Narrative-note source_timestamp = max(input.source_timestamp).
+            // First note in episode → that's just this note's source_timestamp.
             let narrative_note = trace::stage("narrative_note",
-                self.create_narrative_note(&narrative, &episode.id)).await?;
+                self.create_narrative_note(&narrative, &episode.id, note.source_timestamp)).await?;
             episode.narrative_note_id = Some(narrative_note.id.clone());
 
             self.graph_store.upsert_episode(&episode).await?;
@@ -363,12 +437,10 @@ impl WriteEngine {
 
             debug!(episode_id = %episode.id, session = session_id, "Created new episode");
         } else if let Some(ep) = current_episode {
-            // Extend existing episode
             self.graph_store
                 .add_note_to_episode(&note.id, &ep.id)
                 .await?;
 
-            // Re-synthesize narrative with all notes in the episode
             let all_note_ids = self
                 .graph_store
                 .get_notes_for_episode(&ep.id)
@@ -377,20 +449,27 @@ impl WriteEngine {
             let all_notes = self.vector_store.get_many(&all_refs).await?;
             let contents: Vec<&str> = all_notes.iter().map(|n| n.content.as_str()).collect();
 
+            // max(input.source_timestamp) over the episode's notes — bounded
+            // claim for the narrative's effective freshness.
+            let max_source_ts = all_notes
+                .iter()
+                .map(|n| n.source_timestamp)
+                .max()
+                .unwrap_or_else(|| note.source_timestamp);
+
             let (narrative, tags) = trace::stage("narrative_resynth",
                 self.synthesize_narrative(&contents)).await?;
 
-            // Update episode
             let mut updated = ep.clone();
-            updated.end_time = Utc::now();
+            updated.end_time = ctx.reference_time();
             updated.narrative = narrative.clone();
             updated.topic_tags = tags;
 
-            // Update or create narrative note
             if let Some(ref nar_id) = updated.narrative_note_id {
                 if let Some(mut nar_note) = self.vector_store.get(nar_id).await? {
                     nar_note.content = narrative;
                     nar_note.updated_at = Utc::now();
+                    nar_note.source_timestamp = max_source_ts;
                     let emb = trace::stage("embed_narrative", async {
                         self.llm.embed(&[&nar_note.content]).await
                     }).await?;
@@ -403,7 +482,7 @@ impl WriteEngine {
             debug!(episode_id = %ep.id, notes = all_note_ids.len(), "Extended episode");
         }
 
-        Ok(note)
+        Ok(())
     }
 
     async fn detect_episode_boundary(
@@ -474,12 +553,18 @@ impl WriteEngine {
         &self,
         narrative: &str,
         episode_id: &str,
+        source_timestamp: chrono::DateTime<Utc>,
     ) -> Result<MemoryNote> {
         let embeddings = trace::stage("embed_narrative", async {
             self.llm.embed(&[narrative]).await
         }).await?;
         let embedding = embeddings.into_iter().next().unwrap_or_default();
 
+        // Narrative notes are inferences over a batch. source_timestamp =
+        // max(input.source_timestamp) is the bounded claim — same shape as
+        // dream notes (see dream/engine.rs persist_dream). Stamping with
+        // Utc::now() would create the time-travel-confidence bug for
+        // back-dated queries.
         let note = MemoryNote {
             id: Uuid::new_v4().to_string(),
             content: narrative.to_string(),
@@ -498,7 +583,7 @@ impl WriteEngine {
             status: crate::note::NoteStatus::Active,
             last_accessed_at: Utc::now(),
             turn_index: None,
-            source_timestamp: Utc::now(),
+            source_timestamp,
             session_id: None,
         };
 
