@@ -322,6 +322,9 @@ impl WriteEngine {
                         fact.subject = extraction.subject.clone();
                         fact.embedding = embedding;
                         fact.created_at = note.created_at;
+                        fact.occurred_start = extraction.occurred_start;
+                        fact.occurred_end = extraction.occurred_end;
+                        fact.occurred_confidence = extraction.occurred_confidence;
 
                         let fact_id = fact.id.clone();
                         let fact_content = fact.content.clone();
@@ -660,9 +663,26 @@ impl WriteEngine {
                 .map(|a| {
                     a.iter()
                         .filter_map(|v| {
+                            let occurred_start = v["occurred_start"]
+                                .as_str()
+                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                .map(|dt| dt.with_timezone(&chrono::Utc));
+                            let occurred_end = v["occurred_end"]
+                                .as_str()
+                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                .map(|dt| dt.with_timezone(&chrono::Utc));
+                            let occurred_confidence = v["occurred_confidence"]
+                                .as_f64()
+                                .and_then(|f| {
+                                    crate::read::temporal::ConfidenceBand::try_from_f32(f as f32).ok()
+                                })
+                                .unwrap_or(crate::read::temporal::ConfidenceBand::None);
                             Some(crate::note::AtomicFactExtraction {
                                 content: v["content"].as_str()?.to_string(),
                                 subject: v["subject"].as_str().map(String::from),
+                                occurred_start,
+                                occurred_end,
+                                occurred_confidence,
                             })
                         })
                         .collect()

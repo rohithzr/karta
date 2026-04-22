@@ -80,12 +80,27 @@ pub fn note_attributes_schema() -> JsonSchema {
                         "type": "object",
                         "properties": {
                             "content": { "type": "string", "description": "A single atomic, independently verifiable statement." },
-                            "subject": { "type": ["string", "null"], "description": "Primary entity or topic this fact is about. null if general." }
+                            "subject": { "type": ["string", "null"], "description": "Primary entity or topic this fact is about. null if general." },
+                            "occurred_start": {
+                                "type": ["string", "null"],
+                                "format": "date-time",
+                                "description": "Inclusive lower bound (ISO 8601 UTC) of when the asserted event occurred. Null iff occurred_end is also null. For a date-only reference use 00:00:00Z. For true instants, 1 nanosecond before occurred_end."
+                            },
+                            "occurred_end": {
+                                "type": ["string", "null"],
+                                "format": "date-time",
+                                "description": "Exclusive upper bound (ISO 8601 UTC). Use the next day for a date-only reference, next month for a month reference, next quarter for a quarter reference, occurred_start + 1ns for true instants."
+                            },
+                            "occurred_confidence": {
+                                "type": "number",
+                                "enum": [0.0, 0.5, 0.7, 0.8, 1.0],
+                                "description": "Discrete band: 1.0 = explicit ISO date in source; 0.8 = natural-language absolute date (e.g. 'March 15, 2024'); 0.7 = relative reference with deterministic resolution (e.g. 'yesterday', 'next Friday'); 0.5 = vague reference with range chosen (e.g. 'recently', 'around March'); 0.0 = no temporal content. Must be exactly one of these values."
+                            }
                         },
-                        "required": ["content", "subject"],
+                        "required": ["content", "subject", "occurred_start", "occurred_end", "occurred_confidence"],
                         "additionalProperties": false
                     },
-                    "description": "1-5 atomic facts. Each is a standalone, verifiable statement with one specific claim."
+                    "description": "1-5 atomic facts. Each is a standalone, verifiable statement. Every fact MUST emit all three occurred_* fields explicitly — use nulls (0.0) for facts with no temporal content. Silent omission is forbidden."
                 }
             },
             "required": ["reasoning", "context", "keywords", "tags", "foresight_signals", "atomic_facts"],

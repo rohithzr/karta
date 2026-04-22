@@ -214,6 +214,15 @@ pub struct NoteAttributes {
 pub struct AtomicFactExtraction {
     pub content: String,
     pub subject: Option<String>,
+    /// ISO-8601 UTC or null. Null iff `occurred_end` is also null.
+    #[serde(default)]
+    pub occurred_start: Option<DateTime<Utc>>,
+    /// ISO-8601 UTC or null. Null iff `occurred_start` is also null.
+    #[serde(default)]
+    pub occurred_end: Option<DateTime<Utc>>,
+    /// Discrete confidence band (see STEP1.5 resolved decision #4).
+    #[serde(default = "default_confidence_band")]
+    pub occurred_confidence: crate::read::temporal::ConfidenceBand,
 }
 
 /// LLM decision about whether to link two notes.
