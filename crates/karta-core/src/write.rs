@@ -355,6 +355,22 @@ impl WriteEngine {
                             continue;
                         }
 
+                        // Specificity gate (THIRD): drop facts that are generic on both axes.
+                        if let Err(e) = crate::extract::admission::validate_specificity(
+                            extraction.entity_type,
+                            extraction.facet,
+                        ) {
+                            tracing::debug!(
+                                note_id = %note.id,
+                                fact_ordinal = i,
+                                entity_type = ?extraction.entity_type,
+                                facet = ?extraction.facet,
+                                error = %e,
+                                "dropping fact: specificity failed",
+                            );
+                            continue;
+                        }
+
                         fact.memory_kind = extraction.memory_kind;
                         fact.facet = extraction.facet;
                         fact.entity_type = extraction.entity_type;
