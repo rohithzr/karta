@@ -45,17 +45,30 @@ struct BeamConversation {
     id: String,
     category: String,
     title: String,
-    user_messages: Vec<BeamMessage>,
+    sessions: Vec<BeamSession>,
     total_turns: usize,
+    total_user_turns: usize,
     questions: Vec<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
-struct BeamMessage {
-    #[allow(dead_code)]
+#[allow(dead_code)]
+struct BeamSession {
+    session_index: usize,
+    session_anchor: Option<String>,
+    turns: Vec<BeamTurn>,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct BeamTurn {
+    turn_index: u32,
     role: String,
     content: String,
-    time_anchor: String,
+    time_anchor: Option<String>,
+    effective_reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    question_type: Option<String>,
+    raw_index: Option<String>,
 }
 
 fn resolve_dataset_path() -> String {
@@ -69,17 +82,6 @@ fn resolve_dataset_path() -> String {
     let workspace_relative = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../data/beam-100k.json");
     workspace_relative.to_string_lossy().into_owned()
-}
-
-fn parse_time_anchor(anchor: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::NaiveDate;
-    let anchor = anchor.trim();
-    for fmt in &["%Y-%m-%d", "%B-%d-%Y", "%B %d, %Y", "%d-%B-%Y"] {
-        if let Ok(d) = NaiveDate::parse_from_str(anchor, fmt) {
-            return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
-        }
-    }
-    None
 }
 
 /// Build an Azure-Azure provider (chat + embed both via Azure OpenAI).
@@ -160,8 +162,8 @@ async fn trace_conv0() {
         .expect("BEAM dataset has no conversations");
 
     println!(
-        "Tracing conv {} [{}]: {} user msgs total, ingesting first {}",
-        conv.id, conv.category, conv.user_messages.len(), turns
+        "Tracing conv {} [{}]: {} sessions / {} total turns ({} user), ingesting first {} user turns",
+        conv.id, conv.category, conv.sessions.len(), conv.total_turns, conv.total_user_turns, turns
     );
 
     // --- Output paths ---
@@ -224,37 +226,36 @@ async fn trace_conv0() {
     .await
     .expect("Karta::new");
 
-    // --- Ingest first N turns under trace ---
-    let mut current_session = 0usize;
-    let mut last_anchor = String::new();
+    // --- Flatten sessions to user turns; take first N. ---
+    // The trace harness's intent is to characterise per-stage ingest cost
+    // on user turns specifically. Assistant turns are present in the JSON
+    // post-F8 but ingestion semantics for them are still TBD (Q9).
     let session_prefix = format!("trace-conv{}", conv.id);
+    let user_turns: Vec<(usize, &BeamSession, &BeamTurn)> = conv
+        .sessions
+        .iter()
+        .flat_map(|s| s.turns.iter().map(move |t| (s, t)))
+        .filter(|(_, t)| t.role == "user" && !t.content.trim().is_empty())
+        .take(turns)
+        .enumerate()
+        .map(|(i, (s, t))| (i, s, t))
+        .collect();
 
     let overall_start = Instant::now();
 
-    for (i, msg) in conv.user_messages.iter().take(turns).enumerate() {
-        if msg.content.trim().is_empty() {
-            continue;
-        }
-
-        if !msg.time_anchor.is_empty() && msg.time_anchor != last_anchor {
-            current_session += 1;
-            last_anchor = msg.time_anchor.clone();
-        }
-        let session_id = format!("{}-s{}", session_prefix, current_session);
-        let ctx = match parse_time_anchor(&msg.time_anchor) {
-            Some(ts) => karta_core::clock::ClockContext::at(ts),
+    for (i, session, turn) in &user_turns {
+        let session_id = format!("{}-s{}", session_prefix, session.session_index);
+        let ctx = match turn.effective_reference_time {
+            Some(t) => karta_core::clock::ClockContext::at(t),
             None => karta_core::clock::ClockContext::now(),
         };
-        let content = if msg.time_anchor.is_empty() {
-            msg.content.clone()
-        } else {
-            format!("[{}] {}", msg.time_anchor, msg.content)
-        };
+        // No more harness-side `[time_anchor]` prefix — anchor lives in ctx.
+        let content = turn.content.clone();
 
         let writer_clone = Arc::clone(&writer);
         let karta_ref = &karta;
         let content_for_event = if heavy { Some(content.clone()) } else { None };
-        let turn_idx = i as u32;
+        let turn_idx = *i as u32;
 
         let turn_start = Instant::now();
         writer_clone.emit(TraceEvent::TurnStart {
