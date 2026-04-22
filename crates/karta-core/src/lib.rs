@@ -2,6 +2,7 @@ pub mod clock;
 pub mod config;
 pub mod dream;
 pub mod error;
+pub mod extract;
 pub mod llm;
 pub mod note;
 pub mod read;
