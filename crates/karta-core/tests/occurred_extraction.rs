@@ -106,3 +106,29 @@ async fn non_temporal_fact_has_null_bounds_and_zero_confidence() {
         "non-temporal content should have ConfidenceBand::None"
     );
 }
+
+#[tokio::test]
+async fn f7_t4_instant_encoded_as_1ns_interval() {
+    use karta_core::note::AtomicFact;
+
+    let t = Utc.with_ymd_and_hms(2024, 3, 15, 14, 30, 0).unwrap();
+    let fact = AtomicFact {
+        id: "f-inst".into(),
+        content: "Event at 14:30:00 UTC".into(),
+        source_note_id: "n-inst".into(),
+        ordinal: 0,
+        subject: None,
+        embedding: (0..1536).map(|i| i as f32 / 1536.0).collect(),
+        created_at: Utc::now(),
+        source_timestamp: t,
+        occurred_start: Some(t),
+        occurred_end: Some(t + chrono::Duration::nanoseconds(1)),
+        occurred_confidence: ConfidenceBand::Explicit,
+    };
+    assert!(fact.validate_occurred().is_ok());
+    assert_eq!(
+        fact.occurred_end.unwrap() - fact.occurred_start.unwrap(),
+        chrono::Duration::nanoseconds(1),
+        "instant must be exactly 1ns wide"
+    );
+}
