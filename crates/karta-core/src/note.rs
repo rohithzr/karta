@@ -319,6 +319,34 @@ pub struct AtomicFact {
     #[serde(skip)]
     pub embedding: Vec<f32>,
     pub created_at: DateTime<Utc>,
+    /// Inherited from parent MemoryNote.source_timestamp at write time.
+    /// Enables fact-level recency on replay data.
+    #[serde(default = "Utc::now")]
+    pub source_timestamp: DateTime<Utc>,
+    /// Lower bound (inclusive) of when the asserted event occurred.
+    /// `None` iff `occurred_end` is also None (invariant #1).
+    #[serde(default)]
+    pub occurred_start: Option<DateTime<Utc>>,
+    /// Upper bound (exclusive). Half-open semantics.
+    #[serde(default)]
+    pub occurred_end: Option<DateTime<Utc>>,
+    /// Discrete confidence band. `None` iff both bounds are None (invariant #4).
+    #[serde(default = "default_confidence_band")]
+    pub occurred_confidence: crate::read::temporal::ConfidenceBand,
+}
+
+fn default_confidence_band() -> crate::read::temporal::ConfidenceBand {
+    crate::read::temporal::ConfidenceBand::None
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OccurredValidationError {
+    #[error("invariant #1 broken: start and end must both be Some or both be None")]
+    UnpairedBounds,
+    #[error("invariant #2 broken: end ({end}) must be strictly greater than start ({start})")]
+    EndNotAfterStart { start: DateTime<Utc>, end: DateTime<Utc> },
+    #[error("invariant #4 broken: confidence == None iff both bounds are None (got conf={conf:?}, bounds paired={paired})")]
+    ConfidenceBoundsMismatch { conf: crate::read::temporal::ConfidenceBand, paired: bool },
 }
 
 impl AtomicFact {
@@ -331,7 +359,42 @@ impl AtomicFact {
             subject: None,
             embedding: Vec::new(),
             created_at: Utc::now(),
+            source_timestamp: Utc::now(),
+            occurred_start: None,
+            occurred_end: None,
+            occurred_confidence: crate::read::temporal::ConfidenceBand::None,
         }
+    }
+
+    /// Enforce the 4 invariants from STEP1.5 decisions (null pairing,
+    /// end-after-start, closed-set confidence via type, confidence-bounds
+    /// pairing). Invariant #3 (confidence ∈ [0,1]) is enforced at the
+    /// type level by `ConfidenceBand` — impossible to violate here.
+    pub fn validate_occurred(&self) -> Result<(), OccurredValidationError> {
+        use crate::read::temporal::ConfidenceBand;
+
+        let both_some = self.occurred_start.is_some() && self.occurred_end.is_some();
+        let both_none = self.occurred_start.is_none() && self.occurred_end.is_none();
+
+        if !(both_some || both_none) {
+            return Err(OccurredValidationError::UnpairedBounds);
+        }
+
+        if let (Some(s), Some(e)) = (self.occurred_start, self.occurred_end) {
+            if e <= s {
+                return Err(OccurredValidationError::EndNotAfterStart { start: s, end: e });
+            }
+        }
+
+        let conf_is_none = self.occurred_confidence == ConfidenceBand::None;
+        if conf_is_none != both_none {
+            return Err(OccurredValidationError::ConfidenceBoundsMismatch {
+                conf: self.occurred_confidence,
+                paired: both_some,
+            });
+        }
+
+        Ok(())
     }
 }
 

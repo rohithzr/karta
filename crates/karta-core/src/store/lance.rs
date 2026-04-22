@@ -217,6 +217,8 @@ impl LanceVectorStore {
                 .downcast_ref::<Float32Array>().unwrap().values().to_vec();
             let subject_val = subjects.value(i);
 
+            let created_at = chrono::DateTime::parse_from_rfc3339(created_ats.value(i))
+                .unwrap_or_default().with_timezone(&chrono::Utc);
             facts.push(crate::note::AtomicFact {
                 id: ids.value(i).to_string(),
                 content: contents.value(i).to_string(),
@@ -224,8 +226,12 @@ impl LanceVectorStore {
                 ordinal: ordinals.value(i).parse().unwrap_or(0),
                 subject: if subject_val.is_empty() { None } else { Some(subject_val.to_string()) },
                 embedding,
-                created_at: chrono::DateTime::parse_from_rfc3339(created_ats.value(i))
-                    .unwrap_or_default().with_timezone(&chrono::Utc),
+                created_at,
+                // STEP1.5 Task 2 will populate these from new columns.
+                source_timestamp: created_at,
+                occurred_start: None,
+                occurred_end: None,
+                occurred_confidence: crate::read::temporal::ConfidenceBand::None,
             });
         }
         Ok(facts)

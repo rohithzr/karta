@@ -171,6 +171,10 @@ fn make_test_fact(id: &str, content: &str, source_note_id: &str, ordinal: u32, d
         subject: Some("test-entity".to_string()),
         embedding: vec![0.5; dim],
         created_at: Utc::now(),
+        source_timestamp: Utc::now(),
+        occurred_start: None,
+        occurred_end: None,
+        occurred_confidence: karta_core::read::temporal::ConfidenceBand::None,
     }
 }
 

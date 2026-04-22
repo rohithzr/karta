@@ -429,6 +429,9 @@ impl crate::store::VectorStore for SqliteVectorStore {
                     .query_map(params.as_slice(), |row| {
                         let embedding_blob: Vec<u8> = row.get("embedding")?;
                         let created_str: String = row.get("created_at")?;
+                        let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+                            .unwrap_or_default()
+                            .with_timezone(&chrono::Utc);
                         Ok(AtomicFact {
                             id: row.get("id")?,
                             content: row.get("content")?,
@@ -436,9 +439,12 @@ impl crate::store::VectorStore for SqliteVectorStore {
                             ordinal: row.get("ordinal")?,
                             subject: row.get("subject")?,
                             embedding: Self::blob_to_embedding(&embedding_blob),
-                            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                                .unwrap_or_default()
-                                .with_timezone(&chrono::Utc),
+                            created_at,
+                            // STEP1.5 Task 2 will populate these from new columns.
+                            source_timestamp: created_at,
+                            occurred_start: None,
+                            occurred_end: None,
+                            occurred_confidence: crate::read::temporal::ConfidenceBand::None,
                         })
                     })?
                     .filter_map(|r| r.ok())
@@ -472,6 +478,9 @@ impl crate::store::VectorStore for SqliteVectorStore {
             .query_map([note_id], |row| {
                 let embedding_blob: Vec<u8> = row.get("embedding")?;
                 let created_str: String = row.get("created_at")?;
+                let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+                    .unwrap_or_default()
+                    .with_timezone(&chrono::Utc);
                 Ok(AtomicFact {
                     id: row.get("id")?,
                     content: row.get("content")?,
@@ -479,9 +488,12 @@ impl crate::store::VectorStore for SqliteVectorStore {
                     ordinal: row.get("ordinal")?,
                     subject: row.get("subject")?,
                     embedding: Self::blob_to_embedding(&embedding_blob),
-                    created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                        .unwrap_or_default()
-                        .with_timezone(&chrono::Utc),
+                    created_at,
+                    // STEP1.5 Task 2 will populate these from new columns.
+                    source_timestamp: created_at,
+                    occurred_start: None,
+                    occurred_end: None,
+                    occurred_confidence: crate::read::temporal::ConfidenceBand::None,
                 })
             })?
             .filter_map(|r| r.ok())
