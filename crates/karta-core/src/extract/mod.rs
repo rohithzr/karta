@@ -5,3 +5,4 @@
 //! for the design rationale.
 
 pub mod memory_kind;
+pub mod facet;
