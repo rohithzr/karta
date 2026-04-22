@@ -66,3 +66,66 @@ pub struct Interval {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
 }
+
+/// Raw output from either resolver tier, pre-validation.
+#[derive(Debug, Clone, Copy)]
+pub struct RawResolverOutput {
+    pub start: Option<chrono::DateTime<chrono::Utc>>,
+    pub end: Option<chrono::DateTime<chrono::Utc>>,
+    pub confidence_f32: f32,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum ResolverValidationError {
+    #[error("confidence {0} not in closed set {{0.0, 0.5, 0.7, 0.8, 1.0}}")]
+    ConfidenceNotInClosedSet(f32),
+    #[error("start and end must both be Some or both be None")]
+    UnpairedBounds,
+    #[error("end must be strictly greater than start")]
+    EndNotAfterStart,
+    #[error("confidence == 0.0 iff both bounds are None (got conf={conf}, paired={paired})")]
+    ConfidenceBoundsMismatch { conf: f32, paired: bool },
+}
+
+/// Validate a resolver's raw output against the closed-set confidence
+/// rubric AND the three interval invariants. This is SCHEMA ENFORCEMENT,
+/// not a routing policy — bad outputs are rejected, callers fall through
+/// to vector-only retrieval.
+///
+/// Invariant #3 (confidence in [0, 1]) is subsumed by the closed-set
+/// check: values outside the closed set are rejected regardless of range.
+pub fn validate_resolver_output(
+    raw: RawResolverOutput,
+) -> Result<(Option<Interval>, ConfidenceBand), ResolverValidationError> {
+    let conf = ConfidenceBand::try_from_f32(raw.confidence_f32)
+        .map_err(|_| ResolverValidationError::ConfidenceNotInClosedSet(raw.confidence_f32))?;
+
+    let both_some = raw.start.is_some() && raw.end.is_some();
+    let both_none = raw.start.is_none() && raw.end.is_none();
+
+    if !(both_some || both_none) {
+        return Err(ResolverValidationError::UnpairedBounds);
+    }
+
+    if let (Some(s), Some(e)) = (raw.start, raw.end) {
+        if e <= s {
+            return Err(ResolverValidationError::EndNotAfterStart);
+        }
+    }
+
+    let conf_is_none = conf == ConfidenceBand::None;
+    if conf_is_none != both_none {
+        return Err(ResolverValidationError::ConfidenceBoundsMismatch {
+            conf: raw.confidence_f32,
+            paired: both_some,
+        });
+    }
+
+    let interval = both_some.then(|| Interval { start: raw.start.unwrap(), end: raw.end.unwrap() });
+    Ok((interval, conf))
+}
+
+/// Constant referenced only for readability; the validator enforces this
+/// as part of the closed-set check. DO NOT read this at routing time —
+/// it is not a policy threshold.
+pub const RESOLVER_SCHEMA_MIN_CONFIDENCE: f32 = 0.5;
