@@ -160,7 +160,8 @@ impl SqliteVectorStore {
             .unwrap_or_else(|_| chrono::Utc::now());
         let source_timestamp = source_timestamp
             .as_deref()
-            .and_then(|s| s.parse().ok());
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(chrono::Utc::now);
 
         Ok(MemoryNote {
             id,
@@ -179,6 +180,7 @@ impl SqliteVectorStore {
             last_accessed_at,
             turn_index,
             source_timestamp,
+            session_id: None,
         })
     }
 }
@@ -203,7 +205,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
         let created_at = note.created_at.to_rfc3339();
         let updated_at = note.updated_at.to_rfc3339();
         let last_accessed_at = note.last_accessed_at.to_rfc3339();
-        let source_timestamp = note.source_timestamp.map(|t| t.to_rfc3339());
+        let source_timestamp = note.source_timestamp.to_rfc3339();
         let embedding_blob = Self::embedding_to_blob(&note.embedding);
 
         let tx = conn.unchecked_transaction()?;

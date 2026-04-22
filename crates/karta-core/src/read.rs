@@ -273,9 +273,8 @@ impl ReadEngine {
     /// Uses source_timestamp (real conversation date) when available,
     /// falling back to updated_at (ingestion time).
     fn recency_score(&self, note: &MemoryNote) -> f32 {
-        let reference_time = note.source_timestamp.unwrap_or(note.updated_at);
         let age_days = Utc::now()
-            .signed_duration_since(reference_time)
+            .signed_duration_since(note.source_timestamp)
             .num_seconds() as f64
             / 86400.0;
 
@@ -318,12 +317,7 @@ impl ReadEngine {
                 (Some(ai), Some(bi)) => ai.cmp(&bi),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => match (a.source_timestamp, b.source_timestamp) {
-                    (Some(at), Some(bt)) => at.cmp(&bt),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.created_at.cmp(&b.created_at),
-                },
+                (None, None) => a.source_timestamp.cmp(&b.source_timestamp),
             }
         });
         notes.truncate(self.config.max_notes_per_episode);
@@ -887,12 +881,7 @@ impl ReadEngine {
             (Some(ai), Some(bi)) => ai.cmp(&bi),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => match (a.source_timestamp, b.source_timestamp) {
-                (Some(at), Some(bt)) => at.cmp(&bt),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.created_at.cmp(&b.created_at),
-            },
+            (None, None) => a.source_timestamp.cmp(&b.source_timestamp),
         });
 
         // Contradiction force-retrieval
@@ -997,7 +986,7 @@ impl ReadEngine {
                 format!("DIGEST:{}", &episode_id[..8.min(episode_id.len())])
             }
         };
-        let display_time = note.source_timestamp.unwrap_or(note.created_at);
+        let display_time = note.source_timestamp;
         let age = Utc::now()
             .signed_duration_since(display_time)
             .num_days();
@@ -1168,12 +1157,7 @@ impl ReadEngine {
                 (Some(ai), Some(bi)) => ai.cmp(&bi),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => match (a.source_timestamp, b.source_timestamp) {
-                    (Some(at), Some(bt)) => at.cmp(&bt),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.created_at.cmp(&b.created_at),
-                },
+                (None, None) => a.source_timestamp.cmp(&b.source_timestamp),
             }
         });
 
@@ -1250,7 +1234,7 @@ impl ReadEngine {
                 }
             };
             // Use source_timestamp (real conversation date) if available, fall back to created_at
-            let display_time = note.source_timestamp.unwrap_or(note.created_at);
+            let display_time = note.source_timestamp;
             let age = Utc::now()
                 .signed_duration_since(display_time)
                 .num_days();
@@ -1398,12 +1382,7 @@ impl ReadEngine {
                         (Some(ai), Some(bi)) => ai.cmp(&bi),
                         (Some(_), None) => std::cmp::Ordering::Less,
                         (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => match (a.source_timestamp, b.source_timestamp) {
-                            (Some(at), Some(bt)) => at.cmp(&bt),
-                            (Some(_), None) => std::cmp::Ordering::Less,
-                            (None, Some(_)) => std::cmp::Ordering::Greater,
-                            (None, None) => a.created_at.cmp(&b.created_at),
-                        },
+                        (None, None) => a.source_timestamp.cmp(&b.source_timestamp),
                     }
                 });
 

@@ -498,7 +498,8 @@ impl WriteEngine {
             status: crate::note::NoteStatus::Active,
             last_accessed_at: Utc::now(),
             turn_index: None,
-            source_timestamp: None,
+            source_timestamp: Utc::now(),
+            session_id: None,
         };
 
         self.vector_store.upsert(&note).await?;

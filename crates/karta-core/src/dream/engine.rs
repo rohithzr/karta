@@ -548,7 +548,8 @@ impl DreamEngine {
             status: crate::note::NoteStatus::Active,
             last_accessed_at: Utc::now(),
             turn_index: None,
-            source_timestamp: None,
+            source_timestamp: Utc::now(),
+            session_id: None,
         };
 
         self.vector_store.upsert(&note).await?;
@@ -686,7 +687,8 @@ impl DreamEngine {
             status: crate::note::NoteStatus::Active,
             last_accessed_at: dream.created_at,
             turn_index: None,
-            source_timestamp: None,
+            source_timestamp: dream.created_at,
+            session_id: None,
         };
 
         self.vector_store.upsert(&note).await?;
@@ -817,7 +819,8 @@ impl DreamEngine {
                 status: NoteStatus::Active,
                 last_accessed_at: Utc::now(),
                 turn_index: None,
-                source_timestamp: None,
+                source_timestamp: Utc::now(),
+                session_id: None,
             };
 
             digest_note_id = Some(note.id.clone());

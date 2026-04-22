@@ -22,7 +22,8 @@ fn make_test_note(id: &str, content: &str, dim: usize) -> MemoryNote {
         status: NoteStatus::Active,
         last_accessed_at: now,
         turn_index: Some(1),
-        source_timestamp: Some(now),
+        source_timestamp: now,
+        session_id: None,
     }
 }
 

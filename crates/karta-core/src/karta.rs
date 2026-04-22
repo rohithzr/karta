@@ -456,7 +456,9 @@ impl Karta {
 
         if turn_index.is_some() || source_timestamp.is_some() {
             note.turn_index = turn_index;
-            note.source_timestamp = source_timestamp;
+            if let Some(ts) = source_timestamp {
+                note.source_timestamp = ts;
+            }
             self.vector_store.upsert(&note).await?;
         }
 

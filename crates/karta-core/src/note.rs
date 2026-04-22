@@ -37,10 +37,17 @@ pub struct MemoryNote {
     /// Position of this message within its conversation/session (0-indexed).
     #[serde(default)]
     pub turn_index: Option<u32>,
-    /// Original timestamp from source data (e.g., BEAM time_anchor parsed to DateTime).
-    /// Distinct from `created_at` which is the ingestion time.
+    /// The data's "now" at the moment this note was generated. Non-optional —
+    /// every note carries one. Live ingest sets it from `Utc::now()`; replay
+    /// sets it from the source data's parsed reference time. Distinct from
+    /// `created_at`, which is the ingestion (row-write) time.
+    #[serde(default = "Utc::now")]
+    pub source_timestamp: DateTime<Utc>,
+    /// Optional session identifier — the conversation/scope this note belongs
+    /// to. `None` for one-shot adds (e.g. quick scripts, smoke tests). Used
+    /// by episode segmentation and any caller that wants to scope a query.
     #[serde(default)]
-    pub source_timestamp: Option<DateTime<Utc>>,
+    pub session_id: Option<String>,
 }
 
 impl MemoryNote {
@@ -62,7 +69,8 @@ impl MemoryNote {
             status: NoteStatus::Active,
             last_accessed_at: now,
             turn_index: None,
-            source_timestamp: None,
+            source_timestamp: now,
+            session_id: None,
         }
     }
 
