@@ -6,6 +6,7 @@ pub mod note;
 pub mod read;
 pub mod rerank;
 pub mod store;
+pub mod trace;
 pub mod write;
 
 mod karta;

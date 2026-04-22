@@ -49,6 +49,8 @@ impl Default for GenConfig {
 pub struct ChatResponse {
     pub content: String,
     pub tokens_used: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// Pluggable LLM provider. Implement for OpenAI, Anthropic, Ollama, etc.

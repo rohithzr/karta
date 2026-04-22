@@ -383,6 +383,8 @@ impl LlmProvider for MockLlmProvider {
         Ok(ChatResponse {
             content,
             tokens_used: 100,
+            input_tokens: 60,
+            output_tokens: 40,
         })
     }
 

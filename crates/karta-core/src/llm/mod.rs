@@ -9,6 +9,9 @@ pub use openai::OpenAiProvider;
 mod split;
 pub use split::SplitProvider;
 
+mod tracing_wrapper;
+pub use tracing_wrapper::TracingLlmProvider;
+
 mod prompts;
 pub(crate) use prompts::Prompts;
 

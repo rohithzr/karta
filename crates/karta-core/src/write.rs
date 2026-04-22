@@ -9,6 +9,7 @@ use crate::error::Result;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
 use crate::note::{Episode, LinkDecision, MemoryNote, NoteAttributes, Provenance};
 use crate::store::{GraphStore, VectorStore};
+use crate::trace::{self, KnnCandidate, TraceEvent};
 
 /// Handles the write path: index, link, evolve.
 pub struct WriteEngine {
@@ -47,13 +48,11 @@ impl WriteEngine {
 
         // 1. Generate attributes + embed raw content in parallel
         let content_owned = content.to_string();
-        let embed_fut = async {
+        let attrs_fut = trace::stage("attrs", self.generate_attributes(content));
+        let embed_fut = trace::stage("embed_raw", async {
             self.llm.embed(&[&content_owned]).await
-        };
-        let (attrs, raw_embeddings) = tokio::join!(
-            self.generate_attributes(content),
-            embed_fut
-        );
+        });
+        let (attrs, raw_embeddings) = tokio::join!(attrs_fut, embed_fut);
         let attrs = attrs?;
         let raw_embedding = raw_embeddings?.into_iter().next().unwrap_or_default();
         debug!(context = %attrs.context, "Generated attributes");
@@ -65,10 +64,32 @@ impl WriteEngine {
         note.tags = attrs.tags;
 
         // 3. Use raw embedding for candidate search (fast path)
-        let candidates = self
-            .vector_store
-            .find_similar(&raw_embedding, self.config.top_k_candidates, &[&note.id])
-            .await?;
+        let candidates = trace::stage("knn", async {
+            let knn_start = std::time::Instant::now();
+            let cands = self
+                .vector_store
+                .find_similar(&raw_embedding, self.config.top_k_candidates, &[&note.id])
+                .await?;
+            let wall_ms = knn_start.elapsed().as_millis() as u64;
+            let heavy = trace::heavy();
+            trace::try_emit(TraceEvent::KnnCandidates {
+                ts: Utc::now(),
+                turn_idx: trace::current_turn(),
+                stage: trace::current_stage(),
+                wall_ms,
+                returned: cands.len(),
+                candidates: if heavy {
+                    Some(cands.iter().map(|(n, score)| KnnCandidate {
+                        note_id: n.id.clone(),
+                        score: *score,
+                        content_preview: Some(n.content.chars().take(160).collect()),
+                    }).collect())
+                } else {
+                    None
+                },
+            });
+            Ok::<_, crate::error::KartaError>(cands)
+        }).await?;
 
         // 4. Compute enriched embedding for storage (content + context + keywords)
         let embedding_text = format!(
@@ -77,7 +98,9 @@ impl WriteEngine {
             note.context,
             note.keywords.join(" ")
         );
-        let enriched_embeddings = self.llm.embed(&[&embedding_text]).await?;
+        let enriched_embeddings = trace::stage("embed_enriched", async {
+            self.llm.embed(&[&embedding_text]).await
+        }).await?;
         note.embedding = enriched_embeddings.into_iter().next().unwrap_or_default();
 
         let candidates: Vec<_> = candidates
@@ -89,7 +112,7 @@ impl WriteEngine {
 
         // 5. LLM decides which candidates to link
         let link_decisions = if !candidates.is_empty() {
-            self.decide_links(content, &note.context, &candidates).await?
+            trace::stage("link", self.decide_links(content, &note.context, &candidates)).await?
         } else {
             Vec::new()
         };
@@ -115,19 +138,27 @@ impl WriteEngine {
                         continue;
                     }
 
-                    let updated_context = self
-                        .evolve_context(
-                            &existing.content,
-                            &existing.context,
-                            content,
-                            &decision.reason,
-                        )
-                        .await?;
+                    let prev_ctx = existing.context.clone();
+                    let updated_context = trace::stage("evolve", self.evolve_context(
+                        &existing.content,
+                        &existing.context,
+                        content,
+                        &decision.reason,
+                    )).await?;
 
                     // Record evolution in graph store
                     self.graph_store
                         .record_evolution(&existing.id, &note.id, &existing.context)
                         .await?;
+
+                    let heavy = trace::heavy();
+                    trace::try_emit(TraceEvent::Evolution {
+                        ts: Utc::now(),
+                        turn_idx: trace::current_turn(),
+                        evolved_id: existing.id.clone(),
+                        previous_context: if heavy { Some(prev_ctx) } else { None },
+                        new_context: if heavy { Some(updated_context.clone()) } else { None },
+                    });
 
                     // Update the note's context in vector store
                     let mut evolved = existing;
@@ -141,13 +172,22 @@ impl WriteEngine {
         }
 
         // 7. Store the new note
-        self.vector_store.upsert(&note).await?;
+        trace::stage("note_upsert", async {
+            self.vector_store.upsert(&note).await
+        }).await?;
 
         // 8. Store links (bidirectional)
         for decision in &link_decisions {
             self.graph_store
                 .add_link(&note.id, &decision.note_id, &decision.reason)
                 .await?;
+            trace::try_emit(TraceEvent::LinkWritten {
+                ts: Utc::now(),
+                turn_idx: trace::current_turn(),
+                from_id: note.id.clone(),
+                to_id: decision.note_id.clone(),
+                reason: decision.reason.clone(),
+            });
         }
 
         note.links = link_decisions.iter().map(|d| d.note_id.clone()).collect();
@@ -185,7 +225,11 @@ impl WriteEngine {
                 .map(|f| f.content.as_str())
                 .collect();
 
-            match self.llm.embed(&fact_texts).await {
+            let embed_result = trace::stage("embed_facts", async {
+                self.llm.embed(&fact_texts).await
+            }).await;
+
+            match embed_result {
                 Ok(fact_embeddings) => {
                     for (i, (extraction, embedding)) in attrs.atomic_facts.iter()
                         .take(5)
@@ -201,10 +245,21 @@ impl WriteEngine {
                         fact.embedding = embedding;
                         fact.created_at = note.created_at;
 
+                        let fact_id = fact.id.clone();
+                        let fact_content = fact.content.clone();
                         let _ = self.vector_store.upsert_fact(&fact).await;
                         let _ = self.graph_store.record_fact(
                             &fact.id, &note.id, i as u32, fact.subject.as_deref()
                         ).await;
+                        let heavy = trace::heavy();
+                        trace::try_emit(TraceEvent::FactWritten {
+                            ts: Utc::now(),
+                            turn_idx: trace::current_turn(),
+                            fact_id,
+                            source_note_id: note.id.clone(),
+                            ordinal: i as u32,
+                            content: if heavy { Some(fact_content) } else { None },
+                        });
                     }
                     debug!(count = fact_texts.len(), note_id = %note.id, "Stored atomic facts");
                 }
@@ -213,6 +268,13 @@ impl WriteEngine {
                 }
             }
         }
+
+        trace::try_emit(TraceEvent::NoteWritten {
+            ts: Utc::now(),
+            turn_idx: trace::current_turn(),
+            note_id: note.id.clone(),
+            link_count: note.links.len(),
+        });
 
         info!(note_id = %note.id, links = note.links.len(), "Note stored");
 
@@ -267,12 +329,11 @@ impl WriteEngine {
                     if last_note_content.is_empty() {
                         false
                     } else {
-                        self.detect_episode_boundary(
+                        trace::stage("episode_boundary", self.detect_episode_boundary(
                             &last_note_content,
                             content,
                             time_gap,
-                        )
-                        .await?
+                        )).await?
                     }
                 }
             }
@@ -285,14 +346,14 @@ impl WriteEngine {
             episode.end_time = Utc::now();
 
             // Synthesize narrative for this first note
-            let (narrative, tags) = self.synthesize_narrative(&[content]).await?;
+            let (narrative, tags) = trace::stage("narrative_synth",
+                self.synthesize_narrative(&[content])).await?;
             episode.narrative = narrative.clone();
             episode.topic_tags = tags;
 
             // Create narrative note
-            let narrative_note = self
-                .create_narrative_note(&narrative, &episode.id)
-                .await?;
+            let narrative_note = trace::stage("narrative_note",
+                self.create_narrative_note(&narrative, &episode.id)).await?;
             episode.narrative_note_id = Some(narrative_note.id.clone());
 
             self.graph_store.upsert_episode(&episode).await?;
@@ -316,7 +377,8 @@ impl WriteEngine {
             let all_notes = self.vector_store.get_many(&all_refs).await?;
             let contents: Vec<&str> = all_notes.iter().map(|n| n.content.as_str()).collect();
 
-            let (narrative, tags) = self.synthesize_narrative(&contents).await?;
+            let (narrative, tags) = trace::stage("narrative_resynth",
+                self.synthesize_narrative(&contents)).await?;
 
             // Update episode
             let mut updated = ep.clone();
@@ -329,7 +391,9 @@ impl WriteEngine {
                 if let Some(mut nar_note) = self.vector_store.get(nar_id).await? {
                     nar_note.content = narrative;
                     nar_note.updated_at = Utc::now();
-                    let emb = self.llm.embed(&[&nar_note.content]).await?;
+                    let emb = trace::stage("embed_narrative", async {
+                        self.llm.embed(&[&nar_note.content]).await
+                    }).await?;
                     nar_note.embedding = emb.into_iter().next().unwrap_or_default();
                     self.vector_store.upsert(&nar_note).await?;
                 }
@@ -411,7 +475,9 @@ impl WriteEngine {
         narrative: &str,
         episode_id: &str,
     ) -> Result<MemoryNote> {
-        let embeddings = self.llm.embed(&[narrative]).await?;
+        let embeddings = trace::stage("embed_narrative", async {
+            self.llm.embed(&[narrative]).await
+        }).await?;
         let embedding = embeddings.into_iter().next().unwrap_or_default();
 
         let note = MemoryNote {
