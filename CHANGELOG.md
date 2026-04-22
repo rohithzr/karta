@@ -135,6 +135,100 @@ needs the calibration fixture
 (`data/test/fixtures/confidence_calibration.json`, scaffolded but
 unlabeled — needs ≥100 hand-labeled entries before F7-T15 runs).
 
+### STEP2 — Fact extraction redesign (2026-04-22)
+
+Codex review (`docs/reviews/2026-04-22-codex-fact-extraction-review.md`)
+identified six structural failures upstream of temporal grounding. The
+LLM was producing prose paraphrases of input messages instead of typed,
+admission-controlled retrieval rows. STEP2 rebuilds the schema, prompt,
+and write path around the cite-and-validate pattern proven by
+`temporal_evidence`.
+
+**Schema changes** (atomic_facts table recreated, no migration):
+- New typed enum fields: `memory_kind`, `facet`, `entity_type`
+  (closed sets, snake_case serde rename, exhaustive variant guards in tests)
+- New typed value slots: `entity_text`, `value_text`, `value_date`
+- `supporting_spans: string[]` replaces single `temporal_evidence` field
+  (1-3 per fact, each ≥4 chars, each a verbatim substring of source)
+- Old `subject` field removed (subsumed by `entity_text` + `entity_type`)
+- New canonical reader `row_to_fact` — every SELECT site routes through
+  one function so future schema changes touch one place
+- Shadow-DDL collision in `SqliteGraphStore` removed (the old `subject`
+  index was clobbering schema on shared connections — silent data-shape
+  bug fixed in passing)
+
+**Validator gates** (in `WriteEngine::add_note_inner`, load-bearing order):
+1. **Pre-filter (admission)** — drops `ephemeral_request | speech_act |
+   echo` BEFORE dedup BEFORE embed. Saves embed cost and prevents
+   ephemerals from claiming a slot dedup would assign to a real fact.
+2. **Per-fact grounding** — every `supporting_span` ≥4 chars and a real
+   substring of `note.content`. Runs FIRST per fact (cheap mechanical
+   check, telemetry attribution honesty).
+3. **Per-fact admission backstop** — defense-in-depth for the
+   JSON-fallback parse path.
+4. **Per-fact specificity** — rejects facts where both `entity_type`
+   and `facet` are `unknown`.
+
+**Slot-level dedup** runs BETWEEN pre-filter and embed. Collapses facts
+sharing `(entity_text.lower(), facet, value_key)` to one row, MERGING
+`supporting_spans` from siblings (string-equality dedup). Preserves the
+evidence trail when the LLM emits two phrasings of the same claim.
+
+**Mock pair:**
+- `MockLlmProvider` — heuristic mock for trace harness convenience
+  (deadline keywords, tech-stack tokens, pure-request detection)
+- `ScriptedMockLlmProvider` — adversarial mock for validator tests
+  (script `(needle, response_json)` pairs; falls back to heuristic
+  for unscripted calls)
+
+**Prompt rewrite:** admission becomes Section 1, then atomization,
+grounding, normalization, temporal. Temporal is no longer "the one
+big rule" — admission is. Anti-patterns A-G name 7 production failure
+modes. Closer is "Properties of good output" (descriptive shape) rather
+than "final checklist" (imperative validation) — the validator does
+the mechanical checking, the prompt shapes intent.
+
+**Empirical impact (10-turn BEAM conv 0):**
+
+| Run | Facts | Null-bound | Typed (both axes) | Ephemeral persisted |
+|---|---|---|---|---|
+| v1 (original prompt) | 22 | 0% | n/a (no enum) | n/a |
+| v2 (prose-only fix) | 41 | 0% | n/a | n/a |
+| v3 (`temporal_evidence` gate) | 43 | 67% | n/a | n/a |
+| **STEP2** | **17** | n/a (different model) | **100%** | **0** |
+
+STEP2's 17 facts are correctly typed entities + facets:
+- entity_type: project (10), org (5), task (1), person (1) — real types
+- facet: tech_stack (13), target_date (2), ownership (1), preference (1)
+- entity_text values: "Craig", "budget tracker", "app", "project" — real
+  surface forms, not just generic "user"
+- 16 durable_fact + 1 future_commitment, zero ephemeral_request /
+  speech_act / echo
+
+Pure requests now produce zero facts (admission pre-filter fires before
+embed) — turn 1 of the trace ("I'm working on a project... can you
+help me create a schedule") emitted 0 facts as designed.
+
+**Test coverage:** 39 test binaries, ~131 tests in the STEP1.5+STEP2
+regression bundle. New STEP2 test files: 10 (`extraction_*`,
+`note_attributes_schema`, `mock_extraction_shape`, `extraction_failure_modes`).
+The adversarial regression test
+`ephemeral_collision_does_not_steal_durable_slot` uses the scriptable
+mock to construct a slot collision — verifies the load-bearing
+admission-before-dedup ordering doesn't regress.
+
+**Deferred to follow-up:**
+- Cross-note entity canonicalization (Phase 2 per codex; "project" vs
+  "the project" still distinct entity_text values today)
+- Negation/attribution slots (FM3-FM6 from codex review — mock can't
+  drive these honestly, needs real LLM)
+- Per-band calibration fixture extension to admission decisions
+- Lance store backend mirror (currently feature-gated, returns
+  Unknown defaults from row_to_fact)
+- A few miscategorized facts in the trace (Bootstrap config tagged as
+  `target_date`, port 5000 as `target_date`) — prompt tuning territory,
+  not structural
+
 ## [0.1.0-experimental] — 2026-04-14
 
 Initial public release of Karta as an experimental research project.
