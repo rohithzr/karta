@@ -546,14 +546,45 @@ impl ReadEngine {
             QueryMode::Recency => 0.60,
             _ => self.config.recency_weight,
         };
-        // Parallel search: notes + atomic facts (if enabled)
+        // Parallel search: notes + atomic facts (if enabled).
+        //
+        // Temporal gating: if the query carries a lexical temporal indicator
+        // AND tier 1 (Rust regex) resolves it to a concrete interval, we
+        // route fact retrieval through `find_similar_facts_in_interval` so
+        // out-of-window facts are filtered at the SQL layer. Otherwise we
+        // fall through to the unrestricted fact retrieval.
+        //
+        // TODO(step1.5 Task 10): tier 2 LLM fallback when the query is
+        // temporal but tier 1 returns None.
         let fact_k = fetch_k / 2;
+        let temporal_interval = if has_temporal_indicator(query) {
+            resolve::resolve_temporal_phrase(query, ctx.reference_time())
+                .map(|(interval, _conf)| interval)
+        } else {
+            None
+        };
         let (direct, fact_hits) = if self.config.fact_retrieval_enabled {
-            let (direct_result, fact_hits_result) = tokio::join!(
-                self.vector_store.find_similar(&query_embedding, fetch_k, &[]),
-                self.vector_store.find_similar_facts(&query_embedding, fact_k, &[])
-            );
-            (direct_result?, fact_hits_result.unwrap_or_default())
+            match temporal_interval {
+                Some(interval) => {
+                    let (direct_result, fact_hits_result) = tokio::join!(
+                        self.vector_store.find_similar(&query_embedding, fetch_k, &[]),
+                        self.vector_store.find_similar_facts_in_interval(
+                            &query_embedding,
+                            fact_k,
+                            interval.start,
+                            interval.end,
+                        )
+                    );
+                    (direct_result?, fact_hits_result.unwrap_or_default())
+                }
+                None => {
+                    let (direct_result, fact_hits_result) = tokio::join!(
+                        self.vector_store.find_similar(&query_embedding, fetch_k, &[]),
+                        self.vector_store.find_similar_facts(&query_embedding, fact_k, &[])
+                    );
+                    (direct_result?, fact_hits_result.unwrap_or_default())
+                }
+            }
         } else {
             let direct = self.vector_store.find_similar(&query_embedding, fetch_k, &[]).await?;
             (direct, Vec::new())

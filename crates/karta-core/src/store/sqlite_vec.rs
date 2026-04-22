@@ -394,6 +394,133 @@ impl crate::store::VectorStore for SqliteVectorStore {
         Ok(())
     }
 
+    async fn find_similar_facts_in_interval(
+        &self,
+        embedding: &[f32],
+        top_k: usize,
+        interval_start: chrono::DateTime<chrono::Utc>,
+        interval_end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<(AtomicFact, f32)>> {
+        // Interval-overlap retrieval: same kNN + batch-fetch shape as
+        // `find_similar_facts`, but filters to facts whose [occurred_start,
+        // occurred_end) overlaps [interval_start, interval_end). Two windows
+        // overlap iff NOT (a.end <= b.start OR a.start >= b.end). The
+        // `occurred_start IS NOT NULL` predicate also lets SQLite use the
+        // partial index `idx_facts_occurred`.
+        let query_blob = Self::embedding_to_blob(embedding);
+        // Oversample: interval filter may reject many kNN hits, so widen the
+        // kNN pull to keep a reasonable chance of filling top_k.
+        let limit = (top_k * 5).max(50) as i64;
+
+        let interval_start_str = interval_start.to_rfc3339();
+        let interval_end_str = interval_end.to_rfc3339();
+
+        let result: Vec<(AtomicFact, f32)> = {
+            let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+
+            let mut stmt = conn.prepare(
+                "SELECT id, distance FROM facts_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+            )?;
+            let knn_rows: Vec<(String, f64)> = stmt
+                .query_map(rusqlite::params![query_blob, limit], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(stmt);
+
+            if knn_rows.is_empty() {
+                Vec::new()
+            } else {
+                let distance_map: std::collections::HashMap<String, f64> = knn_rows
+                    .iter()
+                    .map(|(id, d)| (id.clone(), *d))
+                    .collect();
+                let placeholders: String = (1..=knn_rows.len())
+                    .map(|i| format!("?{}", i))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                // Bind ids first, then interval_start (?N+1) and interval_end (?N+2).
+                let start_param_idx = knn_rows.len() + 1;
+                let end_param_idx = knn_rows.len() + 2;
+                let sql = format!(
+                    "SELECT id, content, source_note_id, ordinal, subject, created_at,
+                            source_timestamp, occurred_start, occurred_end, occurred_confidence,
+                            embedding
+                     FROM atomic_facts
+                     WHERE id IN ({})
+                       AND occurred_start IS NOT NULL
+                       AND NOT (occurred_end <= ?{} OR occurred_start >= ?{})",
+                    placeholders, start_param_idx, end_param_idx
+                );
+                let mut stmt2 = conn.prepare(&sql)?;
+                let ids: Vec<&str> = knn_rows.iter().map(|(id, _)| id.as_str()).collect();
+                let mut params: Vec<&dyn rusqlite::types::ToSql> =
+                    ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+                params.push(&interval_start_str);
+                params.push(&interval_end_str);
+
+                let facts: Vec<AtomicFact> = stmt2
+                    .query_map(params.as_slice(), |row| {
+                        let embedding_blob: Vec<u8> = row.get("embedding")?;
+                        let created_str: String = row.get("created_at")?;
+                        let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+                            .unwrap_or_default()
+                            .with_timezone(&chrono::Utc);
+                        let source_ts_str: String = row.get("source_timestamp")?;
+                        let source_timestamp =
+                            chrono::DateTime::parse_from_rfc3339(&source_ts_str)
+                                .map(|d| d.with_timezone(&chrono::Utc))
+                                .unwrap_or(created_at);
+                        let occ_start_str: Option<String> = row.get("occurred_start")?;
+                        let occ_end_str: Option<String> = row.get("occurred_end")?;
+                        let occ_conf_f32: f32 = row.get("occurred_confidence")?;
+                        let occurred_start = occ_start_str.and_then(|s| {
+                            chrono::DateTime::parse_from_rfc3339(&s)
+                                .ok()
+                                .map(|d| d.with_timezone(&chrono::Utc))
+                        });
+                        let occurred_end = occ_end_str.and_then(|s| {
+                            chrono::DateTime::parse_from_rfc3339(&s)
+                                .ok()
+                                .map(|d| d.with_timezone(&chrono::Utc))
+                        });
+                        let occurred_confidence =
+                            crate::read::temporal::ConfidenceBand::try_from_f32(occ_conf_f32)
+                                .unwrap_or(crate::read::temporal::ConfidenceBand::None);
+                        Ok(AtomicFact {
+                            id: row.get("id")?,
+                            content: row.get("content")?,
+                            source_note_id: row.get("source_note_id")?,
+                            ordinal: row.get("ordinal")?,
+                            subject: row.get("subject")?,
+                            embedding: Self::blob_to_embedding(&embedding_blob),
+                            created_at,
+                            source_timestamp,
+                            occurred_start,
+                            occurred_end,
+                            occurred_confidence,
+                        })
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                let mut scored: Vec<(AtomicFact, f32)> = facts
+                    .into_iter()
+                    .filter_map(|fact| {
+                        let distance = distance_map.get(&fact.id).copied().unwrap_or(0.0);
+                        Some((fact, 1.0 / (1.0 + distance as f32)))
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                scored.truncate(top_k);
+                scored
+            }
+        };
+
+        Ok(result)
+    }
+
     async fn find_similar_facts(
         &self,
         embedding: &[f32],
