@@ -40,6 +40,9 @@ tracing = "0.1"
 # Env
 dotenvy = "0.15"
 
+# Regex (tier 1 temporal resolver)
+regex = "1"
+
 # Vector store: LanceDB
 lancedb = { version = "0.27", optional = true }
 arrow-array = { version = "57", optional = true }
