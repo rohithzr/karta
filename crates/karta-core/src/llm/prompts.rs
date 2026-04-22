@@ -3,28 +3,46 @@ pub struct Prompts;
 
 impl Prompts {
     pub fn note_attributes_system() -> &'static str {
-        "You are a memory indexing system. Given a piece of information, extract structured attributes.\n\n\
-         Also extract 1-5 atomic facts. Each fact should be:\n\
-         - A single, self-contained statement that makes sense without context\n\
-         - Independently verifiable (not \"he said\" but \"John said\")\n\
-         - Include specific values, dates, numbers when present\n\
-         - Each fact about ONE thing\n\
-         Example: \"I'm using Flask 2.3.1 on Python 3.11 and my budget is $500\" becomes:\n\
-           1. \"The user is using Flask version 2.3.1\" (subject: \"Flask\")\n\
-           2. \"The user is using Python version 3.11\" (subject: \"Python\")\n\
-           3. \"The user's budget is $500\" (subject: \"budget\")\n\n\
-         Respond with JSON only in this exact shape:\n\
-         {\n\
-           \"context\": \"A rich 1-2 sentence description capturing deeper meaning, implications, and why this matters — not just a restatement of the content. Include any specific dates or deadlines mentioned.\",\n\
-           \"keywords\": [\"5 to 8 specific terms that would help find this note\"],\n\
-           \"tags\": [\"3 to 5 categorical labels like: preference, decision, constraint, workflow, entity, pattern\"],\n\
-           \"foresightSignals\": [{\"content\": \"forward-looking statement with time reference\", \"valid_until\": \"YYYY-MM-DD or null\"}],\n\
-           \"atomic_facts\": [{\"content\": \"single atomic statement\", \"subject\": \"primary entity or null\"}]\n\
-         }"
+        r#"You are a memory indexing system. Given a message and a reference time, extract structured attributes.
+
+EXTRACT ONLY FACTS ABOUT THE WORLD, THE USER, OR THEIR PROJECT — not requests, questions, or asks for help. Specifically:
+- Do NOT extract facts about what the user is asking for, wants help with, or is requesting.
+- Extract only claims that will remain true after this conversation ends.
+- Bad fact (request, skip): "User wants help creating a schedule."
+- Good fact (persistent claim): "User has a deadline on 2024-03-15."
+
+For each atomic fact, emit a half-open time interval [occurred_start, occurred_end) describing when the asserted event occurred:
+- Date-only reference (e.g. "March 15, 2024"): occurred_start = 2024-03-15T00:00:00Z, occurred_end = 2024-03-16T00:00:00Z.
+- True instant (e.g. "at 14:30 UTC"): occurred_end = occurred_start + 1 nanosecond.
+- Relative reference (e.g. "yesterday", "next Friday"): resolve against the reference time.
+- Month-range (e.g. "in March 2024"): occurred_start = 2024-03-01T00:00:00Z, occurred_end = 2024-04-01T00:00:00Z.
+- Vague range (e.g. "recently", "around March"): pick a plausible range and reflect uncertainty in confidence.
+- No temporal content: occurred_start = null, occurred_end = null, occurred_confidence = 0.0.
+
+occurred_confidence is a discrete band. Emit EXACTLY one of:
+- 1.0: explicit ISO date in source ("2024-03-15")
+- 0.8: natural-language absolute date ("March 15, 2024")
+- 0.7: relative reference, deterministic resolution ("yesterday", "next Friday")
+- 0.5: vague reference, range chosen ("recently", "around March")
+- 0.0: no temporal content (paired with null bounds)
+
+NEVER emit other values. Both bounds null AND confidence=0.0 together, or both bounds Some AND confidence in {0.5, 0.7, 0.8, 1.0} together. Mixed is a validation failure.
+
+Also extract:
+- context: a rich 1-2 sentence description capturing implications the message doesn't literally state. Don't restate the input.
+- keywords: 5 to 8 specific terms that would help find this note.
+- tags: 3 to 5 categorical labels from the closed set {preference, decision, constraint, workflow, entity, pattern, temporal, code, deadline, planning}. Do not invent tags outside this set.
+- foresight_signals: forward-looking statements with expiry dates, if any.
+
+Respond with JSON only, matching the provided schema exactly."#
     }
 
-    pub fn note_attributes_user(content: &str) -> String {
-        format!("Index this memory:\n\n{}", content)
+    pub fn note_attributes_user(content: &str, reference_time: chrono::DateTime<chrono::Utc>) -> String {
+        format!(
+            "Reference time: {reference_time}. Interpret 'today', 'yesterday', 'next week', 'last March' relative to this.\n\nIndex this memory:\n\n{content}",
+            reference_time = reference_time.to_rfc3339(),
+            content = content,
+        )
     }
 
     pub fn linking_system() -> &'static str {

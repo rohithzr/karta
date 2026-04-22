@@ -96,7 +96,10 @@ impl WriteEngine {
 
         // 1. Generate attributes + embed raw content in parallel
         let content_owned = content.to_string();
-        let attrs_fut = trace::stage("attrs", self.generate_attributes(content));
+        let attrs_fut = trace::stage(
+            "attrs",
+            self.generate_attributes(content, ctx.reference_time()),
+        );
         let embed_fut = trace::stage("embed_raw", async {
             self.llm.embed(&[&content_owned]).await
         });
@@ -322,9 +325,24 @@ impl WriteEngine {
                         fact.subject = extraction.subject.clone();
                         fact.embedding = embedding;
                         fact.created_at = note.created_at;
+                        fact.source_timestamp = note.source_timestamp;
                         fact.occurred_start = extraction.occurred_start;
                         fact.occurred_end = extraction.occurred_end;
                         fact.occurred_confidence = extraction.occurred_confidence;
+
+                        // Validate before writing. Reject if invariants broken
+                        // (unpaired bounds, end<=start, or confidence-bounds
+                        // mismatch). Malformed extractions are dropped with a
+                        // warn log rather than persisted.
+                        if let Err(e) = fact.validate_occurred() {
+                            tracing::warn!(
+                                note_id = %note.id,
+                                fact_ordinal = i,
+                                error = %e,
+                                "dropping malformed fact: occurred_* validation failed",
+                            );
+                            continue;
+                        }
 
                         let fact_id = fact.id.clone();
                         let fact_content = fact.content.clone();
@@ -596,7 +614,11 @@ impl WriteEngine {
         Ok(note)
     }
 
-    async fn generate_attributes(&self, content: &str) -> Result<NoteAttributes> {
+    async fn generate_attributes(
+        &self,
+        content: &str,
+        reference_time: chrono::DateTime<Utc>,
+    ) -> Result<NoteAttributes> {
         let messages = vec![
             ChatMessage {
                 role: Role::System,
@@ -604,7 +626,7 @@ impl WriteEngine {
             },
             ChatMessage {
                 role: Role::User,
-                content: Prompts::note_attributes_user(content),
+                content: Prompts::note_attributes_user(content, reference_time),
             },
         ];
 
