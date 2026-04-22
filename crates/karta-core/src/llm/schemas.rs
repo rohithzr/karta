@@ -95,12 +95,16 @@ pub fn note_attributes_schema() -> JsonSchema {
                                 "type": "number",
                                 "enum": [0.0, 0.5, 0.7, 0.8, 1.0],
                                 "description": "Discrete band: 1.0 = explicit ISO date in source; 0.8 = natural-language absolute date (e.g. 'March 15, 2024'); 0.7 = relative reference with deterministic resolution (e.g. 'yesterday', 'next Friday'); 0.5 = vague reference with range chosen (e.g. 'recently', 'around March'); 0.0 = no temporal content. Must be exactly one of these values."
+                            },
+                            "temporal_evidence": {
+                                "type": ["string", "null"],
+                                "description": "EXACT verbatim quote from `content` containing the temporal phrase that justifies the bounds (e.g. 'April 15 deadline', 'yesterday', 'in March 2024'). MUST be null if and only if all three occurred_* fields are null/0.0. The validator will reject this fact's bounds if this string does not appear in `content` — so do not summarize, do not paraphrase, copy the substring."
                             }
                         },
-                        "required": ["content", "subject", "occurred_start", "occurred_end", "occurred_confidence"],
+                        "required": ["content", "subject", "occurred_start", "occurred_end", "occurred_confidence", "temporal_evidence"],
                         "additionalProperties": false
                     },
-                    "description": "1-5 atomic facts. Each is a standalone, verifiable statement. Every fact MUST emit all three occurred_* fields explicitly — use nulls (0.0) for facts with no temporal content. Silent omission is forbidden."
+                    "description": "1-5 atomic facts. Each is a standalone, verifiable statement. Every fact MUST emit all four occurred_* fields plus temporal_evidence explicitly. Default is null bounds + 0.0 confidence + null evidence — only emit a non-null interval when a temporal phrase appears in the fact's own content."
                 }
             },
             "required": ["reasoning", "context", "keywords", "tags", "foresight_signals", "atomic_facts"],

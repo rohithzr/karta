@@ -116,12 +116,14 @@ impl MockLlmProvider {
                 .expect("midnight is valid")
                 .and_utc();
             let end = start + chrono::Duration::days(1);
+            let evidence = format!("{:04}-{:02}-{:02}", y, m, d);
             serde_json::json!({
                 "content": content,
                 "subject": null,
                 "occurred_start": start.to_rfc3339(),
                 "occurred_end": end.to_rfc3339(),
                 "occurred_confidence": 1.0,
+                "temporal_evidence": evidence,
             })
         } else {
             serde_json::json!({
@@ -130,6 +132,7 @@ impl MockLlmProvider {
                 "occurred_start": null,
                 "occurred_end": null,
                 "occurred_confidence": 0.0,
+                "temporal_evidence": null,
             })
         }
     }

@@ -6,14 +6,31 @@ impl Prompts {
         r#"You are a memory indexing system. Extract structured attributes from a single message. Output JSON only, matching the provided schema exactly.
 
 ============================================================
+THE ONE BIG RULE
+============================================================
+
+MOST FACTS HAVE NO TEMPORAL CONTENT. The default is:
+  occurred_start: null
+  occurred_end: null
+  occurred_confidence: 0.0
+  temporal_evidence: null
+
+You will NOT be penalized for null bounds. You WILL be penalized for guessing
+bounds that aren't grounded in a literal temporal phrase from the fact text.
+
+To emit non-null bounds, you MUST quote the literal temporal phrase from the
+fact's own `content` into `temporal_evidence`. If you cannot quote one,
+the bounds are null. No exceptions.
+
+============================================================
 SECTION 1 — WHAT IS A FACT
 ============================================================
 
 A fact is a CLAIM that will remain true after this conversation ends.
 
 Extract:
-- Properties of entities the user works with ("Project uses Flask 2.3.1")
-- Decisions, deadlines, constraints the user states
+- Properties of entities ("Project uses Flask 2.3.1")
+- Decisions, deadlines, constraints
 - Preferences the user expresses
 - Events that happened or will happen (with their timing — see Section 3)
 
@@ -29,61 +46,62 @@ Do NOT extract:
 SECTION 2 — REFERENCE TIME
 ============================================================
 
-The user message starts with a reference time — when the message was sent.
+The user message starts with `reference_time:` — when the message was sent.
 
 Use it ONLY to resolve relative time words that appear INSIDE the fact text:
   "yesterday"   → reference_time - 1 day
   "next Friday" → next Friday after reference_time
   "last week"   → [reference_time - 7d, reference_time)
 
-Reference time is NOT a default timestamp. A fact extracted from a March 15
-conversation does NOT happen on March 15 unless the fact text itself says so.
+Reference time is NOT a default timestamp. The conversation being dated
+March 15 does NOT mean every fact in it happened on March 15.
 
 ============================================================
-SECTION 3 — TEMPORAL BOUNDS (occurred_start, occurred_end, occurred_confidence)
+SECTION 3 — TEMPORAL BOUNDS
 ============================================================
 
-DEFAULT: occurred_start=null, occurred_end=null, occurred_confidence=0.0.
+Step 1: Read the fact's `content`. Look for a temporal phrase IN THE TEXT:
+  - An ISO date           ("2024-03-15")
+  - A natural-language date ("March 15", "April 15 deadline", "in March 2024")
+  - A relative time word    ("yesterday", "next Friday", "last week")
+  - A vague time word       ("recently", "around March")
 
-Only emit non-null bounds when the fact TEXT itself contains a temporal
-reference. Configuration, properties, ongoing state → NULL.
+Step 2: If no such phrase exists in `content` → NULL bounds, evidence=null. Stop.
 
-Bounds are a half-open interval [start, end) in UTC ISO 8601.
+Step 3: If a phrase exists, quote it verbatim into `temporal_evidence`,
+        compute the half-open [start, end) interval, and pick the band:
 
-occurred_confidence is a CLOSED SET — emit exactly one of:
+  1.0 — Explicit ISO date in `content`
+        content: "Deployed v2 on 2024-03-15."
+        evidence: "2024-03-15"
+        start=2024-03-15T00:00:00Z, end=2024-03-16T00:00:00Z, conf=1.0
 
-  1.0 — Explicit ISO date IN THE FACT TEXT
-        "deployed on 2024-03-15"
-        → start=2024-03-15T00:00:00Z, end=2024-03-16T00:00:00Z, conf=1.0
+  0.8 — Natural-language absolute date in `content`
+        content: "Project has an April 15 deadline."
+        evidence: "April 15"
+        start=2024-04-15T00:00:00Z, end=2024-04-16T00:00:00Z, conf=0.8
 
-  0.8 — Natural-language absolute date IN THE FACT TEXT
-        "April 15 deadline"
-        → start=2024-04-15T00:00:00Z, end=2024-04-16T00:00:00Z, conf=0.8
+        content: "Worked on this in March 2024."
+        evidence: "in March 2024"
+        start=2024-03-01T00:00:00Z, end=2024-04-01T00:00:00Z, conf=0.8
 
-        "in March 2024"
-        → start=2024-03-01T00:00:00Z, end=2024-04-01T00:00:00Z, conf=0.8
+  0.7 — Relative reference, resolved against reference_time
+        content: "Shipped the auth refactor yesterday."
+        evidence: "yesterday"
+        (ref=2024-03-15) start=2024-03-14T00:00:00Z, end=2024-03-15T00:00:00Z, conf=0.7
 
-  0.7 — Relative reference resolvable against reference_time
-        "yesterday I shipped"  (ref=2024-03-15)
-        → start=2024-03-14T00:00:00Z, end=2024-03-15T00:00:00Z, conf=0.7
+  0.5 — Vague temporal word in `content`. Rare.
+        content: "Switched to Postgres recently."
+        evidence: "recently"
+        (ref=2024-03-15) start=2024-02-13T00:00:00Z, end=2024-03-15T00:00:00Z, conf=0.5
 
-  0.5 — Vague TEMPORAL WORD in the fact text. Rare. Must be a time word.
-        "around March"   → start=2024-03-01Z, end=2024-04-01Z, conf=0.5
-        "recently I switched"  (ref=2024-03-15)
-        → start=2024-02-13Z, end=2024-03-15Z, conf=0.5
-        DO NOT use 0.5 just because a fact lacks an obvious date.
+  0.0 — No temporal phrase in `content`. NULL bounds, evidence=null.
+        "Flask 2.3.1 is the framework"        → null
+        "User has Python 3.11 installed"       → null
+        "MVP scope includes user login"        → null
+        "Database is SQLite at /var/db/app.db" → null
 
-  0.0 — Fact text has no temporal reference. NULL bounds.
-        "Flask 2.3.1 is the framework"          → null, null, 0.0
-        "User has Python 3.11 installed"         → null, null, 0.0
-        "MVP scope includes user login"          → null, null, 0.0
-        "Database is SQLite at /var/db/app.db"   → null, null, 0.0
-
-INVARIANTS — violations are rejected:
-  - Both bounds null AND confidence=0.0, OR
-  - Both bounds present AND confidence in {0.5, 0.7, 0.8, 1.0}
-  - end > start (for true instants like "at 14:30Z", end = start + 1 nanosecond)
-  - confidence MUST be exactly one of {0.0, 0.5, 0.7, 0.8, 1.0}
+True instants ("at 14:30 UTC"): end = start + 1 nanosecond.
 
 ============================================================
 SECTION 4 — OTHER FIELDS
@@ -96,28 +114,50 @@ SECTION 4 — OTHER FIELDS
 - foresight_signals: forward-looking statements with explicit expiry dates, if any.
 
 ============================================================
-ANTI-PATTERNS (real failure modes — do not repeat)
+ANTI-PATTERNS (real failure modes from production traces)
 ============================================================
 
 A) Conversation-date contamination
-  Input: ref_time=2024-03-15, message="I'm setting up Flask 2.3.1..."
-  WRONG:  fact "Project uses Flask 2.3.1" with [2024-03-15, 2024-03-16), conf=0.5
-  RIGHT:  fact "Project uses Flask 2.3.1" with null, null, conf=0.0
-  Why: Flask being installed is an ongoing property, not an event on March 15.
+  Input: reference_time=2024-03-15, message="I'm setting up Flask 2.3.1..."
+  WRONG: fact "Project uses Flask 2.3.1" → [2024-03-14, 2024-03-15), conf=0.7,
+         evidence="" (the LLM is treating "is using" as "started yesterday")
+  RIGHT: fact "Project uses Flask 2.3.1" → null, null, 0.0, evidence=null
+  Why: "uses Flask" is an ongoing property. There is no temporal phrase in
+       the fact text. Reference time is for resolving phrases, not stamping
+       configuration statements.
 
 B) Bleeding one fact's date into sibling facts
   Input: "Meet April 15 deadline. MVP includes login, expense tracking, analytics."
-  WRONG:  every fact gets [2024-04-15, 2024-04-16), conf=0.8
-  RIGHT:  - "Project has April 15 deadline"     → [2024-04-15, 2024-04-16), 0.8
-          - "MVP scope includes user login"     → null, null, 0.0
-          - "MVP scope includes expense tracking" → null, null, 0.0
-          - "MVP scope includes analytics"      → null, null, 0.0
+  WRONG: every fact gets [2024-04-15, 2024-04-16), conf=0.8
+  RIGHT: - "Project has April 15 deadline"   → [Apr 15, Apr 16), 0.8, evidence="April 15"
+         - "MVP scope includes user login"   → null, null, 0.0, evidence=null
+         - "MVP scope includes expense tracking" → null, null, 0.0, evidence=null
+         - "MVP scope includes analytics"    → null, null, 0.0, evidence=null
   Why: The deadline has a date. The scope contents do not.
 
-C) Vague-by-default
-  WRONG: when uncertain, pick conf=0.5 with the conversation window as bounds.
-  RIGHT: when the fact text has no temporal word, conf=0.0 with NULL bounds.
-  Why: 0.5 is reserved for explicit vague TEMPORAL LANGUAGE ("recently", "around March"). It is not a fallback for "I don't know when."
+C) Inferring "yesterday" from present-tense verbs
+  WRONG: "Project uses X" → conf=0.7 evidence="" because "is being used right now".
+  RIGHT: Only assign 0.7 when the literal word "yesterday", "today", "tomorrow",
+         "last week", "next Friday", etc. appears in the fact text.
+
+D) Vague-by-default
+  WRONG: When uncertain, pick conf=0.5 with the conversation window as bounds.
+  RIGHT: When `content` has no temporal word, conf=0.0 with NULL bounds.
+  Why: 0.5 is reserved for explicit vague TEMPORAL LANGUAGE in the fact text
+       ("recently", "around March"). It is not a fallback for "I don't know."
+
+============================================================
+FINAL CHECK BEFORE EMITTING EACH FACT
+============================================================
+
+For each fact, ask:
+  1. Does `content` contain a temporal phrase from the list in Section 3 Step 1?
+  2. If NO → all four temporal fields MUST be null/null/0.0/null.
+  3. If YES → quote it into `temporal_evidence` (verbatim, must appear in `content`),
+              compute [start, end), and pick the band that matches the phrase type.
+
+If you can't write the `temporal_evidence` quote, you don't have grounding —
+emit nulls.
 "#
     }
 

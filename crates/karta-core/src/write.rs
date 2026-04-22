@@ -330,6 +330,29 @@ impl WriteEngine {
                         fact.occurred_end = extraction.occurred_end;
                         fact.occurred_confidence = extraction.occurred_confidence;
 
+                        // Grounding gate: if the LLM emitted bounds, it must
+                        // also have quoted the temporal phrase from the fact's
+                        // own content. If the quote is missing or doesn't
+                        // appear in `content`, the bounds are considered
+                        // hallucinated — strip them and downgrade confidence.
+                        let evidence_grounded = extraction
+                            .temporal_evidence
+                            .as_deref()
+                            .map(|q| !q.trim().is_empty() && fact.content.contains(q))
+                            .unwrap_or(false);
+                        if fact.occurred_start.is_some() && !evidence_grounded {
+                            tracing::debug!(
+                                note_id = %note.id,
+                                fact_ordinal = i,
+                                evidence = ?extraction.temporal_evidence,
+                                "stripping ungrounded fact bounds (no temporal_evidence quote in content)",
+                            );
+                            fact.occurred_start = None;
+                            fact.occurred_end = None;
+                            fact.occurred_confidence =
+                                crate::read::temporal::ConfidenceBand::None;
+                        }
+
                         // Validate before writing. Reject if invariants broken
                         // (unpaired bounds, end<=start, or confidence-bounds
                         // mismatch). Malformed extractions are dropped with a
@@ -705,6 +728,9 @@ impl WriteEngine {
                                 occurred_start,
                                 occurred_end,
                                 occurred_confidence,
+                                temporal_evidence: v["temporal_evidence"]
+                                    .as_str()
+                                    .map(String::from),
                             })
                         })
                         .collect()

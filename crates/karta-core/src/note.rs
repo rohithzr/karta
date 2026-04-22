@@ -223,6 +223,13 @@ pub struct AtomicFactExtraction {
     /// Discrete confidence band (see STEP1.5 resolved decision #4).
     #[serde(default = "default_confidence_band")]
     pub occurred_confidence: crate::read::temporal::ConfidenceBand,
+    /// Grounding: literal substring of `content` that justifies the bounds.
+    /// Forces the LLM to point at the temporal phrase rather than infer from
+    /// conversation context. MUST be null iff bounds are null. Validator
+    /// drops the fact's bounds (downgrades to null/null/0.0) if this field
+    /// is missing or doesn't appear in `content`.
+    #[serde(default)]
+    pub temporal_evidence: Option<String>,
 }
 
 /// LLM decision about whether to link two notes.
