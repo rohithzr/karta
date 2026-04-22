@@ -6,3 +6,4 @@
 
 pub mod memory_kind;
 pub mod facet;
+pub mod entity_type;
