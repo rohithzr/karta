@@ -5,6 +5,7 @@ use chrono::Utc;
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use crate::clock::ClockContext;
 use crate::config::DreamConfig;
 use crate::error::Result;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
@@ -12,6 +13,18 @@ use crate::note::{MemoryNote, Provenance};
 use crate::store::{GraphStore, VectorStore};
 
 use super::types::{DreamRecord, DreamRun, DreamType};
+
+/// max(input.source_timestamp) across a dream's input batch — the bounded
+/// claim used to stamp dream-output notes. Falls back to ctx.reference_time()
+/// for an empty batch (defensive; the caller currently never passes an
+/// empty slice but this keeps the helper total).
+fn max_source_timestamp(notes: &[&MemoryNote], ctx: ClockContext) -> chrono::DateTime<chrono::Utc> {
+    notes
+        .iter()
+        .map(|n| n.source_timestamp)
+        .max()
+        .unwrap_or_else(|| ctx.reference_time())
+}
 
 pub struct DreamEngine {
     vector_store: Arc<dyn VectorStore>,
@@ -40,13 +53,27 @@ impl DreamEngine {
         scope_type: &str,
         scope_id: &str,
     ) -> Result<DreamRun> {
+        self.run_with_clock(scope_type, scope_id, ClockContext::now()).await
+    }
+
+    /// Snapshot semantics (codex #8): one read of the input batch, one
+    /// fixed reference_time for the entire run. Concurrent writes after
+    /// `vector_store.get_all()` returns don't affect this run's outputs.
+    pub async fn run_with_clock(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        ctx: ClockContext,
+    ) -> Result<DreamRun> {
         let run_id = Uuid::new_v4().to_string();
         let started_at = Utc::now();
         let mut total_tokens: u64 = 0;
         let mut dreams: Vec<DreamRecord> = Vec::new();
 
-        // Expire stale foresight signals
-        let expired = self.graph_store.expire_foresights(Utc::now()).await?;
+        // Expire stale foresight signals against the data's reference_time,
+        // not the wall clock. A foresight extracted from a 2024 message at
+        // a 2024 reference_time should expire on its own 2024 calendar.
+        let expired = self.graph_store.expire_foresights(ctx.reference_time()).await?;
         if expired > 0 {
             debug!(expired = expired, "Expired foresight signals");
         }
@@ -54,7 +81,8 @@ impl DreamEngine {
         // Get dream cursor for incremental processing
         let cursor = self.graph_store.get_dream_cursor().await?;
 
-        // Get all non-dream notes, filtered by cursor for incremental runs
+        // Snapshot the input batch once. Everything downstream — clustering,
+        // dreaming, foresight expiry — sees the same set of notes.
         let all_notes: Vec<MemoryNote> = self
             .vector_store
             .get_all()
@@ -114,13 +142,16 @@ impl DreamEngine {
             .filter_map(|s| DreamType::from_str(s))
             .collect();
 
-        // Per-cluster dreams (with dedup)
+        // Per-cluster dreams (with dedup). source_timestamp for any persisted
+        // dream-note = max(input.source_timestamp) — the bounded claim.
         for cluster in &clusters {
+            let evidence_max = max_source_timestamp(cluster, ctx);
+
             if enabled.contains(&DreamType::Consolidation) && cluster.len() >= 3 {
                 let (dream, tokens) = self.dream_consolidation(cluster).await?;
                 total_tokens += tokens;
                 if dream.would_write && !self.is_duplicate_dream(&dream).await? {
-                    self.persist_dream(&dream).await?;
+                    self.persist_dream(&dream, evidence_max).await?;
                 }
                 dreams.push(dream);
             }
@@ -129,7 +160,7 @@ impl DreamEngine {
                 let (dream, tokens) = self.dream_deduction(cluster).await?;
                 total_tokens += tokens;
                 if dream.would_write && !self.is_duplicate_dream(&dream).await? {
-                    self.persist_dream(&dream).await?;
+                    self.persist_dream(&dream, evidence_max).await?;
                 }
                 dreams.push(dream);
             }
@@ -138,7 +169,7 @@ impl DreamEngine {
                 let (dream, tokens) = self.dream_contradiction(cluster).await?;
                 total_tokens += tokens;
                 if dream.would_write && !self.is_duplicate_dream(&dream).await? {
-                    self.persist_dream(&dream).await?;
+                    self.persist_dream(&dream, evidence_max).await?;
                 }
                 dreams.push(dream);
             }
@@ -148,15 +179,15 @@ impl DreamEngine {
         let max = self.config.max_notes_per_prompt;
 
         if enabled.contains(&DreamType::Induction) && notes_to_process.len() >= 4 {
-            // Run induction across multiple windows of notes
             for chunk in notes_to_process.chunks(max) {
                 if chunk.len() < 4 {
                     continue;
                 }
+                let evidence_max = max_source_timestamp(chunk, ctx);
                 let (dream, tokens) = self.dream_induction(chunk).await?;
                 total_tokens += tokens;
                 if dream.would_write && !self.is_duplicate_dream(&dream).await? {
-                    self.persist_dream(&dream).await?;
+                    self.persist_dream(&dream, evidence_max).await?;
                 }
                 dreams.push(dream);
             }
@@ -167,10 +198,11 @@ impl DreamEngine {
                 if chunk.len() < 3 {
                     continue;
                 }
-                let (dream, tokens) = self.dream_abduction(chunk).await?;
+                let evidence_max = max_source_timestamp(chunk, ctx);
+                let (dream, tokens) = self.dream_abduction(chunk, ctx).await?;
                 total_tokens += tokens;
                 if dream.would_write && !self.is_duplicate_dream(&dream).await? {
-                    self.persist_dream(&dream).await?;
+                    self.persist_dream(&dream, evidence_max).await?;
                 }
                 dreams.push(dream);
             }
@@ -186,11 +218,16 @@ impl DreamEngine {
                     if !episode.note_ids.is_empty() {
                         let note_refs: Vec<&str> = episode.note_ids.iter().map(|s| s.as_str()).collect();
                         if let Ok(ep_notes) = self.vector_store.get_many(&note_refs).await {
-                            match self.dream_episode_digest(&episode, &ep_notes).await {
+                            let evidence_max = ep_notes
+                                .iter()
+                                .map(|n| n.source_timestamp)
+                                .max()
+                                .unwrap_or_else(|| ctx.reference_time());
+                            match self.dream_episode_digest(&episode, &ep_notes, evidence_max).await {
                                 Ok((dream, tokens)) => {
                                     total_tokens += tokens;
                                     if dream.would_write {
-                                        let _ = self.persist_dream(&dream).await;
+                                        let _ = self.persist_dream(&dream, evidence_max).await;
                                     }
                                     dreams.push(dream);
                                 }
@@ -212,7 +249,7 @@ impl DreamEngine {
                         Ok((dream, tokens)) => {
                             total_tokens += tokens;
                             if dream.would_write && !self.is_duplicate_dream(&dream).await.unwrap_or(false) {
-                                let _ = self.persist_dream(&dream).await;
+                                let _ = self.persist_dream(&dream, ctx.reference_time()).await;
                             }
                             dreams.push(dream);
                         }
@@ -406,7 +443,11 @@ impl DreamEngine {
         ))
     }
 
-    async fn dream_abduction(&self, notes: &[&MemoryNote]) -> Result<(DreamRecord, u64)> {
+    async fn dream_abduction(
+        &self,
+        notes: &[&MemoryNote],
+        ctx: ClockContext,
+    ) -> Result<(DreamRecord, u64)> {
         let notes_text = Self::format_notes(notes);
         let prompt = Prompts::dream_abduction(&notes_text);
 
@@ -419,13 +460,15 @@ impl DreamEngine {
 
         let dream_id = Uuid::new_v4().to_string();
 
-        // Emit foresight signal from hypothesis if it's forward-looking
+        // Abductive foresight TTL anchors to ctx.reference_time(), not Utc::now().
+        // 90 days from the data's "now" — survives a back-dated query with the
+        // matched reference_time; expires correctly on a wall-clock dream pass.
         if let Some(ref h) = hypothesis {
             if would_write {
                 let fs = crate::note::ForesightSignal::new(
                     h.clone(),
                     dream_id.clone(),
-                    Some(chrono::Utc::now() + chrono::Duration::days(90)),
+                    Some(ctx.reference_time() + chrono::Duration::days(90)),
                 );
                 let _ = self.graph_store.upsert_foresight(&fs).await;
             }
@@ -642,7 +685,11 @@ impl DreamEngine {
 
     // --- Persist dream as a note ---
 
-    async fn persist_dream(&self, dream: &DreamRecord) -> Result<()> {
+    async fn persist_dream(
+        &self,
+        dream: &DreamRecord,
+        source_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
         let embedding_text = &dream.dream_content;
         let embeddings = self.llm.embed(&[embedding_text]).await?;
         let embedding = embeddings.into_iter().next().unwrap_or_default();
@@ -687,7 +734,8 @@ impl DreamEngine {
             status: crate::note::NoteStatus::Active,
             last_accessed_at: dream.created_at,
             turn_index: None,
-            source_timestamp: dream.created_at,
+            // bounded claim: this inference is as fresh as its newest evidence.
+            source_timestamp,
             session_id: None,
         };
 
@@ -715,6 +763,7 @@ impl DreamEngine {
         &self,
         episode: &crate::note::Episode,
         notes: &[MemoryNote],
+        source_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<(DreamRecord, u64)> {
         use crate::llm::Prompts;
         use crate::note::{
@@ -819,7 +868,8 @@ impl DreamEngine {
                 status: NoteStatus::Active,
                 last_accessed_at: Utc::now(),
                 turn_index: None,
-                source_timestamp: Utc::now(),
+                // bounded claim: digest freshness == newest evidence.
+                source_timestamp,
                 session_id: None,
             };
 
