@@ -546,6 +546,14 @@ impl Karta {
         self.graph_store.get_links(note_id).await
     }
 
+    /// Get the atomic facts extracted from a note, in ordinal order.
+    pub async fn get_facts_for_note(
+        &self,
+        note_id: &str,
+    ) -> Result<Vec<crate::note::AtomicFact>> {
+        self.vector_store.get_facts_for_note(note_id).await
+    }
+
     /// Raw LLM chat access for evaluation/judge use cases.
     pub async fn llm_chat(
         &self,
