@@ -491,11 +491,15 @@ async fn eval_conversation(
             }
             let session_id = format!("session-{}", current_session);
 
-            // Parse time_anchor into structured timestamp instead of text prefix
-            let source_timestamp = if msg.time_anchor.is_empty() {
-                None
-            } else {
-                parse_time_anchor(&msg.time_anchor)
+            // Parse time_anchor into structured timestamp instead of text prefix.
+            // Falls back to Utc::now() when the source data has no anchor —
+            // that's lossy carry-forward (the new JSON shape from convert_beam.py
+            // pre-resolves effective_reference_time per turn so the harness no
+            // longer has to choose a fallback). When the new converter ships
+            // we'll switch to reading effective_reference_time directly.
+            let ctx = match parse_time_anchor(&msg.time_anchor) {
+                Some(ts) => karta_core::clock::ClockContext::at(ts),
+                None => karta_core::clock::ClockContext::now(),
             };
 
             // Still include time_anchor as text prefix for LLM context
@@ -505,7 +509,7 @@ async fn eval_conversation(
                 format!("[{}] {}", msg.time_anchor, msg.content)
             };
 
-            match karta.add_note_with_metadata(&content, &session_id, Some(i as u32), source_timestamp).await {
+            match karta.add_note_with_clock(&content, Some(&session_id), Some(i as u32), ctx).await {
                 Ok(note) => {
                     ingested += 1;
                     if (i + 1) % 20 == 0 || i == 0 {

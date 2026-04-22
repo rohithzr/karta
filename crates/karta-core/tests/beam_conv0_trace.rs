@@ -241,7 +241,10 @@ async fn trace_conv0() {
             last_anchor = msg.time_anchor.clone();
         }
         let session_id = format!("{}-s{}", session_prefix, current_session);
-        let source_timestamp = parse_time_anchor(&msg.time_anchor);
+        let ctx = match parse_time_anchor(&msg.time_anchor) {
+            Some(ts) => karta_core::clock::ClockContext::at(ts),
+            None => karta_core::clock::ClockContext::now(),
+        };
         let content = if msg.time_anchor.is_empty() {
             msg.content.clone()
         } else {
@@ -263,7 +266,7 @@ async fn trace_conv0() {
 
         let result = trace::with_trace(Some(Arc::clone(&writer)), turn_idx, async move {
             karta_ref
-                .add_note_with_metadata(&content, &session_id, Some(turn_idx), source_timestamp)
+                .add_note_with_clock(&content, Some(&session_id), Some(turn_idx), ctx)
                 .await
         })
         .await;
