@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use tracing::{debug, info};
 
+use crate::clock::ClockContext;
 use crate::config::ReadConfig;
 use crate::error::Result;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
@@ -270,17 +271,18 @@ impl ReadEngine {
 
     /// Compute a recency score for a note using exponential decay.
     /// Returns 1.0 for brand new notes, decaying toward 0.0 for old notes.
-    /// Uses source_timestamp (real conversation date) when available,
-    /// falling back to updated_at (ingestion time).
-    fn recency_score(&self, note: &MemoryNote) -> f32 {
-        let age_days = Utc::now()
-            .signed_duration_since(note.source_timestamp)
+    /// Uses source_timestamp (the data's "now" at ingest) and the query's
+    /// reference_time, NOT Utc::now() — replays must age relative to the
+    /// query, not the wall clock.
+    fn recency_score(&self, note: &MemoryNote, ctx: ClockContext) -> f32 {
+        // Forward-date clamp (codex #2). If source_timestamp is past
+        // reference_time (clock skew, future-dated import, bug), age_days
+        // goes negative — clamp at 0.0 so recency = 1.0 (treated as
+        // fresh-as-possible). Better than producing decay > 1 or NaN.
+        let age_days = (ctx.reference_time() - note.source_timestamp)
             .num_seconds() as f64
             / 86400.0;
-
-        if age_days <= 0.0 {
-            return 1.0;
-        }
+        let age_days = age_days.max(0.0);
 
         // Exponential decay: score = 0.5^(age / half_life)
         let half_life = self.config.recency_half_life_days.max(1.0);
@@ -289,9 +291,15 @@ impl ReadEngine {
 
     /// Combine similarity score with recency to produce a final score.
     /// Accepts an explicit recency weight for mode-specific overrides.
-    fn blended_score_with_weight(&self, similarity: f32, note: &MemoryNote, recency_weight: f32) -> f32 {
+    fn blended_score_with_weight(
+        &self,
+        similarity: f32,
+        note: &MemoryNote,
+        recency_weight: f32,
+        ctx: ClockContext,
+    ) -> f32 {
         let w = recency_weight.clamp(0.0, 1.0);
-        let recency = self.recency_score(note);
+        let recency = self.recency_score(note, ctx);
         (1.0 - w) * similarity + w * recency
     }
 
@@ -397,9 +405,20 @@ impl ReadEngine {
         Ok(weighted_notes.into_iter().map(|(n, _)| n).collect())
     }
 
-    /// Public search: returns exactly top_k results. For external callers.
+    /// Public search: returns exactly top_k results. Live default — anchors
+    /// recency to Utc::now() via ClockContext::now().
     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
-        let (mut results, _mode) = self.search_wide(query, top_k).await?;
+        self.search_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    /// Time-travel / replay query — recency anchored to ctx.reference_time().
+    pub async fn search_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<Vec<SearchResult>> {
+        let (mut results, _mode) = self.search_wide(query, top_k, ctx).await?;
         results.truncate(top_k);
 
         // Access tracking (fire-and-forget — don't block the read path)
@@ -420,7 +439,12 @@ impl ReadEngine {
     /// Internal search: returns the full expanded candidate pool (not truncated)
     /// plus the classified query mode. Used by ask() so the reranker can see the
     /// full pool before truncation, and ask() can use the same mode for top_k sizing.
-    async fn search_wide(&self, query: &str, top_k: usize) -> Result<(Vec<SearchResult>, QueryMode)> {
+    async fn search_wide(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<(Vec<SearchResult>, QueryMode)> {
         info!("Searching: \"{}\"", query);
 
         let embeddings = self.llm.embed(&[query]).await?;
@@ -522,7 +546,7 @@ impl ReadEngine {
                 _ => {}
             }
 
-            let mut final_score = self.blended_score_with_weight(sim, &note, effective_recency_weight);
+            let mut final_score = self.blended_score_with_weight(sim, &note, effective_recency_weight, ctx);
 
             // Graph-aware scoring: notes with more links score higher (PageRank-lite)
             let link_count = self.graph_store.get_link_count(&note.id).await?;
@@ -783,10 +807,19 @@ impl ReadEngine {
     /// them to an agent, etc.). Use `ask()` if you want Karta to also
     /// compose an answer via its configured answer-LLM.
     pub async fn fetch_memories(&self, query: &str, top_k: usize) -> Result<FetchedMemories> {
+        self.fetch_memories_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    pub async fn fetch_memories_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<FetchedMemories> {
         let wide_k = top_k * self.config.summarization_top_k_multiplier.max(4);
         let mut reranker_best: Option<f32> = None;
 
-        let (mut results, mode) = self.search_wide(query, wide_k).await?;
+        let (mut results, mode) = self.search_wide(query, wide_k, ctx).await?;
 
         let effective_top_k = match mode {
             QueryMode::Breadth => top_k * self.config.summarization_top_k_multiplier,
@@ -1018,13 +1051,23 @@ impl ReadEngine {
     /// Search + deduplicate + synthesize an answer with provenance markers.
     /// Includes abstention calibration: if no notes are sufficiently relevant, abstains.
     pub async fn ask(&self, query: &str, top_k: usize) -> Result<AskResult> {
+        self.ask_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    /// Time-travel ask — recency anchored to ctx.reference_time().
+    pub async fn ask_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<AskResult> {
         // Fetch a wide pool from search_wide(), which classifies the query using
         // the embedding classifier. We pass a generous top_k so the pool is large
         // enough for any mode, then truncate based on the actual classified mode.
         let wide_k = top_k * self.config.summarization_top_k_multiplier.max(4);
         let mut reranker_best: Option<f32> = None;
 
-        let (mut results, mode) = self.search_wide(query, wide_k).await?;
+        let (mut results, mode) = self.search_wide(query, wide_k, ctx).await?;
 
         let effective_top_k = match mode {
             QueryMode::Breadth => top_k * self.config.summarization_top_k_multiplier,
