@@ -322,9 +322,13 @@ impl WriteEngine {
                             note.id.clone(),
                             i as u32,
                         );
-                        // TEMPORARY bridge: compose a subject string from entity_text until Task 5
-                        // replaces the storage struct.
-                        fact.subject = extraction.entity_text.clone();
+                        fact.memory_kind = extraction.memory_kind;
+                        fact.facet = extraction.facet;
+                        fact.entity_type = extraction.entity_type;
+                        fact.entity_text = extraction.entity_text.clone();
+                        fact.value_text = extraction.value_text.clone();
+                        fact.value_date = extraction.value_date;
+                        fact.supporting_spans = extraction.supporting_spans.clone();
                         fact.embedding = embedding;
                         fact.created_at = note.created_at;
                         fact.source_timestamp = note.source_timestamp;
@@ -350,7 +354,7 @@ impl WriteEngine {
                         let fact_content = fact.content.clone();
                         let _ = self.vector_store.upsert_fact(&fact).await;
                         let _ = self.graph_store.record_fact(
-                            &fact.id, &note.id, i as u32, fact.subject.as_deref()
+                            &fact.id, &note.id, i as u32, fact.entity_text.as_deref()
                         ).await;
                         let heavy = trace::heavy();
                         trace::try_emit(TraceEvent::FactWritten {

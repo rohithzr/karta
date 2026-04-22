@@ -354,9 +354,24 @@ pub struct AtomicFact {
     pub source_note_id: String,
     /// Position within the source note's fact list (0-indexed, preserves micro-ordering).
     pub ordinal: u32,
-    /// Primary entity or topic for aggregation grouping (e.g., "Flask", "budget", "Coco").
-    pub subject: Option<String>,
-    /// Embedding vector (stored in LanceDB atomic_facts table).
+
+    /// Admission classification — see `MemoryKind::is_durable()`.
+    pub memory_kind: crate::extract::memory_kind::MemoryKind,
+    /// What aspect of the entity this fact describes.
+    pub facet: crate::extract::facet::Facet,
+    /// Coarse entity classification.
+    pub entity_type: crate::extract::entity_type::EntityType,
+    /// Surface form of the entity ("the project", "Coco", "v1").
+    pub entity_text: Option<String>,
+    /// String value slot ("Flask 2.3.1", "vegetarian", "/etc/foo").
+    pub value_text: Option<String>,
+    /// Date value slot — used for dates that ARE the value (deadline, target_date).
+    /// Distinct from `occurred_*` which describes WHEN the fact happened.
+    pub value_date: Option<DateTime<Utc>>,
+    /// Verbatim substrings of the source NOTE content that justify the fact.
+    pub supporting_spans: Vec<String>,
+
+    /// Embedding vector (stored in the vector backend's atomic_facts table).
     #[serde(skip)]
     pub embedding: Vec<f32>,
     pub created_at: DateTime<Utc>,
@@ -397,7 +412,13 @@ impl AtomicFact {
             content,
             source_note_id,
             ordinal,
-            subject: None,
+            memory_kind: crate::extract::memory_kind::MemoryKind::DurableFact,
+            facet: crate::extract::facet::Facet::Unknown,
+            entity_type: crate::extract::entity_type::EntityType::Unknown,
+            entity_text: None,
+            value_text: None,
+            value_date: None,
+            supporting_spans: Vec::new(),
             embedding: Vec::new(),
             created_at: Utc::now(),
             source_timestamp: Utc::now(),

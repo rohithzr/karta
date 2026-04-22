@@ -185,7 +185,10 @@ impl LanceVectorStore {
 
         let created_at = fact.created_at.to_rfc3339();
         let ordinal_str = fact.ordinal.to_string();
-        let subject_str = fact.subject.clone().unwrap_or_default();
+        // Map the old single-slot "subject" column to entity_text — Lance
+        // backend is opt-in and pre-STEP2; full multi-column port is tracked
+        // alongside Task 5.
+        let subject_str = fact.entity_text.clone().unwrap_or_default();
 
         RecordBatch::try_new(
             self.facts_schema(),
@@ -224,7 +227,13 @@ impl LanceVectorStore {
                 content: contents.value(i).to_string(),
                 source_note_id: source_ids.value(i).to_string(),
                 ordinal: ordinals.value(i).parse().unwrap_or(0),
-                subject: if subject_val.is_empty() { None } else { Some(subject_val.to_string()) },
+                memory_kind: crate::extract::memory_kind::MemoryKind::DurableFact,
+                facet: crate::extract::facet::Facet::Unknown,
+                entity_type: crate::extract::entity_type::EntityType::Unknown,
+                entity_text: if subject_val.is_empty() { None } else { Some(subject_val.to_string()) },
+                value_text: None,
+                value_date: None,
+                supporting_spans: Vec::new(),
                 embedding,
                 created_at,
                 // STEP1.5 Task 2 will populate these from new columns.
