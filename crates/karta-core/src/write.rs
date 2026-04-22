@@ -322,6 +322,21 @@ impl WriteEngine {
                             note.id.clone(),
                             i as u32,
                         );
+
+                        // Admission gate (defense-in-depth — the pre-filter in Task 9 catches the
+                        // bulk of ephemeral facts before they reach embed). This per-fact backstop
+                        // catches anything that snuck through the JSON-fallback parse path.
+                        if let Err(e) = crate::extract::admission::validate_admission(extraction.memory_kind) {
+                            tracing::debug!(
+                                note_id = %note.id,
+                                fact_ordinal = i,
+                                kind = ?extraction.memory_kind,
+                                error = %e,
+                                "dropping fact: admission failed",
+                            );
+                            continue;
+                        }
+
                         fact.memory_kind = extraction.memory_kind;
                         fact.facet = extraction.facet;
                         fact.entity_type = extraction.entity_type;
