@@ -36,18 +36,37 @@ struct BeamConversation {
     id: String,
     category: String,
     title: String,
-    user_messages: Vec<BeamMessage>,
+    sessions: Vec<BeamSession>,
     total_turns: usize,
+    #[serde(default)]
+    total_user_turns: usize,
     questions: Vec<BeamQuestion>,
 }
 
-#[derive(serde::Deserialize)]
-struct BeamMessage {
+#[derive(serde::Deserialize, Clone)]
+#[allow(dead_code)]
+struct BeamSession {
+    session_index: usize,
+    #[serde(default)]
+    session_anchor: Option<String>,
+    turns: Vec<BeamTurn>,
+}
+
+#[derive(serde::Deserialize, Clone)]
+#[allow(dead_code)]
+struct BeamTurn {
+    #[serde(default)]
+    turn_index: u32,
     role: String,
     content: String,
-    time_anchor: String,
+    #[serde(default)]
+    time_anchor: Option<String>,
+    #[serde(default)]
+    effective_reference_time: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     question_type: Option<String>,
+    #[serde(default)]
+    raw_index: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -457,12 +476,28 @@ fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 async fn eval_conversation(
     conv: &BeamConversation,
 ) -> (usize, usize, usize, HashMap<String, (usize, usize)>) {
+    // Flatten sessions to user turns (post-STEP1 BEAM converter shape).
+    // Skip empty content + skip `answer_ai_question` echoes (HARNESS-LEVEL
+    // SKIP, F7-T9b). Session boundaries come directly from `session_index`
+    // — no more deriving them from time_anchor changes.
+    let user_turns: Vec<(usize, &BeamTurn)> = conv
+        .sessions
+        .iter()
+        .flat_map(|s| s.turns.iter().map(move |t| (s.session_index, t)))
+        .filter(|(_, t)| {
+            t.role == "user"
+                && !t.content.trim().is_empty()
+                && t.question_type.as_deref() != Some("answer_ai_question")
+        })
+        .collect();
+
     println!("\n{}", "=".repeat(70));
     println!(
-        "BEAM 100K — Conv {} [{}]: {} user msgs, {} questions",
+        "BEAM 100K — Conv {} [{}]: {} sessions / {} ingest-eligible user turns, {} questions",
         conv.id,
         conv.category,
-        conv.user_messages.len(),
+        conv.sessions.len(),
+        user_turns.len(),
         conv.questions.len()
     );
     println!("{}", "=".repeat(70));
@@ -478,51 +513,42 @@ async fn eval_conversation(
         let ingest_start = Instant::now();
         let mut ingested = 0;
         let mut ingest_errors = 0;
-        let mut current_session = 0usize;
-        let mut last_anchor = String::new();
+        let total_eligible = user_turns.len();
 
-        for (i, msg) in conv.user_messages.iter().enumerate() {
-            if msg.content.trim().is_empty() {
-                continue;
-            }
+        for (i, (session_index, turn)) in user_turns.iter().enumerate() {
+            let session_id = format!("session-{}", session_index);
 
-            // HARNESS-LEVEL SKIP (F7-T9b): user echoes of AI suggestions carry
-            // no originating claims. Skip before calling add_note_with_clock so
-            // no attrs LLM call fires.
-            if msg.question_type.as_deref() == Some("answer_ai_question") {
-                continue;
-            }
-
-            // Derive session boundaries from time_anchor changes
-            if !msg.time_anchor.is_empty() && msg.time_anchor != last_anchor {
-                current_session += 1;
-                last_anchor = msg.time_anchor.clone();
-            }
-            let session_id = format!("session-{}", current_session);
-
-            // Parse time_anchor into structured timestamp instead of text prefix.
-            // Falls back to Utc::now() when the source data has no anchor —
-            // that's lossy carry-forward (the new JSON shape from convert_beam.py
-            // pre-resolves effective_reference_time per turn so the harness no
-            // longer has to choose a fallback). When the new converter ships
-            // we'll switch to reading effective_reference_time directly.
-            let ctx = match parse_time_anchor(&msg.time_anchor) {
-                Some(ts) => karta_core::clock::ClockContext::at(ts),
-                None => karta_core::clock::ClockContext::now(),
+            // Reference time: prefer the converter's pre-resolved
+            // effective_reference_time; fall back to parsing the text
+            // anchor; fall back to `now()` (lossy carry-forward, signals
+            // the source data had no anchor for this turn).
+            let ctx = if let Some(t) = turn.effective_reference_time {
+                karta_core::clock::ClockContext::at(t)
+            } else if let Some(anchor) = turn.time_anchor.as_deref() {
+                match parse_time_anchor(anchor) {
+                    Some(t) => karta_core::clock::ClockContext::at(t),
+                    None => karta_core::clock::ClockContext::now(),
+                }
+            } else {
+                karta_core::clock::ClockContext::now()
             };
 
-            // Still include time_anchor as text prefix for LLM context
-            let content = if msg.time_anchor.is_empty() {
-                msg.content.clone()
-            } else {
-                format!("[{}] {}", msg.time_anchor, msg.content)
+            // Preserve the `[time_anchor]` text prefix for retrieval
+            // signal — P1 baselines used this. The structured ctx is the
+            // authoritative timestamp; the prefix is a side-channel for
+            // ANN over note text containing dates.
+            let content = match turn.time_anchor.as_deref() {
+                Some(anchor) if !anchor.is_empty() => {
+                    format!("[{}] {}", anchor, turn.content)
+                }
+                _ => turn.content.clone(),
             };
 
             match karta.add_note_with_clock(&content, Some(&session_id), Some(i as u32), ctx).await {
                 Ok(note) => {
                     ingested += 1;
                     if (i + 1) % 20 == 0 || i == 0 {
-                        println!("  Ingested {}/{} notes ({} links)", i + 1, conv.user_messages.len(), note.links.len());
+                        println!("  Ingested {}/{} notes ({} links)", i + 1, total_eligible, note.links.len());
                     }
                 }
                 Err(e) => {
@@ -874,53 +900,34 @@ async fn beam_100k_full() {
     for chunk in dataset.conversations.chunks(concurrency) {
         let mut set = tokio::task::JoinSet::new();
         for conv in chunk {
-            // Clone data into owned types for 'static lifetime
+            // Clone data into owned types for 'static lifetime.
+            // The structs derive Clone post-STEP1.5 so we can hand the
+            // whole sessions/turns tree to the spawned task without
+            // hand-rolling tuple-conversions per field.
             let conv_id = conv.id.clone();
             let conv_category = conv.category.clone();
-            let msgs: Vec<(String, String, String, Option<String>)> = conv
-                .user_messages
-                .iter()
-                .map(|m| (m.role.clone(), m.content.clone(), m.time_anchor.clone(), m.question_type.clone()))
-                .collect();
-            let questions: Vec<(String, String, String, serde_json::Value)> = conv
+            let owned_sessions: Vec<BeamSession> = conv.sessions.clone();
+            let owned_qs: Vec<BeamQuestion> = conv
                 .questions
                 .iter()
-                .map(|q| {
-                    (
-                        q.ability.clone(),
-                        q.question.clone(),
-                        q.reference_answer.clone(),
-                        q.rubric.clone(),
-                    )
+                .map(|q| BeamQuestion {
+                    ability: q.ability.clone(),
+                    question: q.question.clone(),
+                    reference_answer: q.reference_answer.clone(),
+                    rubric: q.rubric.clone(),
                 })
                 .collect();
+            let owned_total_turns = conv.total_turns;
+            let owned_total_user_turns = conv.total_user_turns;
 
             set.spawn(async move {
-                // Reconstruct the conv reference types
-                let owned_msgs: Vec<BeamMessage> = msgs
-                    .iter()
-                    .map(|(r, c, t, q)| BeamMessage {
-                        role: r.clone(),
-                        content: c.clone(),
-                        time_anchor: t.clone(),
-                        question_type: q.clone(),
-                    })
-                    .collect();
-                let owned_qs: Vec<BeamQuestion> = questions
-                    .iter()
-                    .map(|(a, q, ra, rub)| BeamQuestion {
-                        ability: a.clone(),
-                        question: q.clone(),
-                        reference_answer: ra.clone(),
-                        rubric: rub.clone(),
-                    })
-                    .collect();
                 let owned_conv = BeamConversation {
                     id: conv_id,
                     category: conv_category,
                     title: String::new(),
-                    user_messages: owned_msgs,
-                    total_turns: 0,
+                    sessions: owned_sessions,
+                    total_turns: owned_total_turns,
+                    total_user_turns: owned_total_user_turns,
                     questions: owned_qs,
                 };
                 eval_conversation(&owned_conv).await
