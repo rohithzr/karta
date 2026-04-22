@@ -1,3 +1,4 @@
+use chrono::TimeZone;
 use chrono::Utc;
 use karta_core::note::{AtomicFact, MemoryNote, NoteStatus, Provenance};
 use karta_core::store::sqlite_vec::SqliteVectorStore;
@@ -227,4 +228,77 @@ async fn test_delete_removes_from_knn() {
 
     let results = store.find_similar(&[1.0, 0.0, 0.0, 0.0], 5, &[]).await.unwrap();
     assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn test_fact_typed_slots_round_trip() {
+    // Pin the encode/decode contract for every new STEP2 column. If
+    // memory_kind / facet / entity_type / entity_text / value_text /
+    // value_date / supporting_spans ever break their JSON↔TEXT mapping
+    // in upsert_fact or row_to_fact, this test fails loudly. The 14
+    // sibling tests above only assert on `ordinal` for fact rows, so
+    // this is the load-bearing coverage for the typed-slot redesign.
+    use karta_core::extract::entity_type::EntityType;
+    use karta_core::extract::facet::Facet;
+    use karta_core::extract::memory_kind::MemoryKind;
+    use karta_core::read::temporal::ConfidenceBand;
+
+    let dir = TempDir::new().unwrap();
+    let store = SqliteVectorStore::new(dir.path().to_str().unwrap(), 4)
+        .await
+        .unwrap();
+
+    let value_date = chrono::Utc
+        .with_ymd_and_hms(2024, 4, 15, 0, 0, 0)
+        .unwrap();
+    let occurred_start = chrono::Utc
+        .with_ymd_and_hms(2024, 3, 15, 0, 0, 0)
+        .unwrap();
+    let occurred_end = occurred_start + chrono::Duration::days(1);
+    let source_timestamp = chrono::Utc
+        .with_ymd_and_hms(2024, 3, 15, 12, 0, 0)
+        .unwrap();
+
+    let original = AtomicFact {
+        id: "f-typed".to_string(),
+        content: "The Coco project has an April 15 deadline.".to_string(),
+        source_note_id: "n-typed".to_string(),
+        ordinal: 7,
+        memory_kind: MemoryKind::FutureCommitment,
+        facet: Facet::Deadline,
+        entity_type: EntityType::Project,
+        entity_text: Some("Coco".to_string()),
+        value_text: Some("Flask 2.3.1".to_string()),
+        value_date: Some(value_date),
+        supporting_spans: vec!["April 15".to_string(), "Coco project".to_string()],
+        embedding: vec![0.1, 0.2, 0.3, 0.4],
+        created_at: chrono::Utc::now(),
+        source_timestamp,
+        occurred_start: Some(occurred_start),
+        occurred_end: Some(occurred_end),
+        occurred_confidence: ConfidenceBand::Explicit,
+    };
+    store.upsert_fact(&original).await.unwrap();
+
+    let fetched = store.get_facts_for_note("n-typed").await.unwrap();
+    assert_eq!(fetched.len(), 1);
+    let f = &fetched[0];
+
+    assert_eq!(f.id, "f-typed");
+    assert_eq!(f.content, original.content);
+    assert_eq!(f.ordinal, 7);
+    assert_eq!(f.memory_kind, MemoryKind::FutureCommitment);
+    assert_eq!(f.facet, Facet::Deadline);
+    assert_eq!(f.entity_type, EntityType::Project);
+    assert_eq!(f.entity_text.as_deref(), Some("Coco"));
+    assert_eq!(f.value_text.as_deref(), Some("Flask 2.3.1"));
+    assert_eq!(f.value_date, Some(value_date));
+    assert_eq!(
+        f.supporting_spans,
+        vec!["April 15".to_string(), "Coco project".to_string()]
+    );
+    assert_eq!(f.source_timestamp, source_timestamp);
+    assert_eq!(f.occurred_start, Some(occurred_start));
+    assert_eq!(f.occurred_end, Some(occurred_end));
+    assert_eq!(f.occurred_confidence, ConfidenceBand::Explicit);
 }

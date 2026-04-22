@@ -14,7 +14,6 @@ fn embedding_of_dim(n: usize) -> Vec<f32> {
     (0..n).map(|i| i as f32 / n as f32).collect()
 }
 
-#[ignore = "step2 task 11: AtomicFact shape changed, port pending"]
 #[tokio::test]
 async fn round_trip_occurred_fields() {
     let dir = TempDir::new().unwrap();
@@ -55,7 +54,6 @@ async fn round_trip_occurred_fields() {
     assert_eq!(f.source_timestamp, start);
 }
 
-#[ignore = "step2 task 11: AtomicFact shape changed, port pending"]
 #[tokio::test]
 async fn round_trip_null_bounds() {
     let dir = TempDir::new().unwrap();
@@ -91,7 +89,6 @@ async fn round_trip_null_bounds() {
     assert_eq!(f.occurred_confidence, ConfidenceBand::None);
 }
 
-#[ignore = "step2 task 11: AtomicFact shape changed, port pending"]
 #[tokio::test]
 async fn partial_index_exists() {
     let dir = TempDir::new().unwrap();
