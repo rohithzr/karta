@@ -95,11 +95,45 @@ text on Friday were indistinguishable to the retrieval layer.
 Structured bounds + interval-overlap SQL replace the text-match
 hack with the right primitive.
 
-**Known calibration gap:** real-LLM trace runs return mostly
-`Vague (0.5)` with wide ranges even when content has explicit dates.
-Prompt is over-hedging. Calibration fixture
-(`data/test/fixtures/confidence_calibration.json`) scaffolded but
-unlabeled — needs ≥100 hand-labeled entries before F7-T15 runs.
+### F7 prompt — evidence-grounded fact bounds (2026-04-22)
+
+The first F7 prompt over-hedged: real-LLM traces returned
+`Vague (0.5)` with wide ranges on most facts. The prose-only fix
+made it worse: the LLM put `[ref_time-1d, ref_time)` bounds on
+every fact, treating present-tense verbs ("uses Flask") as
+"started yesterday."
+
+Root cause: structured output models bias hard toward producing
+non-null fields. Prose rules ("default to null") lose to that
+bias.
+
+Fix: required `temporal_evidence: string | null` field on each
+fact. The LLM must quote the literal temporal phrase from the
+fact's `content`. The write-path validator strips bounds
+(downgrades to null/null/0.0) if:
+  - `temporal_evidence` is null/empty, OR
+  - the quote does not appear verbatim in `fact.content`.
+
+This is grounded reasoning instead of inference. The LLM cannot
+write a quote that isn't in the text, so it cannot smuggle
+conversation-date intuitions into per-fact bounds.
+
+**Trace impact (10-turn BEAM conv 0):**
+- v1 (original):       0% null bounds (9/22 hallucinations)
+- v2 (prose-only fix): 0% null bounds (41/41 hallucinations)
+- v3 (grounding gate): 67% null bounds (29/43 correct nulls)
+
+The validator stripped 29 of 44 LLM-emitted bounds (66%) for
+ungrounded evidence quotes — including the LLM trying to use
+"reference_time: 2024-03-15..." (the prompt prefix itself) and
+"April 15" as evidence for unrelated facts.
+
+**Known follow-up:** the 15 facts that survived the gate include
+~6 borderline cases where the LLM included "March 15" in the
+synthesized fact text and the gate accepts it. Per-band precision
+needs the calibration fixture
+(`data/test/fixtures/confidence_calibration.json`, scaffolded but
+unlabeled — needs ≥100 hand-labeled entries before F7-T15 runs).
 
 ## [0.1.0-experimental] — 2026-04-14
 
