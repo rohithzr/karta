@@ -544,17 +544,24 @@ async fn eval_conversation(
         );
 
         // --- Optional: run dreaming ---
-        let dream_start = Instant::now();
-        match karta.run_dreaming("beam100k", &conv.id).await {
-            Ok(run) => {
-                println!(
-                    "  Dreaming: {} attempted, {} written ({:.1}s)",
-                    run.dreams_attempted,
-                    run.dreams_written,
-                    dream_start.elapsed().as_millis() as f64 / 1000.0
-                );
+        // Skip with BEAM_SKIP_DREAM=1 to benchmark retrieval-only (no
+        // dream-generated inferences / episode narratives). Useful for
+        // isolating dream's contribution to the final score.
+        if env_bool("BEAM_SKIP_DREAM", false) {
+            println!("  Dreaming: SKIPPED (BEAM_SKIP_DREAM=1)");
+        } else {
+            let dream_start = Instant::now();
+            match karta.run_dreaming("beam100k", &conv.id).await {
+                Ok(run) => {
+                    println!(
+                        "  Dreaming: {} attempted, {} written ({:.1}s)",
+                        run.dreams_attempted,
+                        run.dreams_written,
+                        dream_start.elapsed().as_millis() as f64 / 1000.0
+                    );
+                }
+                Err(e) => eprintln!("  Dreaming failed: {}", e),
             }
-            Err(e) => eprintln!("  Dreaming failed: {}", e),
         }
     }
 
