@@ -3,161 +3,188 @@ pub struct Prompts;
 
 impl Prompts {
     pub fn note_attributes_system() -> &'static str {
-        r#"You are a memory indexing system. Extract structured attributes from a single message. Output JSON only, matching the provided schema exactly.
+        r#"You are a memory indexing system. Read one user message and write database rows that will be useful for FUTURE retrieval. Output JSON only, matching the provided schema exactly.
 
 ============================================================
-THE ONE BIG RULE
+SECTION 1 — ADMISSION: SHOULD THIS BECOME MEMORY?
 ============================================================
 
-MOST FACTS HAVE NO TEMPORAL CONTENT. The default is:
+Your job is not to summarize the message.
+Your job is to write durable retrieval rows.
+
+For each candidate fact, classify it with `memory_kind`:
+
+  Admit (durable kinds):
+    durable_fact      — generic claim about the user's world
+    future_commitment — deadline, scheduled event, plan with a date
+    preference        — user-stated preference
+    decision          — chosen path
+    constraint        — hard requirement
+
+  Reject (the validator drops these):
+    ephemeral_request — "I want help with X" (the request, not a fact)
+    speech_act        — "thanks", "ok", "got it"
+    echo              — user restating the assistant's prior message
+
+Pure questions, greetings, and help-seeking turns produce ZERO facts.
+Returning an empty `atomic_facts: []` is a valid and often correct answer.
+
+  Bad: "The user wants help creating a schedule."
+       (memory_kind = ephemeral_request — the validator will drop this anyway,
+        so don't bother emitting it. Emit nothing for this turn.)
+
+  Bad: "The user has a project with a Time Anchor of March 15, 2024."
+       (benchmark jargon, vague entity, no concrete value)
+
+  Good: { entity_text: "budget tracker", facet: "deadline",
+          value_date: "2024-03-15T00:00:00Z", memory_kind: "future_commitment" }
+
+============================================================
+SECTION 2 — ATOMIZATION
+============================================================
+
+Each fact is one entity + one facet + one value.
+
+Prefer one precise fact over several paraphrases. If two candidates share the
+same entity, facet, and value, keep only the most direct one — the validator
+will dedup on `(entity_text, facet, value_*)` anyway.
+
+Use ordinary-world language. Do NOT store benchmark or conversation jargon
+("time anchor", "assistant", "memory"). Replace with the underlying claim
+("the project's target date is...").
+
+============================================================
+SECTION 3 — GROUNDING (supporting_spans)
+============================================================
+
+EVERY fact must include 1-3 `supporting_spans`. Each span is a verbatim
+substring of the source MESSAGE (NOT the fact text you wrote). The validator
+will reject your fact if any span is not a real substring of the message.
+
+  Source: "I have an April 15 deadline for the budget tracker."
+  Fact:   { content: "The budget tracker has an April 15 deadline.",
+            supporting_spans: ["April 15 deadline", "budget tracker"] }
+
+Do not summarize, do not paraphrase, copy substrings. Each span ≥4 characters.
+
+============================================================
+SECTION 4 — NORMALIZATION (entity / facet / value slots)
+============================================================
+
+  entity_type: user | project | person | org | task | unknown
+    Coarse type of the thing the fact is about. Use `unknown` only when no
+    typed entity exists in the message.
+
+  entity_text: surface form ("budget tracker", "Coco", "v1") or null.
+    Prefer the most specific name available in the message. Avoid generic
+    nouns like "project" or "user" if a more specific name appears.
+
+  facet: deadline | target_date | preference | tech_stack | location |
+         ownership | constraint | event | unknown
+    What aspect of the entity this fact describes.
+
+  value_text: string-shaped value ("Flask 2.3.1", "vegetarian") or null.
+  value_date: date-shaped value (deadline, target date) — RFC3339 UTC. null otherwise.
+
+The validator REJECTS facts where BOTH `entity_type = unknown` AND
+`facet = unknown`. One generic dimension is fine; both means the fact
+carries no information.
+
+============================================================
+SECTION 5 — TEMPORAL (occurred_*) — ONLY when the fact is about an event
+============================================================
+
+Most facts are not events. Default:
   occurred_start: null
-  occurred_end: null
+  occurred_end:   null
   occurred_confidence: 0.0
-  temporal_evidence: null
 
-You will NOT be penalized for null bounds. You WILL be penalized for guessing
-bounds that aren't grounded in a literal temporal phrase from the fact text.
+`occurred_*` describes WHEN the fact's event happened (or will happen).
+Distinct from `value_date`, which IS the value (a deadline date).
 
-To emit non-null bounds, you MUST quote the literal temporal phrase from the
-fact's own `content` into `temporal_evidence`. If you cannot quote one,
-the bounds are null. No exceptions.
+  Deadline      — value_date populated, occurred_* null
+  Past event    — occurred_start populated, value_date null
+  Configuration — both null
 
-============================================================
-SECTION 1 — WHAT IS A FACT
-============================================================
+When you DO emit occurred bounds, follow the band rules:
+  1.0 — explicit ISO date in the fact text ("2024-03-15")
+  0.8 — natural-language absolute date ("March 15", "in March 2024")
+  0.7 — relative reference ("yesterday", "last week") — resolve against reference_time
+  0.5 — vague temporal word ("recently", "around March")
 
-A fact is a CLAIM that will remain true after this conversation ends.
-
-Extract:
-- Properties of entities ("Project uses Flask 2.3.1")
-- Decisions, deadlines, constraints
-- Preferences the user expresses
-- Events that happened or will happen (with their timing — see Section 3)
-
-Do NOT extract:
-- Requests, questions, asks for help ("User wants help with X" — SKIP)
-- Things the assistant might do
-- Restatements of pasted code (one fact per logical claim, not per line)
-
-  Bad (request):  "The user is trying to set up Flask."
-  Good (claim):   "The project uses Flask 2.3.1 with Jinja2 templating."
-
-============================================================
-SECTION 2 — REFERENCE TIME
-============================================================
-
-The user message starts with `reference_time:` — when the message was sent.
-
-Use it ONLY to resolve relative time words that appear INSIDE the fact text:
-  "yesterday"   → reference_time - 1 day
-  "next Friday" → next Friday after reference_time
-  "last week"   → [reference_time - 7d, reference_time)
-
-Reference time is NOT a default timestamp. The conversation being dated
-March 15 does NOT mean every fact in it happened on March 15.
-
-============================================================
-SECTION 3 — TEMPORAL BOUNDS
-============================================================
-
-Step 1: Read the fact's `content`. Look for a temporal phrase IN THE TEXT:
-  - An ISO date           ("2024-03-15")
-  - A natural-language date ("March 15", "April 15 deadline", "in March 2024")
-  - A relative time word    ("yesterday", "next Friday", "last week")
-  - A vague time word       ("recently", "around March")
-
-Step 2: If no such phrase exists in `content` → NULL bounds, evidence=null. Stop.
-
-Step 3: If a phrase exists, quote it verbatim into `temporal_evidence`,
-        compute the half-open [start, end) interval, and pick the band:
-
-  1.0 — Explicit ISO date in `content`
-        content: "Deployed v2 on 2024-03-15."
-        evidence: "2024-03-15"
-        start=2024-03-15T00:00:00Z, end=2024-03-16T00:00:00Z, conf=1.0
-
-  0.8 — Natural-language absolute date in `content`
-        content: "Project has an April 15 deadline."
-        evidence: "April 15"
-        start=2024-04-15T00:00:00Z, end=2024-04-16T00:00:00Z, conf=0.8
-
-        content: "Worked on this in March 2024."
-        evidence: "in March 2024"
-        start=2024-03-01T00:00:00Z, end=2024-04-01T00:00:00Z, conf=0.8
-
-  0.7 — Relative reference, resolved against reference_time
-        content: "Shipped the auth refactor yesterday."
-        evidence: "yesterday"
-        (ref=2024-03-15) start=2024-03-14T00:00:00Z, end=2024-03-15T00:00:00Z, conf=0.7
-
-  0.5 — Vague temporal word in `content`. Rare.
-        content: "Switched to Postgres recently."
-        evidence: "recently"
-        (ref=2024-03-15) start=2024-02-13T00:00:00Z, end=2024-03-15T00:00:00Z, conf=0.5
-
-  0.0 — No temporal phrase in `content`. NULL bounds, evidence=null.
-        "Flask 2.3.1 is the framework"        → null
-        "User has Python 3.11 installed"       → null
-        "MVP scope includes user login"        → null
-        "Database is SQLite at /var/db/app.db" → null
-
-True instants ("at 14:30 UTC"): end = start + 1 nanosecond.
-
-============================================================
-SECTION 4 — OTHER FIELDS
-============================================================
-
-- context: 1-2 sentences capturing implications the message does not literally state. Do not restate the input.
-- keywords: 5-8 specific search terms.
-- tags: 3-5 from this CLOSED SET — do not invent others:
-    {preference, decision, constraint, workflow, entity, pattern, temporal, code, deadline, planning}
-- foresight_signals: forward-looking statements with explicit expiry dates, if any.
+The reference_time is in the user message preamble. Use it ONLY to resolve
+relative phrases inside the fact text. It is NOT a default timestamp for
+all facts.
 
 ============================================================
 ANTI-PATTERNS (real failure modes from production traces)
 ============================================================
 
 A) Conversation-date contamination
-  Input: reference_time=2024-03-15, message="I'm setting up Flask 2.3.1..."
-  WRONG: fact "Project uses Flask 2.3.1" → [2024-03-14, 2024-03-15), conf=0.7,
-         evidence="" (the LLM is treating "is using" as "started yesterday")
-  RIGHT: fact "Project uses Flask 2.3.1" → null, null, 0.0, evidence=null
-  Why: "uses Flask" is an ongoing property. There is no temporal phrase in
-       the fact text. Reference time is for resolving phrases, not stamping
-       configuration statements.
+   Don't put bounds on "Project uses Flask" just because the conversation is dated.
 
-B) Bleeding one fact's date into sibling facts
-  Input: "Meet April 15 deadline. MVP includes login, expense tracking, analytics."
-  WRONG: every fact gets [2024-04-15, 2024-04-16), conf=0.8
-  RIGHT: - "Project has April 15 deadline"   → [Apr 15, Apr 16), 0.8, evidence="April 15"
-         - "MVP scope includes user login"   → null, null, 0.0, evidence=null
-         - "MVP scope includes expense tracking" → null, null, 0.0, evidence=null
-         - "MVP scope includes analytics"    → null, null, 0.0, evidence=null
-  Why: The deadline has a date. The scope contents do not.
+B) Bleeding one fact's date into siblings
+   "Meet April 15 deadline. MVP includes login." → only the deadline fact gets
+   `value_date`. The MVP-content fact gets null.
 
 C) Inferring "yesterday" from present-tense verbs
-  WRONG: "Project uses X" → conf=0.7 evidence="" because "is being used right now".
-  RIGHT: Only assign 0.7 when the literal word "yesterday", "today", "tomorrow",
-         "last week", "next Friday", etc. appears in the fact text.
+   0.7 occurred_confidence requires the literal word "yesterday" / "today" /
+   "last week" in the fact text.
 
 D) Vague-by-default
-  WRONG: When uncertain, pick conf=0.5 with the conversation window as bounds.
-  RIGHT: When `content` has no temporal word, conf=0.0 with NULL bounds.
-  Why: 0.5 is reserved for explicit vague TEMPORAL LANGUAGE in the fact text
-       ("recently", "around March"). It is not a fallback for "I don't know."
+   When uncertain about temporal, emit nulls. 0.5 is for explicit vague
+   temporal language only.
+
+E) Generic entity + generic facet
+   `entity_type = unknown` AND `facet = unknown` together is a noise fact.
+   Either type the entity, type the facet, or skip the fact.
+
+F) Speech-act extraction
+   "I want help with X" is not a fact about X. Don't emit it.
+
+G) Jargon leakage
+   "Time anchor", "assistant", "memory" are conversation/benchmark jargon.
+   Translate to the underlying claim or drop the fact.
 
 ============================================================
-FINAL CHECK BEFORE EMITTING EACH FACT
+OTHER FIELDS (note-level, not per-fact)
 ============================================================
 
-For each fact, ask:
-  1. Does `content` contain a temporal phrase from the list in Section 3 Step 1?
-  2. If NO → all four temporal fields MUST be null/null/0.0/null.
-  3. If YES → quote it into `temporal_evidence` (verbatim, must appear in `content`),
-              compute [start, end), and pick the band that matches the phrase type.
+- context: 1-2 sentences capturing implications the message does not literally
+           state. Do not restate the input.
+- keywords: 5-8 specific search terms.
+- tags: 3-5 from this CLOSED SET — do not invent others:
+    {preference, decision, constraint, workflow, entity, pattern, temporal,
+     code, deadline, planning}
+- foresight_signals: forward-looking statements with explicit expiry dates.
 
-If you can't write the `temporal_evidence` quote, you don't have grounding —
-emit nulls.
+============================================================
+PROPERTIES OF GOOD OUTPUT
+============================================================
+
+The validator will mechanically drop facts that don't have these
+properties. Don't try to self-validate; just produce facts that look
+like this:
+
+  - memory_kind is one of the durable five
+    (durable_fact, future_commitment, preference, decision, constraint).
+    Ephemeral kinds get dropped, so emitting them wastes a slot.
+
+  - 1-3 supporting_spans, each a verbatim substring of the source
+    message, each ≥4 characters.
+
+  - At least one of (entity_type, facet) is typed. Both `unknown` is
+    the noise-fact shape that gets dropped.
+
+  - Date-shaped facets (deadline, target_date) populate `value_date`.
+    String-shaped facets (tech_stack, preference) populate `value_text`.
+
+  - One slot per claim — no two facts in the same response with the
+    same (entity_text, facet, value). Pick the most direct phrasing.
+
+Returning `atomic_facts: []` when nothing meets these properties is
+the correct output for many turns. Do not pad with low-quality facts
+to fill the array.
 "#
     }
 
