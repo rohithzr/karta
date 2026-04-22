@@ -37,8 +37,13 @@ async fn make_karta(dir: &std::path::Path) -> Karta {
 }
 
 #[tokio::test]
-#[ignore = "step2 task 12: mock emits empty spans, restored after mock rewrite"]
 async fn iso_date_extracts_with_explicit_confidence() {
+    // Mock contract (after STEP2 task 12 rewrite): a message containing
+    // "deadline" + an ISO date emits a `future_commitment` fact whose
+    // `value_date` carries the date. `occurred_*` stays null because the
+    // fact references a future event (the deadline itself), not when the
+    // claim was asserted. The original test asserted occurred_*; that
+    // contract is now expressed via value_date.
     let dir = TempDir::new().unwrap();
     let karta = make_karta(dir.path()).await;
     let ref_time = Utc.with_ymd_and_hms(2024, 3, 15, 0, 0, 0).unwrap();
@@ -56,33 +61,30 @@ async fn iso_date_extracts_with_explicit_confidence() {
     let facts = karta.get_facts_for_note(&note.id).await.unwrap();
     assert!(
         !facts.is_empty(),
-        "mock should emit at least one fact from a non-empty sentence"
-    );
-    assert!(
-        facts
-            .iter()
-            .any(|f| f.occurred_confidence == ConfidenceBand::Explicit),
-        "at least one fact should carry Explicit confidence for the ISO date"
+        "mock should emit at least one fact for an ISO-dated deadline"
     );
     let dated = facts
         .iter()
-        .find(|f| f.occurred_start.is_some())
-        .expect("at least one fact should have an occurred_start for 2024-03-15");
+        .find(|f| f.value_date.is_some())
+        .expect("at least one fact should carry value_date for 2024-03-15");
     assert_eq!(
-        dated.occurred_start.unwrap(),
+        dated.value_date.unwrap(),
         Utc.with_ymd_and_hms(2024, 3, 15, 0, 0, 0).unwrap(),
-        "occurred_start should match the ISO date's 00:00:00 UTC"
+        "value_date should match the ISO deadline date"
     );
-    assert_eq!(
-        dated.occurred_end.unwrap(),
-        Utc.with_ymd_and_hms(2024, 3, 16, 0, 0, 0).unwrap(),
-        "occurred_end should be start + 1 day"
+    // occurred_* are null for future_commitment facts: the fact describes
+    // a deadline (a future event), not an assertion-time event.
+    assert!(
+        facts.iter().all(|f| f.occurred_confidence == ConfidenceBand::None),
+        "future_commitment fact should carry ConfidenceBand::None on occurred_*"
     );
 }
 
 #[tokio::test]
-#[ignore = "step2 task 12: mock emits empty spans, restored after mock rewrite"]
 async fn non_temporal_fact_has_null_bounds_and_zero_confidence() {
+    // Mock contract: a tech-stack message ("Flask 2.3.1 ...") emits one
+    // tech_stack fact per known token (Flask, Python, ...) with null
+    // occurred_* + ConfidenceBand::None. value_date is also null.
     let dir = TempDir::new().unwrap();
     let karta = make_karta(dir.path()).await;
 

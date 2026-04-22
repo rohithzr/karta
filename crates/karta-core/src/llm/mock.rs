@@ -105,137 +105,226 @@ impl MockLlmProvider {
         None
     }
 
-    /// Build one `atomic_facts` entry that matches the real LLM schema.
-    /// Deterministic: ISO-date fact → 1-day interval @ confidence 1.0;
-    /// otherwise null bounds @ confidence 0.0.
-    fn emit_fact_with_occurred(content: &str) -> serde_json::Value {
+    fn find_iso_or_nl_date(content: &str) -> Option<chrono::NaiveDate> {
+        // ISO first.
         if let Some((y, m, d)) = Self::find_iso_date(content) {
-            let start = chrono::NaiveDate::from_ymd_opt(y, m, d)
-                .expect("date validated in find_iso_date")
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is valid")
-                .and_utc();
-            let end = start + chrono::Duration::days(1);
-            let evidence = format!("{:04}-{:02}-{:02}", y, m, d);
-            let _ = evidence;
-            serde_json::json!({
-                "content": content,
-                "memory_kind": "durable_fact",
-                "supporting_spans": [],
-                "facet": "unknown",
-                "entity_type": "unknown",
-                "entity_text": null,
-                "value_text": null,
-                "value_date": null,
-                "occurred_start": start.to_rfc3339(),
-                "occurred_end": end.to_rfc3339(),
-                "occurred_confidence": 1.0,
-            })
+            return chrono::NaiveDate::from_ymd_opt(y, m, d);
+        }
+        // NL: "Month DD".
+        let months = [
+            ("january", 1),
+            ("february", 2),
+            ("march", 3),
+            ("april", 4),
+            ("may", 5),
+            ("june", 6),
+            ("july", 7),
+            ("august", 8),
+            ("september", 9),
+            ("october", 10),
+            ("november", 11),
+            ("december", 12),
+        ];
+        let lower = content.to_lowercase();
+        for (name, m) in months {
+            if let Some(pos) = lower.find(name) {
+                let after = &content[pos + name.len()..];
+                let skip: String = after.chars().take_while(|c| !c.is_ascii_digit()).collect();
+                let after_skip = &after[skip.len()..];
+                let day_str: String = after_skip
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(d) = day_str.parse::<u32>() {
+                    if let Some(date) = chrono::NaiveDate::from_ymd_opt(2024, m, d) {
+                        return Some(date);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn find_substring_for_date(content: &str, date: &chrono::NaiveDate) -> Option<String> {
+        use chrono::Datelike;
+        let iso = date.format("%Y-%m-%d").to_string();
+        if content.contains(&iso) {
+            return Some(iso);
+        }
+        // Portable "Month DD" (avoid %-d / %e platform-specific specifiers).
+        let month_name = date.format("%B").to_string();
+        let nl = format!("{} {}", month_name, date.day());
+        if content.contains(&nl) {
+            return Some(nl);
+        }
+        let nl2 = format!("{} {}, {}", month_name, date.day(), date.year());
+        if content.contains(&nl2) {
+            return Some(nl2);
+        }
+        None
+    }
+
+    fn find_tech_phrase(content: &str, token: &str) -> Option<String> {
+        let pos = content.find(token)?;
+        let after = &content[pos + token.len()..];
+        let trailer: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ' ')
+            .collect();
+        let trailer_trim = trailer.trim_end();
+        if trailer_trim.is_empty() {
+            Some(token.to_string())
         } else {
-            serde_json::json!({
-                "content": content,
-                "memory_kind": "durable_fact",
-                "supporting_spans": [],
-                "facet": "unknown",
-                "entity_type": "unknown",
-                "entity_text": null,
-                "value_text": null,
-                "value_date": null,
-                "occurred_start": null,
-                "occurred_end": null,
-                "occurred_confidence": 0.0,
-            })
+            Some(format!("{}{}", token, trailer_trim))
         }
     }
 
+    fn guess_entity_text(content: &str) -> Option<String> {
+        if content.contains("budget tracker") {
+            return Some("budget tracker".to_string());
+        }
+        None
+    }
+
     fn handle_attributes(&self, user_msg: &str) -> String {
-        // The attribute prompt is "reference_time: ...\n\nMessage:\n{content}".
-        // Strip the framing so fact extraction sees only the actual content —
-        // otherwise the reference-time ISO date leaks into every fact's
-        // `occurred_*` bounds via our YYYY-MM-DD scanner.
+        use chrono::Datelike;
         let content: &str = user_msg
             .split("Message:")
             .nth(1)
             .map(|s| s.trim_start_matches(|c: char| c == '\n' || c == ' '))
             .unwrap_or(user_msg);
+
+        let lower = content.to_lowercase();
+        let mut facts: Vec<serde_json::Value> = Vec::new();
+
+        // Try deadline (scan first so "help with April 15 deadline" doesn't short-circuit).
+        if let Some(date) = Self::find_iso_or_nl_date(content) {
+            let day_num: u32 = date.day();
+            if lower.contains("deadline") || lower.contains(" due ") || lower.contains(" by ") {
+                let span = Self::find_substring_for_date(content, &date)
+                    .unwrap_or_else(|| format!("{} {}", date.format("%B"), day_num));
+                let entity =
+                    Self::guess_entity_text(content).unwrap_or_else(|| "project".to_string());
+                facts.push(serde_json::json!({
+                    "content": format!("{} has a deadline on {}.", entity, date.format("%Y-%m-%d")),
+                    "memory_kind": "future_commitment",
+                    "supporting_spans": [span],
+                    "facet": "deadline",
+                    "entity_type": "project",
+                    "entity_text": entity,
+                    "value_text": null,
+                    "value_date": format!("{}T00:00:00Z", date.format("%Y-%m-%d")),
+                    "occurred_start": null,
+                    "occurred_end": null,
+                    "occurred_confidence": 0.0,
+                }));
+            }
+        }
+
+        // Tech-stack tokens.
+        for tok in &[
+            "Flask",
+            "Python",
+            "SQLite",
+            "Django",
+            "Postgres",
+            "Bootstrap",
+        ] {
+            if let Some(version_phrase) = Self::find_tech_phrase(content, tok) {
+                facts.push(serde_json::json!({
+                    "content": format!("Project uses {}.", version_phrase),
+                    "memory_kind": "durable_fact",
+                    "supporting_spans": [version_phrase.clone()],
+                    "facet": "tech_stack",
+                    "entity_type": "project",
+                    "entity_text": "project",
+                    "value_text": version_phrase,
+                    "value_date": null,
+                    "occurred_start": null,
+                    "occurred_end": null,
+                    "occurred_confidence": 0.0,
+                }));
+            }
+        }
+
+        // If nothing typed was found and it's a pure request, emit empty.
+        // Otherwise, also consider ISO-date content as a fallback durable_fact
+        // (for the existing occurred_extraction tests that embed a bare date).
+        let is_pure_request = lower.contains("can you help")
+            || lower.contains("could you")
+            || lower.contains("how do i");
+        if facts.is_empty() && !is_pure_request {
+            if let Some((y, m, d)) = Self::find_iso_date(content) {
+                let start = chrono::NaiveDate::from_ymd_opt(y, m, d)
+                    .expect("date validated in find_iso_date")
+                    .and_hms_opt(0, 0, 0)
+                    .expect("midnight is valid")
+                    .and_utc();
+                let end = start + chrono::Duration::days(1);
+                let iso = format!("{:04}-{:02}-{:02}", y, m, d);
+                facts.push(serde_json::json!({
+                    "content": format!("Event on {}.", iso),
+                    "memory_kind": "durable_fact",
+                    "supporting_spans": [iso.clone()],
+                    "facet": "event",
+                    "entity_type": "project",
+                    "entity_text": "project",
+                    "value_text": null,
+                    "value_date": null,
+                    "occurred_start": start.to_rfc3339(),
+                    "occurred_end": end.to_rfc3339(),
+                    "occurred_confidence": 1.0,
+                }));
+            } else if !lower.contains("flask") && !lower.contains("python") {
+                // Plain non-pattern content → emit one durable_fact with Unknown
+                // facet+entity_type so the specificity gate catches it. This
+                // keeps the mock honest: it does not pretend to classify
+                // everything correctly.
+                let first_word = content.split_whitespace().next().unwrap_or("fact");
+                let span_len = 4.max(first_word.chars().count().min(40));
+                let span: String = content.chars().take(span_len).collect();
+                facts.push(serde_json::json!({
+                    "content": content.to_string(),
+                    "memory_kind": "durable_fact",
+                    "supporting_spans": [span],
+                    "facet": "unknown",
+                    "entity_type": "unknown",
+                    "entity_text": null,
+                    "value_text": null,
+                    "value_date": null,
+                    "occurred_start": null,
+                    "occurred_end": null,
+                    "occurred_confidence": 0.0,
+                }));
+            }
+        }
+
+        // Context / keywords / tags (existing logic, preserved).
         let words = Self::extract_words(content);
         let keywords: Vec<String> = words.iter().take(8).cloned().collect();
-
-        // Generate tags based on content
-        let mut tags = Vec::new();
-        let lower = content.to_lowercase();
+        let mut tags: Vec<&str> = Vec::new();
         if lower.contains("prefer") || lower.contains("want") || lower.contains("request") {
             tags.push("preference");
         }
         if lower.contains("require") || lower.contains("must") || lower.contains("mandate") {
             tags.push("constraint");
         }
-        if lower.contains("automat") || lower.contains("workflow") || lower.contains("pipeline") {
-            tags.push("workflow");
-        }
-        if lower.contains("policy") || lower.contains("compliance") || lower.contains("audit") {
-            tags.push("decision");
-        }
-        let entity_words: Vec<&str> = content
-            .split_whitespace()
-            .filter(|w| w.chars().next().is_some_and(|c| c.is_uppercase()) && w.len() > 1)
-            .take(3)
-            .collect();
-        if !entity_words.is_empty() {
-            tags.push("entity");
-        }
         if tags.is_empty() {
             tags.push("pattern");
         }
-
-        // Generate a richer context
         let first_sentence = content.split('.').next().unwrap_or(content);
         let context = format!(
-            "{} — this is significant because it establishes constraints and context that affect related decisions and workflows.",
+            "{} - significant because it establishes context for related decisions.",
             first_sentence.trim()
         );
 
-        // Extract foresight signals (forward-looking statements)
-        let mut foresight: Vec<&str> = Vec::new();
-        let lower = content.to_lowercase();
-        if lower.contains("deadline") || lower.contains("by ") || lower.contains("before ") {
-            foresight.push("upcoming deadline detected");
-        }
-        if lower.contains("scheduled") || lower.contains("starts ") || lower.contains("launch") {
-            foresight.push("scheduled event detected");
-        }
-        if lower.contains("plan") || lower.contains("will ") || lower.contains("going to") {
-            foresight.push("future plan detected");
-        }
-
-        // Atomic facts: one per non-empty sentence (up to 5). Each fact
-        // carries `occurred_*` fields per the STEP1.5 schema — ISO-date
-        // content gets an explicit 1-day interval, everything else gets
-        // null bounds + 0.0 confidence. The real write path validates
-        // `occurred_*` and drops malformed facts; emitting the paired
-        // null/0.0 shape keeps mock-backed tests honest.
-        let fact_sentences: Vec<String> = content
-            .split('.')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .take(5)
-            .map(|s| s.to_string())
-            .collect();
-        let atomic_facts: Vec<serde_json::Value> = if fact_sentences.is_empty() {
-            vec![Self::emit_fact_with_occurred(content)]
-        } else {
-            fact_sentences
-                .iter()
-                .map(|s| Self::emit_fact_with_occurred(s))
-                .collect()
-        };
-
         serde_json::json!({
+            "reasoning": "mock heuristic extraction",
             "context": context,
             "keywords": keywords,
             "tags": tags,
-            "foresightSignals": foresight,
-            "atomic_facts": atomic_facts,
+            "foresight_signals": [],
+            "atomic_facts": facts,
         })
         .to_string()
     }
