@@ -135,12 +135,12 @@ impl MockLlmProvider {
     }
 
     fn handle_attributes(&self, user_msg: &str) -> String {
-        // The attribute prompt is "Reference time: ...\n\nIndex this memory:\n\n{content}".
+        // The attribute prompt is "reference_time: ...\n\nMessage:\n{content}".
         // Strip the framing so fact extraction sees only the actual content —
         // otherwise the reference-time ISO date leaks into every fact's
         // `occurred_*` bounds via our YYYY-MM-DD scanner.
         let content: &str = user_msg
-            .split("Index this memory:")
+            .split("Message:")
             .nth(1)
             .map(|s| s.trim_start_matches(|c: char| c == '\n' || c == ' '))
             .unwrap_or(user_msg);

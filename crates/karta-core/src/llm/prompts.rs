@@ -3,44 +3,128 @@ pub struct Prompts;
 
 impl Prompts {
     pub fn note_attributes_system() -> &'static str {
-        r#"You are a memory indexing system. Given a message and a reference time, extract structured attributes.
+        r#"You are a memory indexing system. Extract structured attributes from a single message. Output JSON only, matching the provided schema exactly.
 
-EXTRACT ONLY FACTS ABOUT THE WORLD, THE USER, OR THEIR PROJECT — not requests, questions, or asks for help. Specifically:
-- Do NOT extract facts about what the user is asking for, wants help with, or is requesting.
-- Extract only claims that will remain true after this conversation ends.
-- Bad fact (request, skip): "User wants help creating a schedule."
-- Good fact (persistent claim): "User has a deadline on 2024-03-15."
+============================================================
+SECTION 1 — WHAT IS A FACT
+============================================================
 
-For each atomic fact, emit a half-open time interval [occurred_start, occurred_end) describing when the asserted event occurred:
-- Date-only reference (e.g. "March 15, 2024"): occurred_start = 2024-03-15T00:00:00Z, occurred_end = 2024-03-16T00:00:00Z.
-- True instant (e.g. "at 14:30 UTC"): occurred_end = occurred_start + 1 nanosecond.
-- Relative reference (e.g. "yesterday", "next Friday"): resolve against the reference time.
-- Month-range (e.g. "in March 2024"): occurred_start = 2024-03-01T00:00:00Z, occurred_end = 2024-04-01T00:00:00Z.
-- Vague range (e.g. "recently", "around March"): pick a plausible range and reflect uncertainty in confidence.
-- No temporal content: occurred_start = null, occurred_end = null, occurred_confidence = 0.0.
+A fact is a CLAIM that will remain true after this conversation ends.
 
-occurred_confidence is a discrete band. Emit EXACTLY one of:
-- 1.0: explicit ISO date in source ("2024-03-15")
-- 0.8: natural-language absolute date ("March 15, 2024")
-- 0.7: relative reference, deterministic resolution ("yesterday", "next Friday")
-- 0.5: vague reference, range chosen ("recently", "around March")
-- 0.0: no temporal content (paired with null bounds)
+Extract:
+- Properties of entities the user works with ("Project uses Flask 2.3.1")
+- Decisions, deadlines, constraints the user states
+- Preferences the user expresses
+- Events that happened or will happen (with their timing — see Section 3)
 
-NEVER emit other values. Both bounds null AND confidence=0.0 together, or both bounds Some AND confidence in {0.5, 0.7, 0.8, 1.0} together. Mixed is a validation failure.
+Do NOT extract:
+- Requests, questions, asks for help ("User wants help with X" — SKIP)
+- Things the assistant might do
+- Restatements of pasted code (one fact per logical claim, not per line)
 
-Also extract:
-- context: a rich 1-2 sentence description capturing implications the message doesn't literally state. Don't restate the input.
-- keywords: 5 to 8 specific terms that would help find this note.
-- tags: 3 to 5 categorical labels from the closed set {preference, decision, constraint, workflow, entity, pattern, temporal, code, deadline, planning}. Do not invent tags outside this set.
-- foresight_signals: forward-looking statements with expiry dates, if any.
+  Bad (request):  "The user is trying to set up Flask."
+  Good (claim):   "The project uses Flask 2.3.1 with Jinja2 templating."
 
-Respond with JSON only, matching the provided schema exactly."#
+============================================================
+SECTION 2 — REFERENCE TIME
+============================================================
+
+The user message starts with a reference time — when the message was sent.
+
+Use it ONLY to resolve relative time words that appear INSIDE the fact text:
+  "yesterday"   → reference_time - 1 day
+  "next Friday" → next Friday after reference_time
+  "last week"   → [reference_time - 7d, reference_time)
+
+Reference time is NOT a default timestamp. A fact extracted from a March 15
+conversation does NOT happen on March 15 unless the fact text itself says so.
+
+============================================================
+SECTION 3 — TEMPORAL BOUNDS (occurred_start, occurred_end, occurred_confidence)
+============================================================
+
+DEFAULT: occurred_start=null, occurred_end=null, occurred_confidence=0.0.
+
+Only emit non-null bounds when the fact TEXT itself contains a temporal
+reference. Configuration, properties, ongoing state → NULL.
+
+Bounds are a half-open interval [start, end) in UTC ISO 8601.
+
+occurred_confidence is a CLOSED SET — emit exactly one of:
+
+  1.0 — Explicit ISO date IN THE FACT TEXT
+        "deployed on 2024-03-15"
+        → start=2024-03-15T00:00:00Z, end=2024-03-16T00:00:00Z, conf=1.0
+
+  0.8 — Natural-language absolute date IN THE FACT TEXT
+        "April 15 deadline"
+        → start=2024-04-15T00:00:00Z, end=2024-04-16T00:00:00Z, conf=0.8
+
+        "in March 2024"
+        → start=2024-03-01T00:00:00Z, end=2024-04-01T00:00:00Z, conf=0.8
+
+  0.7 — Relative reference resolvable against reference_time
+        "yesterday I shipped"  (ref=2024-03-15)
+        → start=2024-03-14T00:00:00Z, end=2024-03-15T00:00:00Z, conf=0.7
+
+  0.5 — Vague TEMPORAL WORD in the fact text. Rare. Must be a time word.
+        "around March"   → start=2024-03-01Z, end=2024-04-01Z, conf=0.5
+        "recently I switched"  (ref=2024-03-15)
+        → start=2024-02-13Z, end=2024-03-15Z, conf=0.5
+        DO NOT use 0.5 just because a fact lacks an obvious date.
+
+  0.0 — Fact text has no temporal reference. NULL bounds.
+        "Flask 2.3.1 is the framework"          → null, null, 0.0
+        "User has Python 3.11 installed"         → null, null, 0.0
+        "MVP scope includes user login"          → null, null, 0.0
+        "Database is SQLite at /var/db/app.db"   → null, null, 0.0
+
+INVARIANTS — violations are rejected:
+  - Both bounds null AND confidence=0.0, OR
+  - Both bounds present AND confidence in {0.5, 0.7, 0.8, 1.0}
+  - end > start (for true instants like "at 14:30Z", end = start + 1 nanosecond)
+  - confidence MUST be exactly one of {0.0, 0.5, 0.7, 0.8, 1.0}
+
+============================================================
+SECTION 4 — OTHER FIELDS
+============================================================
+
+- context: 1-2 sentences capturing implications the message does not literally state. Do not restate the input.
+- keywords: 5-8 specific search terms.
+- tags: 3-5 from this CLOSED SET — do not invent others:
+    {preference, decision, constraint, workflow, entity, pattern, temporal, code, deadline, planning}
+- foresight_signals: forward-looking statements with explicit expiry dates, if any.
+
+============================================================
+ANTI-PATTERNS (real failure modes — do not repeat)
+============================================================
+
+A) Conversation-date contamination
+  Input: ref_time=2024-03-15, message="I'm setting up Flask 2.3.1..."
+  WRONG:  fact "Project uses Flask 2.3.1" with [2024-03-15, 2024-03-16), conf=0.5
+  RIGHT:  fact "Project uses Flask 2.3.1" with null, null, conf=0.0
+  Why: Flask being installed is an ongoing property, not an event on March 15.
+
+B) Bleeding one fact's date into sibling facts
+  Input: "Meet April 15 deadline. MVP includes login, expense tracking, analytics."
+  WRONG:  every fact gets [2024-04-15, 2024-04-16), conf=0.8
+  RIGHT:  - "Project has April 15 deadline"     → [2024-04-15, 2024-04-16), 0.8
+          - "MVP scope includes user login"     → null, null, 0.0
+          - "MVP scope includes expense tracking" → null, null, 0.0
+          - "MVP scope includes analytics"      → null, null, 0.0
+  Why: The deadline has a date. The scope contents do not.
+
+C) Vague-by-default
+  WRONG: when uncertain, pick conf=0.5 with the conversation window as bounds.
+  RIGHT: when the fact text has no temporal word, conf=0.0 with NULL bounds.
+  Why: 0.5 is reserved for explicit vague TEMPORAL LANGUAGE ("recently", "around March"). It is not a fallback for "I don't know when."
+"#
     }
 
     pub fn note_attributes_user(content: &str, reference_time: chrono::DateTime<chrono::Utc>) -> String {
         format!(
-            "Reference time: {reference_time}. Interpret 'today', 'yesterday', 'next week', 'last March' relative to this.\n\nIndex this memory:\n\n{content}",
-            reference_time = reference_time.to_rfc3339(),
+            "reference_time: {ref_time}\n\nMessage:\n{content}",
+            ref_time = reference_time.to_rfc3339(),
             content = content,
         )
     }
