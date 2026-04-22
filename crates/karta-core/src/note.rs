@@ -209,27 +209,52 @@ pub struct NoteAttributes {
     pub atomic_facts: Vec<AtomicFactExtraction>,
 }
 
-/// A single atomic fact as extracted by the LLM (before embedding/storage).
+/// A single atomic fact as extracted by the LLM (before validation/storage).
+///
+/// All fields except `value_text`, `value_date`, and `entity_text` are
+/// required from the LLM. The validator gates use these fields directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtomicFactExtraction {
+    /// Free-text statement of the fact (still useful for embedding).
     pub content: String,
-    pub subject: Option<String>,
-    /// ISO-8601 UTC or null. Null iff `occurred_end` is also null.
+
+    /// Admission classification - see `MemoryKind::is_durable()`.
+    pub memory_kind: crate::extract::memory_kind::MemoryKind,
+
+    /// Verbatim substrings of the source NOTE content that justify the fact.
+    /// Each must be at least 4 chars and a real substring of `note.content`.
+    /// Empty list = grounding-gate failure = drop the fact.
+    pub supporting_spans: Vec<String>,
+
+    /// What aspect of the entity this fact describes.
+    pub facet: crate::extract::facet::Facet,
+
+    /// Coarse entity classification.
+    pub entity_type: crate::extract::entity_type::EntityType,
+
+    /// Surface form of the entity ("the project", "Coco", "v1").
+    /// `None` only allowed when `entity_type` is non-`Unknown` could not yield a name.
+    pub entity_text: Option<String>,
+
+    /// String value slot ("Flask 2.3.1", "vegetarian", "/etc/foo").
+    pub value_text: Option<String>,
+
+    /// Date value slot - used for dates that ARE the value (deadline, target_date).
+    /// Distinct from `occurred_*` which describes WHEN the fact happened.
+    pub value_date: Option<DateTime<Utc>>,
+
+    /// Lower bound (inclusive) of when the fact's event occurred.
+    /// Distinct from `value_date`. Null iff `occurred_end` also null.
     #[serde(default)]
     pub occurred_start: Option<DateTime<Utc>>,
-    /// ISO-8601 UTC or null. Null iff `occurred_start` is also null.
+
+    /// Upper bound (exclusive). Half-open semantics.
     #[serde(default)]
     pub occurred_end: Option<DateTime<Utc>>,
-    /// Discrete confidence band (see STEP1.5 resolved decision #4).
+
+    /// Discrete confidence band for the temporal bounds.
     #[serde(default = "default_confidence_band")]
     pub occurred_confidence: crate::read::temporal::ConfidenceBand,
-    /// Grounding: literal substring of `content` that justifies the bounds.
-    /// Forces the LLM to point at the temporal phrase rather than infer from
-    /// conversation context. MUST be null iff bounds are null. Validator
-    /// drops the fact's bounds (downgrades to null/null/0.0) if this field
-    /// is missing or doesn't appear in `content`.
-    #[serde(default)]
-    pub temporal_evidence: Option<String>,
 }
 
 /// LLM decision about whether to link two notes.

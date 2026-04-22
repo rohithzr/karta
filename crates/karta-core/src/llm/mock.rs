@@ -117,22 +117,33 @@ impl MockLlmProvider {
                 .and_utc();
             let end = start + chrono::Duration::days(1);
             let evidence = format!("{:04}-{:02}-{:02}", y, m, d);
+            let _ = evidence;
             serde_json::json!({
                 "content": content,
-                "subject": null,
+                "memory_kind": "durable_fact",
+                "supporting_spans": [],
+                "facet": "unknown",
+                "entity_type": "unknown",
+                "entity_text": null,
+                "value_text": null,
+                "value_date": null,
                 "occurred_start": start.to_rfc3339(),
                 "occurred_end": end.to_rfc3339(),
                 "occurred_confidence": 1.0,
-                "temporal_evidence": evidence,
             })
         } else {
             serde_json::json!({
                 "content": content,
-                "subject": null,
+                "memory_kind": "durable_fact",
+                "supporting_spans": [],
+                "facet": "unknown",
+                "entity_type": "unknown",
+                "entity_text": null,
+                "value_text": null,
+                "value_date": null,
                 "occurred_start": null,
                 "occurred_end": null,
                 "occurred_confidence": 0.0,
-                "temporal_evidence": null,
             })
         }
     }

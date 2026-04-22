@@ -322,36 +322,15 @@ impl WriteEngine {
                             note.id.clone(),
                             i as u32,
                         );
-                        fact.subject = extraction.subject.clone();
+                        // TEMPORARY bridge: compose a subject string from entity_text until Task 5
+                        // replaces the storage struct.
+                        fact.subject = extraction.entity_text.clone();
                         fact.embedding = embedding;
                         fact.created_at = note.created_at;
                         fact.source_timestamp = note.source_timestamp;
                         fact.occurred_start = extraction.occurred_start;
                         fact.occurred_end = extraction.occurred_end;
                         fact.occurred_confidence = extraction.occurred_confidence;
-
-                        // Grounding gate: if the LLM emitted bounds, it must
-                        // also have quoted the temporal phrase from the fact's
-                        // own content. If the quote is missing or doesn't
-                        // appear in `content`, the bounds are considered
-                        // hallucinated — strip them and downgrade confidence.
-                        let evidence_grounded = extraction
-                            .temporal_evidence
-                            .as_deref()
-                            .map(|q| !q.trim().is_empty() && fact.content.contains(q))
-                            .unwrap_or(false);
-                        if fact.occurred_start.is_some() && !evidence_grounded {
-                            tracing::debug!(
-                                note_id = %note.id,
-                                fact_ordinal = i,
-                                evidence = ?extraction.temporal_evidence,
-                                "stripping ungrounded fact bounds (no temporal_evidence quote in content)",
-                            );
-                            fact.occurred_start = None;
-                            fact.occurred_end = None;
-                            fact.occurred_confidence =
-                                crate::read::temporal::ConfidenceBand::None;
-                        }
 
                         // Validate before writing. Reject if invariants broken
                         // (unpaired bounds, end<=start, or confidence-bounds
@@ -724,13 +703,25 @@ impl WriteEngine {
                                 .unwrap_or(crate::read::temporal::ConfidenceBand::None);
                             Some(crate::note::AtomicFactExtraction {
                                 content: v["content"].as_str()?.to_string(),
-                                subject: v["subject"].as_str().map(String::from),
+                                memory_kind: serde_json::from_value(v["memory_kind"].clone())
+                                    .unwrap_or(crate::extract::memory_kind::MemoryKind::DurableFact),
+                                supporting_spans: v["supporting_spans"]
+                                    .as_array()
+                                    .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                                    .unwrap_or_default(),
+                                facet: serde_json::from_value(v["facet"].clone())
+                                    .unwrap_or(crate::extract::facet::Facet::Unknown),
+                                entity_type: serde_json::from_value(v["entity_type"].clone())
+                                    .unwrap_or(crate::extract::entity_type::EntityType::Unknown),
+                                entity_text: v["entity_text"].as_str().map(String::from),
+                                value_text: v["value_text"].as_str().map(String::from),
+                                value_date: v["value_date"]
+                                    .as_str()
+                                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                    .map(|dt| dt.with_timezone(&chrono::Utc)),
                                 occurred_start,
                                 occurred_end,
                                 occurred_confidence,
-                                temporal_evidence: v["temporal_evidence"]
-                                    .as_str()
-                                    .map(String::from),
                             })
                         })
                         .collect()
