@@ -300,8 +300,28 @@ impl WriteEngine {
         }
 
         // 10. Store atomic facts (each with its own embedding for fine-grained retrieval)
-        if !attrs.atomic_facts.is_empty() {
-            let fact_texts: Vec<&str> = attrs.atomic_facts.iter()
+        // PRE-FILTER: admission gate runs first so dedup can't silently collapse a
+        // real fact under an ephemeral one, and so the embed batch only includes
+        // facts that have a chance of being persisted.
+        let admitted: Vec<crate::note::AtomicFactExtraction> = attrs
+            .atomic_facts
+            .into_iter()
+            .filter(|e| {
+                let durable = e.memory_kind.is_durable();
+                if !durable {
+                    tracing::debug!(
+                        note_id = %note.id,
+                        kind = ?e.memory_kind,
+                        "pre-filter dropped ephemeral fact before dedup/embed",
+                    );
+                }
+                durable
+            })
+            .collect();
+
+        let attrs_atomic_facts = crate::extract::dedup::dedup_extractions(admitted);
+        if !attrs_atomic_facts.is_empty() {
+            let fact_texts: Vec<&str> = attrs_atomic_facts.iter()
                 .take(self.config.max_facts_per_note)
                 .map(|f| f.content.as_str())
                 .collect();
@@ -312,7 +332,7 @@ impl WriteEngine {
 
             match embed_result {
                 Ok(fact_embeddings) => {
-                    for (i, (extraction, embedding)) in attrs.atomic_facts.iter()
+                    for (i, (extraction, embedding)) in attrs_atomic_facts.iter()
                         .take(5)
                         .zip(fact_embeddings)
                         .enumerate()

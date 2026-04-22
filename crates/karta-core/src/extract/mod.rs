@@ -9,3 +9,4 @@ pub mod facet;
 pub mod entity_type;
 pub mod admission;
 pub mod grounding;
+pub mod dedup;
