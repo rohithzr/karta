@@ -37,7 +37,7 @@ mod tests {
         let ctx = ClockContext::at(two_days_ahead);
 
         let note = karta
-            .add_note_with_metadata("future-dated probe", "s0", Some(0), Some(ctx.reference_time()))
+            .add_note_with_clock("future-dated probe", Some("s0"), Some(0), ctx)
             .await
             .unwrap();
 

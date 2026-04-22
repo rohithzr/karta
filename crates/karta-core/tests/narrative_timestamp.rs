@@ -46,11 +46,11 @@ mod tests {
         for (i, date) in dates.iter().enumerate() {
             let ts: chrono::DateTime<chrono::Utc> = format!("{}T00:00:00Z", date).parse().unwrap();
             karta
-                .add_note_with_metadata(
+                .add_note_with_clock(
                     &format!("project budget update entry {}", i),
-                    "narr-session",
+                    Some("narr-session"),
                     Some(i as u32),
-                    Some(ts),
+                    ClockContext::at(ts),
                 )
                 .await
                 .unwrap();

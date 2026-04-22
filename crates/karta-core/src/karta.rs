@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
-
+use crate::clock::ClockContext;
 use crate::config::KartaConfig;
 use crate::dream::{DreamEngine, DreamRun};
 use crate::error::{KartaError, Result};
@@ -425,47 +424,55 @@ impl Karta {
 
     // --- Write ---
 
+    /// Live default — sugar over `add_note_with_clock(content, None, None,
+    /// ClockContext::now())`. Intended for smoke tests, docs examples, and
+    /// quick scripts. Production callers should prefer `add_note_with_clock`.
     pub async fn add_note(&self, content: &str) -> Result<MemoryNote> {
-        self.write_engine.add_note(content).await
+        self.add_note_with_clock(content, None, None, ClockContext::now()).await
     }
 
-    pub async fn add_note_with_session(
+    /// Canonical ingest with full clock + session control. session_id is
+    /// optional because not every note belongs to a session (a one-shot
+    /// `add_note(content)` doesn't have one). turn_index is optional for
+    /// non-conversational ingest paths.
+    pub async fn add_note_with_clock(
         &self,
         content: &str,
-        session_id: &str,
-    ) -> Result<MemoryNote> {
-        self.write_engine
-            .add_note_with_clock(content, Some(session_id), None, crate::clock::ClockContext::now())
-            .await
-    }
-
-    /// Add a note with session context and optional temporal metadata.
-    /// `turn_index`: position of this message within its conversation (0-indexed).
-    /// `source_timestamp`: original timestamp from source data (distinct from ingestion time).
-    pub async fn add_note_with_metadata(
-        &self,
-        content: &str,
-        session_id: &str,
+        session_id: Option<&str>,
         turn_index: Option<u32>,
-        source_timestamp: Option<DateTime<Utc>>,
+        ctx: ClockContext,
     ) -> Result<MemoryNote> {
-        let ctx = match source_timestamp {
-            Some(ts) => crate::clock::ClockContext::at(ts),
-            None => crate::clock::ClockContext::now(),
-        };
         self.write_engine
-            .add_note_with_clock(content, Some(session_id), turn_index, ctx)
+            .add_note_with_clock(content, session_id, turn_index, ctx)
             .await
     }
 
     // --- Read ---
 
     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
-        self.read_engine.search(query, top_k).await
+        self.search_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    pub async fn search_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<Vec<SearchResult>> {
+        self.read_engine.search_with_clock(query, top_k, ctx).await
     }
 
     pub async fn ask(&self, query: &str, top_k: usize) -> Result<crate::note::AskResult> {
-        self.read_engine.ask(query, top_k).await
+        self.ask_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    pub async fn ask_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<crate::note::AskResult> {
+        self.read_engine.ask_with_clock(query, top_k, ctx).await
     }
 
     /// Retrieve-only entry point: runs the full Karta retrieval pipeline
@@ -483,7 +490,16 @@ impl Karta {
         query: &str,
         top_k: usize,
     ) -> Result<crate::note::FetchedMemories> {
-        self.read_engine.fetch_memories(query, top_k).await
+        self.fetch_memories_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    pub async fn fetch_memories_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<crate::note::FetchedMemories> {
+        self.read_engine.fetch_memories_with_clock(query, top_k, ctx).await
     }
 
     // --- Dream ---
@@ -493,13 +509,22 @@ impl Karta {
         scope_type: &str,
         scope_id: &str,
     ) -> Result<DreamRun> {
+        self.run_dreaming_with_clock(scope_type, scope_id, ClockContext::now()).await
+    }
+
+    pub async fn run_dreaming_with_clock(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        ctx: ClockContext,
+    ) -> Result<DreamRun> {
         let engine = DreamEngine::new(
             Arc::clone(&self.vector_store),
             Arc::clone(&self.graph_store),
             Arc::clone(&self.llm),
             self.config.dream.clone(),
         );
-        engine.run(scope_type, scope_id).await
+        engine.run_with_clock(scope_type, scope_id, ctx).await
     }
 
     // --- Inspection ---

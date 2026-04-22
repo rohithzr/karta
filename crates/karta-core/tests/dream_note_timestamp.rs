@@ -53,7 +53,7 @@ mod tests {
         for (date, body) in dates.iter().zip(bodies.iter()) {
             let ts: chrono::DateTime<chrono::Utc> = format!("{}T00:00:00Z", date).parse().unwrap();
             karta
-                .add_note_with_metadata(body, "s0", Some(0), Some(ts))
+                .add_note_with_clock(body, Some("s0"), Some(0), ClockContext::at(ts))
                 .await
                 .unwrap();
         }
