@@ -6,6 +6,7 @@ use tracing::{debug, info};
 
 pub mod temporal;
 pub mod resolve;
+pub mod resolve_llm;
 
 use crate::clock::ClockContext;
 use crate::config::ReadConfig;
@@ -377,6 +378,38 @@ impl ReadEngine {
         (1.0 - w) * similarity + w * recency
     }
 
+    /// Fetch the last `n` user-turn notes from a session for tier 2
+    /// temporal-resolver context. Returns empty when session context is
+    /// unavailable (the common case on `search_wide` today) or on any
+    /// store error — the tier 2 resolver tolerates a missing recent-turn
+    /// list and anchors on `reference_time` instead.
+    ///
+    /// Plumbing a real session_id end-to-end is a follow-up; today's read
+    /// path doesn't thread one, so callers pass `None` and get an empty
+    /// vec.
+    async fn recent_user_turns_in_session(
+        &self,
+        session_id: Option<&str>,
+        n: usize,
+    ) -> Option<Vec<String>> {
+        let sid = session_id?;
+        let eps = self.graph_store.get_episodes_for_session(sid).await.ok()?;
+        let last_ep = eps.last()?;
+        let note_ids = self
+            .graph_store
+            .get_notes_for_episode(&last_ep.id)
+            .await
+            .ok()?;
+        let mut out = Vec::new();
+        for id in note_ids.iter().rev().take(n) {
+            if let Ok(Some(note)) = self.vector_store.get(id).await {
+                out.push(note.content);
+            }
+        }
+        out.reverse();
+        Some(out)
+    }
+
     /// Drill into an episode: fetch constituent notes, filter active, sort chronologically.
     async fn episode_drilldown(&self, episode_id: &str) -> Result<Vec<MemoryNote>> {
         let note_ids = self.graph_store.get_notes_for_episode(episode_id).await?;
@@ -551,15 +584,34 @@ impl ReadEngine {
         // Temporal gating: if the query carries a lexical temporal indicator
         // AND tier 1 (Rust regex) resolves it to a concrete interval, we
         // route fact retrieval through `find_similar_facts_in_interval` so
-        // out-of-window facts are filtered at the SQL layer. Otherwise we
-        // fall through to the unrestricted fact retrieval.
-        //
-        // TODO(step1.5 Task 10): tier 2 LLM fallback when the query is
-        // temporal but tier 1 returns None.
+        // out-of-window facts are filtered at the SQL layer. If tier 1 punts
+        // (ambiguous phrase like "last spring"), we fall back to tier 2
+        // (LLM resolver). Both resolvers' outputs pass through
+        // `validate_resolver_output`; schema violations degrade to
+        // unrestricted fact retrieval.
         let fact_k = fetch_k / 2;
         let temporal_interval = if has_temporal_indicator(query) {
-            resolve::resolve_temporal_phrase(query, ctx.reference_time())
-                .map(|(interval, _conf)| interval)
+            let ref_time = ctx.reference_time();
+            match resolve::resolve_temporal_phrase(query, ref_time) {
+                Some((interval, _conf)) => Some(interval),
+                None => {
+                    // Tier 2 fallback. Session context is not plumbed into
+                    // search_wide yet; pass empty recent_turns — the
+                    // resolver still handles self-anchored phrases like
+                    // "last spring" via reference_time alone.
+                    let recent = self
+                        .recent_user_turns_in_session(None, 3)
+                        .await
+                        .unwrap_or_default();
+                    let llm_resolver =
+                        resolve_llm::LlmResolver::new(Arc::clone(&self.llm));
+                    let ctx_r = resolve_llm::ResolverContext { recent_turns: recent };
+                    llm_resolver
+                        .resolve(query, ref_time, &ctx_r)
+                        .await
+                        .map(|(iv, _)| iv)
+                }
+            }
         } else {
             None
         };

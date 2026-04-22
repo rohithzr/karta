@@ -436,7 +436,26 @@ impl LlmProvider for MockLlmProvider {
         // For dream prompts (no system message, just user prompt)
         let full_prompt = if system_msg.is_empty() { user_msg } else { "" };
 
-        let content = if system_msg.contains("memory indexing system") {
+        let content = if system_msg.contains("Resolve the user's temporal query") {
+            // Tier 2 temporal resolver. Deterministic mock: if the query
+            // mentions "last spring" return a wide range at low
+            // confidence; else return null bounds at confidence 0.0 so
+            // the validator treats it as "no temporal content".
+            let response = if user_msg.contains("last spring") {
+                serde_json::json!({
+                    "occurred_start": "2024-03-01T00:00:00Z",
+                    "occurred_end":   "2024-06-01T00:00:00Z",
+                    "occurred_confidence": 0.5
+                })
+            } else {
+                serde_json::json!({
+                    "occurred_start": null,
+                    "occurred_end": null,
+                    "occurred_confidence": 0.0
+                })
+            };
+            response.to_string()
+        } else if system_msg.contains("memory indexing system") {
             self.handle_attributes(user_msg)
         } else if system_msg.contains("should be linked") {
             self.handle_linking(user_msg)

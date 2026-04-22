@@ -1,5 +1,5 @@
 mod traits;
-pub use traits::{ChatMessage, ChatResponse, GenConfig, LlmProvider, Role};
+pub use traits::{ChatMessage, ChatResponse, GenConfig, JsonSchema, LlmProvider, Role};
 
 #[cfg(feature = "openai")]
 mod openai;
