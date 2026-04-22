@@ -206,6 +206,77 @@ fn classify_query_keywords(query: &str) -> QueryMode {
     QueryMode::Standard
 }
 
+/// Lightweight regex/keyword pre-filter that flags queries containing temporal
+/// indicators (relative phrases, weekday/month names, year tokens, ISO dates).
+///
+/// Used by the query classifier to set [`QueryClassification::temporal`] which
+/// in turn enables interval-overlap SQL filtering at retrieval time. This is
+/// purely lexical — semantic temporal intent is captured separately by
+/// [`QueryMode::Temporal`] via embedding similarity.
+pub(crate) fn has_temporal_indicator(query: &str) -> bool {
+    let q = query.to_lowercase();
+
+    let keywords = [
+        "when", "last ", "next ", "yesterday", "today", "tomorrow",
+        "before", "after", "during", "recently", "this week",
+        "this month", "this year", "this quarter",
+    ];
+    if keywords.iter().any(|k| q.contains(k)) {
+        return true;
+    }
+
+    let months = [
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+    ];
+    if months.iter().any(|m| q.contains(m)) {
+        return true;
+    }
+
+    let days = [
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    ];
+    if days.iter().any(|d| q.contains(d)) {
+        return true;
+    }
+
+    // 4-digit year (1900–2099) — also catches ISO dates like 2024-03-15.
+    static YEAR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = YEAR_RE.get_or_init(|| regex::Regex::new(r"\b(19|20)\d{2}\b").unwrap());
+    re.is_match(&q)
+}
+
+/// Public, integration-test-visible wrapper around [`has_temporal_indicator`].
+///
+/// Crate-internal callers should prefer the `pub(crate)` helper; this wrapper
+/// exists so tests under `crates/karta-core/tests/` (which see only `pub` API)
+/// can verify the temporal pre-filter.
+pub fn query_is_temporal(q: &str) -> bool {
+    has_temporal_indicator(q)
+}
+
+/// Output of the query classifier: the mode bucket plus auxiliary flags that
+/// downstream retrieval uses to gate behavior (e.g. interval-overlap SQL).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueryClassification {
+    pub mode: QueryMode,
+    /// True when the query contains lexical temporal indicators (weekday/month
+    /// names, year/ISO dates, "yesterday/last week/before/after/...").
+    /// Set independently of `mode` — a query can be `QueryMode::Standard` and
+    /// still be temporal (e.g. "did I deploy on March 15").
+    pub temporal: bool,
+}
+
+/// Keyword-only classifier that returns the full [`QueryClassification`]
+/// (mode + `temporal` flag). Embedding-based callers compose this with the
+/// embedding-derived mode separately; see `ReadEngine::search_wide`.
+pub fn classify_query(query: &str) -> QueryClassification {
+    QueryClassification {
+        mode: classify_query_keywords(query),
+        temporal: has_temporal_indicator(query),
+    }
+}
+
 /// Handles the read path: search, graph traversal, reranking, synthesis.
 pub struct ReadEngine {
     vector_store: Arc<dyn VectorStore>,
