@@ -46,6 +46,8 @@ struct BeamMessage {
     role: String,
     content: String,
     time_anchor: String,
+    #[serde(default)]
+    question_type: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -484,6 +486,13 @@ async fn eval_conversation(
                 continue;
             }
 
+            // HARNESS-LEVEL SKIP (F7-T9b): user echoes of AI suggestions carry
+            // no originating claims. Skip before calling add_note_with_clock so
+            // no attrs LLM call fires.
+            if msg.question_type.as_deref() == Some("answer_ai_question") {
+                continue;
+            }
+
             // Derive session boundaries from time_anchor changes
             if !msg.time_anchor.is_empty() && msg.time_anchor != last_anchor {
                 current_session += 1;
@@ -861,10 +870,10 @@ async fn beam_100k_full() {
             // Clone data into owned types for 'static lifetime
             let conv_id = conv.id.clone();
             let conv_category = conv.category.clone();
-            let msgs: Vec<(String, String, String)> = conv
+            let msgs: Vec<(String, String, String, Option<String>)> = conv
                 .user_messages
                 .iter()
-                .map(|m| (m.role.clone(), m.content.clone(), m.time_anchor.clone()))
+                .map(|m| (m.role.clone(), m.content.clone(), m.time_anchor.clone(), m.question_type.clone()))
                 .collect();
             let questions: Vec<(String, String, String, serde_json::Value)> = conv
                 .questions
@@ -883,10 +892,11 @@ async fn beam_100k_full() {
                 // Reconstruct the conv reference types
                 let owned_msgs: Vec<BeamMessage> = msgs
                     .iter()
-                    .map(|(r, c, t)| BeamMessage {
+                    .map(|(r, c, t, q)| BeamMessage {
                         role: r.clone(),
                         content: c.clone(),
                         time_anchor: t.clone(),
+                        question_type: q.clone(),
                     })
                     .collect();
                 let owned_qs: Vec<BeamQuestion> = questions

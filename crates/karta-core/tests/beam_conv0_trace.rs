@@ -231,11 +231,18 @@ async fn trace_conv0() {
     // on user turns specifically. Assistant turns are present in the JSON
     // post-F8 but ingestion semantics for them are still TBD (Q9).
     let session_prefix = format!("trace-conv{}", conv.id);
+    // HARNESS-LEVEL SKIP (F7-T9b): user echoes of AI suggestions carry no
+    // originating claims. Skip before feeding the ingest loop so no attrs
+    // LLM call fires for these turns.
     let user_turns: Vec<(usize, &BeamSession, &BeamTurn)> = conv
         .sessions
         .iter()
         .flat_map(|s| s.turns.iter().map(move |t| (s, t)))
-        .filter(|(_, t)| t.role == "user" && !t.content.trim().is_empty())
+        .filter(|(_, t)| {
+            t.role == "user"
+                && !t.content.trim().is_empty()
+                && t.question_type.as_deref() != Some("answer_ai_question")
+        })
         .take(turns)
         .enumerate()
         .map(|(i, (s, t))| (i, s, t))
