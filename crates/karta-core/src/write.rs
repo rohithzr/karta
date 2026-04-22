@@ -323,6 +323,24 @@ impl WriteEngine {
                             i as u32,
                         );
 
+                        // Grounding gate (FIRST): every fact must cite real source spans.
+                        // Runs before admission so telemetry attributes failures to the
+                        // actual filter that fired, and so we don't pay admission's
+                        // LLM-judgment cost on facts that are mechanically invalid.
+                        if let Err(e) = crate::extract::grounding::validate_supporting_spans(
+                            &extraction.supporting_spans,
+                            &note.content,
+                        ) {
+                            tracing::debug!(
+                                note_id = %note.id,
+                                fact_ordinal = i,
+                                spans = ?extraction.supporting_spans,
+                                error = %e,
+                                "dropping fact: grounding failed",
+                            );
+                            continue;
+                        }
+
                         // Admission gate (defense-in-depth — the pre-filter in Task 9 catches the
                         // bulk of ephemeral facts before they reach embed). This per-fact backstop
                         // catches anything that snuck through the JSON-fallback parse path.
