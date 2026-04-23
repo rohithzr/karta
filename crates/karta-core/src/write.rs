@@ -391,6 +391,50 @@ impl WriteEngine {
                             continue;
                         }
 
+                        // Date-shaped facets MUST populate value_date. Real LLMs
+                        // (esp. smaller open models) bias to null under structured
+                        // output even when the prompt says otherwise — the validator
+                        // is the only thing that holds.
+                        match crate::extract::temporal_slots::validate_value_date_for_facet(
+                            extraction.facet,
+                            extraction.value_date,
+                        ) {
+                            crate::extract::temporal_slots::ValueDateOutcome::Keep => {}
+                            crate::extract::temporal_slots::ValueDateOutcome::StripFact => {
+                                tracing::debug!(
+                                    note_id = %note.id,
+                                    fact_ordinal = i,
+                                    facet = ?extraction.facet,
+                                    "dropping fact: date-shaped facet missing value_date",
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Strip occurred_* if no supporting_span carries a temporal
+                        // marker. Mirrors the temporal_evidence cite-and-validate
+                        // pattern from F7-v3.
+                        let mut occ_start = extraction.occurred_start;
+                        let mut occ_end = extraction.occurred_end;
+                        let mut occ_conf = extraction.occurred_confidence;
+                        match crate::extract::temporal_slots::validate_occurred_grounding(
+                            occ_start,
+                            occ_conf.as_f32(),
+                            &extraction.supporting_spans,
+                        ) {
+                            crate::extract::temporal_slots::OccurredOutcome::Keep => {}
+                            crate::extract::temporal_slots::OccurredOutcome::StripBounds => {
+                                tracing::debug!(
+                                    note_id = %note.id,
+                                    fact_ordinal = i,
+                                    "stripping occurred_*: no temporal marker in supporting_spans",
+                                );
+                                occ_start = None;
+                                occ_end = None;
+                                occ_conf = crate::read::temporal::ConfidenceBand::None;
+                            }
+                        }
+
                         fact.memory_kind = extraction.memory_kind;
                         fact.facet = extraction.facet;
                         fact.entity_type = extraction.entity_type;
@@ -401,9 +445,9 @@ impl WriteEngine {
                         fact.embedding = embedding;
                         fact.created_at = note.created_at;
                         fact.source_timestamp = note.source_timestamp;
-                        fact.occurred_start = extraction.occurred_start;
-                        fact.occurred_end = extraction.occurred_end;
-                        fact.occurred_confidence = extraction.occurred_confidence;
+                        fact.occurred_start = occ_start;
+                        fact.occurred_end = occ_end;
+                        fact.occurred_confidence = occ_conf;
 
                         // Validate before writing. Reject if invariants broken
                         // (unpaired bounds, end<=start, or confidence-bounds

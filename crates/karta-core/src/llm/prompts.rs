@@ -39,6 +39,25 @@ Returning an empty `atomic_facts: []` is a valid and often correct answer.
   Good: { entity_text: "budget tracker", facet: "deadline",
           value_date: "2024-03-15T00:00:00Z", memory_kind: "future_commitment" }
 
+WRAPPER-STRIP RULE — "I want help with X" is two things: the request
+(ephemeral, drop it) AND any concrete claim embedded in X (durable, keep).
+Strip the request framing, then ask: does the remainder name a typed entity
++ facet + value? If yes, emit the embedded fact.
+
+  Source: "I want help configuring Chart.js 4.3.0 for tooltips and 60fps animation."
+  Drop:   the help-request itself.
+  Keep:   { entity_type: project, facet: tech_stack,
+            value_text: "Chart.js 4.3.0", memory_kind: durable_fact }
+
+PAST EVENTS WITH CONCRETE DATES are durable facts — emit them with
+`memory_kind=durable_fact` and `facet=event`. Do NOT classify them as
+ephemeral just because they describe completed work.
+
+  Source: "Sprint 1 ended on March 29."
+  Keep:   { entity_text: "Sprint 1", facet: event, memory_kind: durable_fact,
+            occurred_start: "2024-03-29T00:00:00Z", occurred_confidence: 0.8,
+            supporting_spans: ["Sprint 1 ended on March 29", "March 29"] }
+
 ============================================================
 SECTION 2 — ATOMIZATION
 ============================================================
@@ -67,6 +86,17 @@ will reject your fact if any span is not a real substring of the message.
 
 Do not summarize, do not paraphrase, copy substrings. Each span ≥4 characters.
 
+TEMPORAL GROUNDING — if the fact has any `occurred_*` populated, ONE of
+your supporting_spans MUST contain the literal temporal phrase
+("yesterday", "last week", "March 29", "2024-03-15"). The validator
+strips occurred_* otherwise — the bounds become null and the fact loses
+its temporal anchor.
+
+  Source: "Yesterday I closed the auth ticket."
+  Fact:   { facet: event, occurred_start: <ref-1d>, occurred_confidence: 0.7,
+            supporting_spans: ["Yesterday I closed the auth ticket", "auth ticket"] }
+                                ^^^^^^^^^ MUST appear in some span
+
 ============================================================
 SECTION 4 — NORMALIZATION (entity / facet / value slots)
 ============================================================
@@ -91,30 +121,60 @@ The validator REJECTS facts where BOTH `entity_type = unknown` AND
 carries no information.
 
 ============================================================
-SECTION 5 — TEMPORAL (occurred_*) — ONLY when the fact is about an event
+SECTION 5 — TEMPORAL SLOTS
 ============================================================
 
-Most facts are not events. Default:
-  occurred_start: null
-  occurred_end:   null
-  occurred_confidence: 0.0
+Two distinct slot families. Both have STRUCTURAL validators —
+ungrounded or missing values get stripped, so populating them
+correctly is the only way to surface temporal info downstream.
 
-`occurred_*` describes WHEN the fact's event happened (or will happen).
-Distinct from `value_date`, which IS the value (a deadline date).
+---- A) value_date — when the FACT IS A DATE ----
 
-  Deadline      — value_date populated, occurred_* null
-  Past event    — occurred_start populated, value_date null
-  Configuration — both null
+REQUIRED whenever facet ∈ { deadline, target_date }. The validator
+STRIPS the fact entirely if facet is date-shaped and value_date is null.
 
-When you DO emit occurred bounds, follow the band rules:
-  1.0 — explicit ISO date in the fact text ("2024-03-15")
-  0.8 — natural-language absolute date ("March 15", "in March 2024")
-  0.7 — relative reference ("yesterday", "last week") — resolve against reference_time
+Extract value_date from the source message's date phrase. If the
+year is implicit ("by April 19" with no year), use the year from
+reference_time.
+
+  "deadline of 2024-04-15"          → facet=deadline,    value_date=2024-04-15
+  "deadline of March 15, 2024"      → facet=deadline,    value_date=2024-03-15
+  "Sprint 2 ... by April 19"        → facet=target_date, value_date=<ref-year>-04-19
+  "targeting March 15 for v1"       → facet=target_date, value_date=2024-03-15
+
+If you classify a fact as facet=deadline / target_date but cannot
+extract a concrete date, you should not be using that facet — pick
+a different facet (event, constraint, preference) instead.
+
+---- B) occurred_* — when the FACT REFERENCES PAST/FUTURE EVENT TIME ----
+
+Default for non-event facts: all three null + occurred_confidence=0.0.
+
+REQUIRED grounding: at least one supporting_span MUST contain the
+temporal phrase (literal date OR relative phrase like "yesterday",
+"last week", "ago"). The validator STRIPS occurred_* when no span
+carries a temporal marker — inferred bounds from sentence vibes get
+dropped.
+
+Band rules:
+  1.0 — explicit ISO date in the source span ("2024-03-15")
+  0.8 — NL absolute date in the source span ("March 15", "March 29")
+  0.7 — relative reference in the source span ("yesterday", "last week")
+        — resolve against reference_time
   0.5 — vague temporal word ("recently", "around March")
 
-The reference_time is in the user message preamble. Use it ONLY to resolve
-relative phrases inside the fact text. It is NOT a default timestamp for
-all facts.
+Examples:
+  "Sprint 1 ended on March 29"
+    → facet=event, occurred_start=2024-03-29, conf=0.8,
+      supporting_spans includes "March 29"
+
+  "yesterday I closed the auth ticket" (ref_time=2024-04-22)
+    → facet=event, occurred_start=2024-04-21, conf=0.7,
+      supporting_spans includes "yesterday"
+
+The reference_time in the user message preamble is for resolving
+relative phrases. It is NOT a default timestamp — do not stamp
+present-tense facts with `[ref_time-1d, ref_time)`.
 
 ============================================================
 ANTI-PATTERNS (real failure modes from production traces)
@@ -140,11 +200,25 @@ E) Generic entity + generic facet
    Either type the entity, type the facet, or skip the fact.
 
 F) Speech-act extraction
-   "I want help with X" is not a fact about X. Don't emit it.
+   The help-request wrapper is ephemeral and gets dropped. But X may itself
+   contain a durable claim — extract that, drop the wrapper. See the
+   WRAPPER-STRIP RULE in Section 1.
 
 G) Jargon leakage
    "Time anchor", "assistant", "memory" are conversation/benchmark jargon.
-   Translate to the underlying claim or drop the fact.
+   Translate to the underlying claim or drop the fact. The "[March-15-2024]"
+   prefix on a benchmark message is jargon — do not bleed it into per-fact
+   value_date or occurred_* unless the fact text itself contains the date.
+
+H) Date-shaped facet without value_date
+   facet=deadline / target_date with value_date=null is the v1-STEP2 failure
+   mode. The validator strips these facts entirely. Either extract the date
+   from the source phrase or pick a different facet.
+
+I) Inferred occurred_* without span grounding
+   occurred_confidence > 0 with no temporal phrase in supporting_spans is
+   the v1-STEP2 failure mode for past events. The validator strips bounds
+   that aren't cited. Quote the date / "yesterday" / "ago" phrase.
 
 ============================================================
 OTHER FIELDS (note-level, not per-fact)
