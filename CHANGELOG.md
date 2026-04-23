@@ -13,274 +13,76 @@ semantic versioning once we leave the experimental phase.
 - `docs/landscape.md` — research survey of the AI memory space
 - `docs/retrieval-plan.md` — open retrieval experiment backlog
 - `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `CHANGELOG.md`
+- `ClockContext` and `*_with_clock` variants on every public write/read
+  entry point (`add_note`, `run_dreaming`, `search`, `ask`,
+  `fetch_memories`). Replay data with a known anchor and live data flow
+  through the same code path. Legacy non-clock wrappers continue to work
+  by passing `ClockContext::now()`.
+- Real-LLM extraction regression test gated by `KARTA_REAL_LLM_TESTS=1`.
+  Runs an 8-entry dated-message fixture against the production LLM in
+  ~2 minutes and asserts the right `value_date` / `occurred_*` slots
+  are populated. Catches model-prompt drift before it leaks into a
+  full benchmark run.
 
 ### Changed
-- **BEAM 100K: 61.6%** (P1 retrieval fixes, 2026-04-14). Up from 53.0%
-  P0 baseline (+8.6pp). Biggest wins: temporal_reasoning (+18pp),
+- **BEAM 100K: 61.6%** (retrieval fixes, 2026-04-14). Up from 53.0%
+  baseline (+8.6pp). Biggest wins: temporal_reasoning (+18pp),
   preference_following (+8pp), contradiction_resolution (+7pp).
+- **BEAM 100K conv 0 retrieval-only: 71.2%** (extraction fixes,
+  2026-04-22). Up from 56.6% mid-rebuild. Per-ability wins:
+  event_ordering +46pp, multi_session_reasoning +33pp,
+  summarization +30pp, contradiction_resolution +26pp.
+- **Default storage backend is now SQLite + sqlite-vec only.** Lance
+  remains in the tree behind a feature flag for benchmark/comparison
+  purposes, but the production path uses SQLite for both graph and
+  vector storage. Embedded-first, single-binary deployment, no
+  external services to run.
+- **Atomic facts are now typed retrieval rows.** Each fact carries
+  closed-set `memory_kind` / `facet` / `entity_type` enums, typed
+  `entity_text` / `value_text` / `value_date` slots, and 1-3
+  `supporting_spans` (verbatim substrings of the source message).
+  Replaces the prior single-string-content shape.
+- **Temporal extraction is structurally enforced.** Date-shaped facets
+  (`deadline`, `target_date`) must populate `value_date` or the fact
+  is stripped. `occurred_*` bounds must be cited by a supporting span
+  containing a literal temporal phrase or the bounds get nulled.
+  Real LLMs (especially smaller open models) bias toward filling
+  required fields under structured output; the validator is the only
+  thing that holds.
+- **Cite-and-validate write path.** Pre-admission filter drops
+  ephemeral / speech-act / echo facts before embed. Per-fact gates
+  enforce grounding (every span ≥4 chars and a real substring of the
+  source), specificity (reject facts with both `entity_type=unknown`
+  and `facet=unknown`), and temporal grounding. Slot-level dedup
+  collapses facts sharing `(entity_text, facet, value)` and merges
+  their supporting spans.
+- **System prompt rewritten** around what the validator enforces:
+  admission first (which kinds become memory), then atomization,
+  grounding, normalization, temporal slots. Anti-patterns named after
+  real production failure modes (wrapper-strip rule for "I want help
+  configuring X", past events as durable facts, jargon leakage).
+- **Read-path temporal resolver.** Two-tier resolution for "what did
+  I close last week" style queries: tier 1 Rust regex, tier 2 LLM
+  fallback for vague phrases ("last spring") with last-3-user-turns
+  context. Validation failures fall through to vector-only retrieval
+  (no silent guessing).
 - Retrieval path: expand-then-rerank, removed synthesis-level
   insufficient-info gate that was killing temporal/computation queries
 - Dream engine: score candidates on source note timestamps instead of
   dream write time (accurate recency)
+- Dream output uses `max(input.source_timestamp)` rather than the
+  current clock, so dreams over old notes don't outrank actual-recent
+  facts.
 - README reframed to emphasize experimental research project status
 
 ### Fixed
 - Read path prompt handling for recency-sensitive queries
 - SQLite schema + trait adjustments for source timestamp propagation
-
-### Clock context for write/read paths (2026-04-22)
-
-Karta now takes an explicit reference time at every entry point instead
-of reading `Utc::now()` deep in the write/read paths. Replay data with a
-known anchor (BEAM, LongMem, LOCOMO) and live data both flow through the
-same path.
-
-- New `ClockContext { reference_time }` with `now()` and `at(t)` constructors
-- All public API surfaces gained `*_with_clock` variants:
-  `add_note_with_clock`, `run_dreaming_with_clock`, `search_with_clock`,
-  `ask_with_clock`, `fetch_memories_with_clock`. Legacy wrappers without
-  `_with_clock` keep working by passing `ClockContext::now()`.
-- `MemoryNote.source_timestamp` is non-optional and always set from the
-  caller's clock at write time. `session_id: Option<String>` added.
-- BEAM converter (`data/convert_beam.py`) rewritten to emit
-  `sessions[].turns[]` with a per-turn `effective_reference_time` so
-  the harness no longer guesses time anchors from sparse `time_anchor`
-  prefixes (3/5732 turns populated in the source).
-- Dream-output `source_timestamp = max(input.source_timestamp)` (NOT
-  `ctx.reference_time()`) — avoids the time-travel-confidence bug where
-  a fresh-clocked dream over old notes would outrank actual-recent facts.
-
-**Why:** Recency, foresight DOA, and "yesterday/last week" queries were
-silently using wall-clock time during BEAM replay, which placed every
-piece of replay content "now" relative to itself and broke ordering on
-event_ordering (35%) and knowledge_update (43%) categories. Reference
-time is now data, not ambient state.
-
-### Temporal interval bounds + read-path resolver (2026-04-22)
-
-Each atomic fact carries a half-open interval `[occurred_start, occurred_end)`
-and a discrete confidence band, so "what did I close last week" is a SQL
-range query against fact intervals instead of substring matching against
-date strings inside fact text.
-
-- `atomic_facts` schema gained `source_timestamp` (inherited from parent
-  note), `occurred_start`, `occurred_end`, `occurred_confidence`. Partial
-  composite index `idx_facts_occurred(occurred_start, occurred_end) WHERE
-  occurred_start IS NOT NULL` for cheap interval-overlap scans.
-- `ConfidenceBand` enum is a closed set: `{0.0, 0.5, 0.7, 0.8, 1.0}`
-  mapped to `{None, Vague, Relative, NLAbsolute, Explicit}`. Continuous
-  values are a schema violation and rejected.
-- 4 invariants enforced via `AtomicFact::validate_occurred()`: bound
-  pairing, end > start, closed-set confidence (type-level), confidence/
-  bounds null-pairing.
-- Prompt rewrite: `note_attributes_system` now requires per-fact
-  occurred_start/end/confidence, forbids extracting requests-for-help as
-  facts, and supplies the reference time in the user message preamble.
-- Read-path two-tier resolver: tier 1 Rust regex (ISO/NL absolute/
-  yesterday/last week/last month) → tier 2 LLM fallback for vague
-  phrases ("last spring") with last-3-user-turns context. Both pass
-  through `validate_resolver_output`. Validation failures fall through
-  to vector-only retrieval (no silent guessing).
-- Query classifier emits `temporal: bool`; when true and a resolver
-  returns an interval, fact retrieval uses
-  `find_similar_facts_in_interval` (the partial index path).
-  Null-bound facts are excluded from temporal queries by design.
-- BEAM harness skips `question_type='answer_ai_question'` turns at
-  ingest time (these are user echoes of AI suggestions with no
-  originating claims). Skip lives in the test harness, not Karta core.
-
-**Why:** Previously, "last week" matched on text similarity to fact
-content. A fact saying "yesterday at 14:30" on Monday and the same
-text on Friday were indistinguishable to the retrieval layer.
-Structured bounds + interval-overlap SQL replace the text-match
-hack with the right primitive.
-
-### Cite-and-validate temporal evidence (2026-04-22)
-
-The first version over-hedged: real-LLM traces returned
-`Vague (0.5)` with wide ranges on most facts. The prose-only fix
-made it worse: the LLM put `[ref_time-1d, ref_time)` bounds on
-every fact, treating present-tense verbs ("uses Flask") as
-"started yesterday."
-
-Root cause: structured output models bias hard toward producing
-non-null fields. Prose rules ("default to null") lose to that
-bias.
-
-Fix: required `temporal_evidence: string | null` field on each
-fact. The LLM must quote the literal temporal phrase from the
-fact's `content`. The write-path validator strips bounds
-(downgrades to null/null/0.0) if:
-  - `temporal_evidence` is null/empty, OR
-  - the quote does not appear verbatim in `fact.content`.
-
-This is grounded reasoning instead of inference. The LLM cannot
-write a quote that isn't in the text, so it cannot smuggle
-conversation-date intuitions into per-fact bounds.
-
-**Trace impact (10-turn BEAM conv 0):**
-- v1 (original):       0% null bounds (9/22 hallucinations)
-- v2 (prose-only fix): 0% null bounds (41/41 hallucinations)
-- v3 (grounding gate): 67% null bounds (29/43 correct nulls)
-
-The validator stripped 29 of 44 LLM-emitted bounds (66%) for
-ungrounded evidence quotes — including the LLM trying to use
-"reference_time: 2024-03-15..." (the prompt prefix itself) and
-"April 15" as evidence for unrelated facts.
-
-**Known follow-up:** the 15 facts that survived the gate include
-~6 borderline cases where the LLM included "March 15" in the
-synthesized fact text and the gate accepts it. Per-band precision
-needs the calibration fixture
-(`data/test/fixtures/confidence_calibration.json`, scaffolded but
-unlabeled — needs ≥100 hand-labeled entries before per-band precision runs).
-
-### Fact extraction redesign — typed slots + admission control (2026-04-22)
-
-An external review identified six structural failures upstream of
-temporal grounding. The LLM was producing prose paraphrases of input
-messages instead of typed, admission-controlled retrieval rows. This
-revision rebuilds the schema, prompt, and write path around the
-cite-and-validate pattern proven by the temporal-evidence gate above.
-
-**Schema changes** (atomic_facts table recreated, no migration):
-- New typed enum fields: `memory_kind`, `facet`, `entity_type`
-  (closed sets, snake_case serde rename, exhaustive variant guards in tests)
-- New typed value slots: `entity_text`, `value_text`, `value_date`
-- `supporting_spans: string[]` replaces single `temporal_evidence` field
-  (1-3 per fact, each ≥4 chars, each a verbatim substring of source)
-- Old `subject` field removed (subsumed by `entity_text` + `entity_type`)
-- New canonical reader `row_to_fact` — every SELECT site routes through
-  one function so future schema changes touch one place
-- Shadow-DDL collision in `SqliteGraphStore` removed (the old `subject`
-  index was clobbering schema on shared connections — silent data-shape
-  bug fixed in passing)
-
-**Validator gates** (in `WriteEngine::add_note_inner`, load-bearing order):
-1. **Pre-filter (admission)** — drops `ephemeral_request | speech_act |
-   echo` BEFORE dedup BEFORE embed. Saves embed cost and prevents
-   ephemerals from claiming a slot dedup would assign to a real fact.
-2. **Per-fact grounding** — every `supporting_span` ≥4 chars and a real
-   substring of `note.content`. Runs FIRST per fact (cheap mechanical
-   check, telemetry attribution honesty).
-3. **Per-fact admission backstop** — defense-in-depth for the
-   JSON-fallback parse path.
-4. **Per-fact specificity** — rejects facts where both `entity_type`
-   and `facet` are `unknown`.
-
-**Slot-level dedup** runs BETWEEN pre-filter and embed. Collapses facts
-sharing `(entity_text.lower(), facet, value_key)` to one row, MERGING
-`supporting_spans` from siblings (string-equality dedup). Preserves the
-evidence trail when the LLM emits two phrasings of the same claim.
-
-**Mock pair:**
-- `MockLlmProvider` — heuristic mock for trace harness convenience
-  (deadline keywords, tech-stack tokens, pure-request detection)
-- `ScriptedMockLlmProvider` — adversarial mock for validator tests
-  (script `(needle, response_json)` pairs; falls back to heuristic
-  for unscripted calls)
-
-**Prompt rewrite:** admission becomes Section 1, then atomization,
-grounding, normalization, temporal. Temporal is no longer "the one
-big rule" — admission is. Anti-patterns A-G name 7 production failure
-modes. Closer is "Properties of good output" (descriptive shape) rather
-than "final checklist" (imperative validation) — the validator does
-the mechanical checking, the prompt shapes intent.
-
-**Empirical impact (10-turn BEAM conv 0):**
-
-| Run | Facts | Null-bound | Typed (both axes) | Ephemeral persisted |
-|---|---|---|---|---|
-| v1 (original prompt) | 22 | 0% | n/a (no enum) | n/a |
-| v2 (prose-only fix) | 41 | 0% | n/a | n/a |
-| v3 (`temporal_evidence` gate) | 43 | 67% | n/a | n/a |
-| **typed slots + admission** | **17** | n/a (different model) | **100%** | **0** |
-
-The 17 surviving facts are correctly typed entities + facets:
-- entity_type: project (10), org (5), task (1), person (1) — real types
-- facet: tech_stack (13), target_date (2), ownership (1), preference (1)
-- entity_text values: "Craig", "budget tracker", "app", "project" — real
-  surface forms, not just generic "user"
-- 16 durable_fact + 1 future_commitment, zero ephemeral_request /
-  speech_act / echo
-
-Pure requests now produce zero facts (admission pre-filter fires before
-embed) — turn 1 of the trace ("I'm working on a project... can you
-help me create a schedule") emitted 0 facts as designed.
-
-**Test coverage:** 39 test binaries, ~131 tests in the temporal +
-extraction regression bundle. New extraction test files: 10 (`extraction_*`,
-`note_attributes_schema`, `mock_extraction_shape`, `extraction_failure_modes`).
-The adversarial regression test
-`ephemeral_collision_does_not_steal_durable_slot` uses the scriptable
-mock to construct a slot collision — verifies the load-bearing
-admission-before-dedup ordering doesn't regress.
-
-**Deferred to follow-up:**
-- Cross-note entity canonicalization ("project" vs
-  "the project" still distinct entity_text values today)
-- Negation/attribution slots (mock can't
-  drive these honestly, needs real LLM)
-- Per-band calibration fixture extension to admission decisions
-- Lance store backend mirror (currently feature-gated, returns
-  Unknown defaults from row_to_fact)
-- A few miscategorized facts in the trace (Bootstrap config tagged as
-  `target_date`, port 5000 as `target_date`) — prompt tuning territory,
-  not structural
-
-### Structural validators for date and event extraction (2026-04-22)
-
-The previous fact-extraction redesign moved typing and admission to
-the validator, but the date/event slots still relied on prose rules
-("default to null"). Real LLMs (especially smaller open models like
-Gemma) silently went the other way under structured output: deadline
-facts persisted with `value_date = null`, and `occurred_*` bounds were
-inferred from sentence vibes rather than the source text.
-
-Two new write-path validators:
-
-1. **value_date required for date-shaped facets.** If `facet ∈
-   {deadline, target_date}` and `value_date` is null, the entire fact
-   is stripped. Generalizes the cite-and-validate pattern from temporal
-   evidence to the date slot.
-2. **occurred_* must be span-grounded.** When a fact has any
-   `occurred_*` populated, at least one `supporting_span` MUST contain
-   a literal temporal phrase (yesterday/last week/ISO date/month-day).
-   Bounds without a cited span get stripped to null.
-
-Prompt SECTION 5 split into A) value_date for date-shaped facets, B)
-occurred_* for past/future events. New WRAPPER-STRIP RULE in Section 1
-with worked examples for "I want help configuring Chart.js" and
-"Sprint 1 ended on March 29" to stop the LLM from dropping whole turns
-as ephemeral when they wrap a durable claim.
-
-**Real-LLM regression test** (`extraction_real_llm_dates.rs`, gated by
-`KARTA_REAL_LLM_TESTS=1`) runs an 8-entry dated-message fixture against
-the production LLM in ~2 minutes. Closes the test gap that let
-temporal extraction silently regress until a 95-minute BEAM run
-exposed it.
-
-**Empirical impact (BEAM 100K conv 0, retrieval-only):** 56.6% →
-**71.2%** (+14.6pp), back inside the 71.7-77.4% three-model baseline.
-Per-ability wins: event_ordering +46pp, multi_session_reasoning +33pp,
-summarization +30pp, contradiction_resolution +26pp.
-`temporal_reasoning` failure mode shifted from "I can't determine"
-(no data) to wrong arithmetic over the right facts — extraction works;
-multi-fact synthesis is the next bottleneck.
-
-Real-LLM fixture currently passes 5/8 with Gemma 4:e4b — the 3
-remaining failures are at the extraction-breadth / span-citation layer
-(model-capacity limits, not prompt clarity). The structural validators
-ensure the surviving facts are correct.
-
-### Default storage backend: SQLite + sqlite-vec only
-
-The `Karta::with_defaults` constructor is now gated on `sqlite-vec`
-without `lance`. The Lance backend is still in the tree behind a
-feature flag for benchmark/comparison purposes, but the production
-path uses SQLite for both graph and vector storage. Justification:
-30,000× faster get for the embedded-first use case, zero read-blocking
-behavior, and a single dependency to vendor.
+- "Yesterday" / "last week" queries against replay data no longer
+  resolve to wall-clock time, which previously placed every replay
+  memory "now" relative to itself.
+- `MemoryNote.source_timestamp` is now non-optional and always set
+  from the caller's clock at write time.
 
 ## [0.1.0-experimental] — 2026-04-14
 
