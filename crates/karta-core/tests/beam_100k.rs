@@ -415,9 +415,11 @@ fn find_latest_data_dir(conv_id: &str) -> Option<String> {
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
             let created = meta.created().ok().or_else(|| meta.modified().ok())?;
-            // Verify the dir has actual data (lance table exists)
+            // Verify the dir has actual data — accept either backend
+            // (sqlite-vec default or the legacy Lance table).
+            let sqlite_path = e.path().join("karta.db");
             let lance_path = e.path().join("lance/notes.lance/data");
-            let has_data = lance_path.exists();
+            let has_data = sqlite_path.exists() || lance_path.exists();
             if has_data {
                 Some((e.path().to_string_lossy().to_string(), created))
             } else {
@@ -568,26 +570,29 @@ async fn eval_conversation(
             ingest_ms as f64 / 1000.0 / ingested.max(1) as f64,
             ingest_errors
         );
+    }
 
-        // --- Optional: run dreaming ---
-        // Skip with BEAM_SKIP_DREAM=1 to benchmark retrieval-only (no
-        // dream-generated inferences / episode narratives). Useful for
-        // isolating dream's contribution to the final score.
-        if env_bool("BEAM_SKIP_DREAM", false) {
-            println!("  Dreaming: SKIPPED (BEAM_SKIP_DREAM=1)");
-        } else {
-            let dream_start = Instant::now();
-            match karta.run_dreaming("beam100k", &conv.id).await {
-                Ok(run) => {
-                    println!(
-                        "  Dreaming: {} attempted, {} written ({:.1}s)",
-                        run.dreams_attempted,
-                        run.dreams_written,
-                        dream_start.elapsed().as_millis() as f64 / 1000.0
-                    );
-                }
-                Err(e) => eprintln!("  Dreaming failed: {}", e),
+    // --- Optional: run dreaming (runs regardless of skip_ingest) ---
+    // Skip with BEAM_SKIP_DREAM=1 to benchmark retrieval-only (no
+    // dream-generated inferences / episode narratives). Useful for
+    // isolating dream's contribution to the final score.
+    // When BEAM_SKIP_INGEST=1 is also set, this dreams over the notes
+    // already in the DB from a prior run — lets us A/B "same ingest,
+    // +dream" without paying ingest cost twice.
+    if env_bool("BEAM_SKIP_DREAM", false) {
+        println!("  Dreaming: SKIPPED (BEAM_SKIP_DREAM=1)");
+    } else {
+        let dream_start = Instant::now();
+        match karta.run_dreaming("beam100k", &conv.id).await {
+            Ok(run) => {
+                println!(
+                    "  Dreaming: {} attempted, {} written ({:.1}s)",
+                    run.dreams_attempted,
+                    run.dreams_written,
+                    dream_start.elapsed().as_millis() as f64 / 1000.0
+                );
             }
+            Err(e) => eprintln!("  Dreaming failed: {}", e),
         }
     }
 
