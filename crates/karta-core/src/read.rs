@@ -846,6 +846,7 @@ impl ReadEngine {
                 contradiction_injected: 0,
                 has_contradiction: false,
                 reranker_best_score: None,
+                evidence: None,
             });
         }
 
@@ -950,6 +951,7 @@ impl ReadEngine {
                 contradiction_injected: 0,
                 has_contradiction: false,
                 reranker_best_score: reranker_best,
+                evidence: None,
             });
         }
 
@@ -1162,6 +1164,7 @@ impl ReadEngine {
                         contradiction_injected: contradiction_count,
                         has_contradiction,
                         reranker_best_score: reranker_best,
+                        evidence: None,
                     });
                 }
                 response.content.clone()
@@ -1279,6 +1282,7 @@ impl ReadEngine {
                             contradiction_injected: 0,
                             has_contradiction: retry_has_contradiction,
                             reranker_best_score: reranker_best,
+                            evidence: None,
                         });
                     }
                 }
@@ -1294,6 +1298,7 @@ impl ReadEngine {
             contradiction_injected: contradiction_count,
             has_contradiction,
             reranker_best_score: reranker_best,
+            evidence: None,
         })
     }
 

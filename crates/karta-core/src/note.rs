@@ -137,6 +137,37 @@ pub struct AskResult {
     pub has_contradiction: bool,
     /// Best reranker relevance score (None if reranker disabled).
     pub reranker_best_score: Option<f32>,
+    /// Evidence packets explaining why each note was retrieved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<EvidencePacket>,
+}
+
+/// Evidence packet explaining why notes were retrieved for an answer.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EvidencePacket {
+    /// Per-channel retrieval traces (e.g., "ann", "facts", "profile").
+    pub channel_traces: Vec<ChannelTrace>,
+    /// IDs of fired procedural rules.
+    pub fired_rule_ids: Vec<String>,
+    /// IDs of unresolved contradictions affecting this answer.
+    pub contradiction_ids: Vec<String>,
+    /// Human-readable explanation of why these notes were retrieved.
+    pub why_retrieved: String,
+}
+
+/// Trace for a single retrieval channel.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelTrace {
+    pub channel: String,
+    /// Ranked hits for this channel, in retrieval order.
+    pub ranked: Vec<RankedHit>,
+    pub rrf_contribution: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RankedHit {
+    pub note_id: String,
+    pub score: f32,
 }
 
 /// A forward-looking statement extracted by the LLM during attribute generation.

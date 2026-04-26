@@ -23,6 +23,7 @@ system could find because they were never explicitly stored.
 - **Temporal awareness** — exponential decay scoring, foresight signals with validity windows
 - **Provenance tracking** — every note tagged as FACT or INFERRED with confidence scores
 - **Forgetting** — note lifecycle (Active → Deprecated → Superseded → Archived) with access-based decay
+- **Evidence packets** — `AskResult` exposes an optional `EvidencePacket` slot for per-channel rank traces, fired rule IDs, contradiction IDs, and human-readable "why retrieved" explanations; current read paths return `evidence: None` until ACTIVATE populates it
 - **Deterministic extractors** — `Extractor` trait with Markdown (headings, links, code fences), JSON (recursive paths), YAML (key-value), and Cargo.toml (metadata, dependency edges) extractors that run before LLM extraction
 
 ## Quick Start
