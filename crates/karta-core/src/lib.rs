@@ -1,5 +1,6 @@
 pub mod activate;
 pub mod config;
+pub mod contradiction;
 pub mod dream;
 pub mod error;
 pub mod extract;

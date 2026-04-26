@@ -18,6 +18,7 @@ system could find because they were never explicitly stored.
 
 - **Self-organizing note graph** — notes are enriched with LLM-generated context, semantically linked, and retroactively evolved when new information arrives
 - **Dream engine** — 5 types of background inference: deduction, induction, abduction, consolidation, contradiction detection
+- **First-class contradictions** — structured `Contradiction` objects with lifecycle (open → resolved/ignored), per-entity and per-scope queries, source-note protection from forgetting
 - **Structured output with reasoning** — forces chain-of-thought before answers, enabling reliable abstention and contradiction flagging
 - **Cross-encoder reranking** — Jina AI reranker for precise relevance scoring and intelligent abstention
 - **Temporal awareness** — exponential decay scoring, foresight signals with validity windows

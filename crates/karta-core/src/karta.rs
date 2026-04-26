@@ -3,6 +3,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::config::KartaConfig;
+use crate::contradiction::{Contradiction, ContradictionResolution, ContradictionStatus};
 use crate::dream::{DreamEngine, DreamRun};
 use crate::error::Result;
 use crate::forget::{ForgetEngine, ForgetPreview, ForgetRun};
@@ -311,6 +312,45 @@ impl Karta {
             pending_migrations: pending,
             warnings,
         })
+    }
+
+    // --- Contradictions ---
+
+    pub async fn upsert_contradiction(&self, contradiction: Contradiction) -> Result<()> {
+        self.graph_store.upsert_contradiction(&contradiction).await
+    }
+
+    pub async fn get_contradiction(&self, id: &str) -> Result<Option<Contradiction>> {
+        self.graph_store.get_contradiction(id).await
+    }
+
+    pub async fn list_contradictions(
+        &self,
+        scope_id: Option<&str>,
+        status: Option<ContradictionStatus>,
+    ) -> Result<Vec<Contradiction>> {
+        self.graph_store.list_contradictions(scope_id, status).await
+    }
+
+    pub async fn list_contradictions_for_entity(&self, entity: &str) -> Result<Vec<Contradiction>> {
+        self.graph_store
+            .list_contradictions_for_entity(entity)
+            .await
+    }
+
+    pub async fn resolve_contradiction(
+        &self,
+        id: &str,
+        resolution: ContradictionResolution,
+        resolved_by: Option<&str>,
+    ) -> Result<()> {
+        self.graph_store
+            .resolve_contradiction(id, resolution, resolved_by)
+            .await
+    }
+
+    pub async fn ignore_contradiction(&self, id: &str, reason: &str) -> Result<()> {
+        self.graph_store.ignore_contradiction(id, reason).await
     }
 
     // --- Rules ---

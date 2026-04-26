@@ -1260,6 +1260,186 @@ impl crate::store::GraphStore for SqliteGraphStore {
         migrate::load_schema_meta(&conn)
     }
 
+    // --- Contradictions ---
+
+    async fn upsert_contradiction(
+        &self,
+        contradiction: &crate::contradiction::Contradiction,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let source_ids_json = serde_json::to_string(&contradiction.source_note_ids)
+            .map_err(KartaError::Serialization)?;
+        let resolution_json = contradiction
+            .resolution
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(KartaError::Serialization)?;
+        let status_str = match contradiction.status {
+            crate::contradiction::ContradictionStatus::Open => "open",
+            crate::contradiction::ContradictionStatus::Resolved => "resolved",
+            crate::contradiction::ContradictionStatus::Ignored => "ignored",
+        };
+        conn.execute(
+            "INSERT INTO contradictions (id, entity, scope_id, source_note_ids_json, description, dream_run_id, status, resolution_json, resolved_at, resolved_by, ignore_reason, ignored_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(id) DO UPDATE SET
+                 entity=?2, scope_id=?3, source_note_ids_json=?4, description=?5,
+                 dream_run_id=?6, status=?7, resolution_json=?8, resolved_at=?9,
+                 resolved_by=?10, ignore_reason=?11, ignored_at=?12",
+            rusqlite::params![
+                contradiction.id,
+                contradiction.entity,
+                contradiction.scope_id,
+                source_ids_json,
+                contradiction.description,
+                contradiction.dream_run_id,
+                status_str,
+                resolution_json,
+                contradiction.resolved_at.map(|t| t.to_rfc3339()),
+                contradiction.resolved_by,
+                contradiction.ignore_reason,
+                contradiction.ignored_at.map(|t| t.to_rfc3339()),
+                contradiction.created_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_contradiction(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::contradiction::Contradiction>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, entity, scope_id, source_note_ids_json, description, dream_run_id, status, resolution_json, resolved_at, resolved_by, ignore_reason, ignored_at, created_at FROM contradictions WHERE id = ?1",
+            )
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+
+        match stmt.query_row(rusqlite::params![id], parse_contradiction_row) {
+            Ok(c) => Ok(Some(c)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(KartaError::GraphStore(e.to_string())),
+        }
+    }
+
+    async fn list_contradictions(
+        &self,
+        scope_id: Option<&str>,
+        status: Option<crate::contradiction::ContradictionStatus>,
+    ) -> Result<Vec<crate::contradiction::Contradiction>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let mut sql = "SELECT id, entity, scope_id, source_note_ids_json, description, dream_run_id, status, resolution_json, resolved_at, resolved_by, ignore_reason, ignored_at, created_at FROM contradictions WHERE 1=1".to_string();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(scope) = scope_id {
+            sql.push_str(" AND scope_id = ?");
+            params.push(Box::new(scope.to_string()));
+        }
+        if let Some(s) = status {
+            let status_str = match s {
+                crate::contradiction::ContradictionStatus::Open => "open",
+                crate::contradiction::ContradictionStatus::Resolved => "resolved",
+                crate::contradiction::ContradictionStatus::Ignored => "ignored",
+            };
+            sql.push_str(" AND status = ?");
+            params.push(Box::new(status_str.to_string()));
+        }
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params.iter()),
+                parse_contradiction_row,
+            )
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))
+    }
+
+    async fn list_contradictions_for_entity(
+        &self,
+        entity: &str,
+    ) -> Result<Vec<crate::contradiction::Contradiction>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, entity, scope_id, source_note_ids_json, description, dream_run_id, status, resolution_json, resolved_at, resolved_by, ignore_reason, ignored_at, created_at FROM contradictions WHERE entity = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![entity], parse_contradiction_row)
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))
+    }
+
+    async fn resolve_contradiction(
+        &self,
+        id: &str,
+        resolution: crate::contradiction::ContradictionResolution,
+        resolved_by: Option<&str>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let resolution_json =
+            serde_json::to_string(&resolution).map_err(KartaError::Serialization)?;
+        let now = Utc::now().to_rfc3339();
+        let rows = conn
+            .execute(
+                "UPDATE contradictions SET status = 'resolved', resolution_json = ?2, resolved_at = ?3, resolved_by = ?4, ignored_at = NULL WHERE id = ?1 AND status = 'open'",
+                rusqlite::params![id, resolution_json, now, resolved_by],
+            )
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        if rows == 0 {
+            return Err(KartaError::GraphStore(format!(
+                "Contradiction {id} not found or already resolved/ignored"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn ignore_contradiction(&self, id: &str, reason: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let rows = conn
+            .execute(
+                "UPDATE contradictions SET status = 'ignored', ignore_reason = ?2, ignored_at = ?3, resolved_at = NULL, resolved_by = NULL WHERE id = ?1 AND status = 'open'",
+                rusqlite::params![id, reason, now],
+            )
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        if rows == 0 {
+            return Err(KartaError::GraphStore(format!(
+                "Contradiction {id} not found or already resolved/ignored"
+            )));
+        }
+        Ok(())
+    }
+
     // --- Procedural Rules ---
 
     async fn upsert_procedural_rule(&self, rule: &crate::rules::ProceduralRule) -> Result<()> {
@@ -1361,6 +1541,77 @@ impl crate::store::GraphStore for SqliteGraphStore {
         .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         Ok(())
     }
+}
+
+fn parse_contradiction_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::contradiction::Contradiction> {
+    let status_str: String = row.get(6)?;
+    let status = match status_str.as_str() {
+        "resolved" => crate::contradiction::ContradictionStatus::Resolved,
+        "ignored" => crate::contradiction::ContradictionStatus::Ignored,
+        _ => crate::contradiction::ContradictionStatus::Open,
+    };
+
+    let source_note_ids: Vec<String> = {
+        let json: String = row.get(3)?;
+        serde_json::from_str(&json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+        })?
+    };
+
+    let resolution: Option<crate::contradiction::ContradictionResolution> = {
+        let json: Option<String> = row.get(7)?;
+        match json {
+            Some(j) => Some(serde_json::from_str(&j).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?),
+            None => None,
+        }
+    };
+
+    let resolved_at: Option<DateTime<Utc>> = {
+        let s: Option<String> = row.get(8)?;
+        s.and_then(|t| {
+            DateTime::parse_from_rfc3339(&t)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        })
+    };
+
+    let ignored_at: Option<DateTime<Utc>> = {
+        let s: Option<String> = row.get(11)?;
+        s.and_then(|t| {
+            DateTime::parse_from_rfc3339(&t)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        })
+    };
+
+    let created_at_str: String = row.get(12)?;
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+        .unwrap_or_default()
+        .with_timezone(&Utc);
+
+    Ok(crate::contradiction::Contradiction {
+        id: row.get(0)?,
+        entity: row.get(1)?,
+        scope_id: row.get(2)?,
+        source_note_ids,
+        description: row.get(4)?,
+        dream_run_id: row.get(5)?,
+        status,
+        resolution,
+        resolved_at,
+        resolved_by: row.get(9)?,
+        ignore_reason: row.get(10)?,
+        ignored_at,
+        created_at,
+    })
 }
 
 #[cfg(test)]
