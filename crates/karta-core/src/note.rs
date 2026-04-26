@@ -41,7 +41,23 @@ pub struct MemoryNote {
     /// Distinct from `created_at` which is the ingestion time.
     #[serde(default)]
     pub source_timestamp: Option<DateTime<Utc>>,
+    /// Total number of times this note has been returned by retrieval.
+    /// Drives ACT-R base-level activation fallback when `access_history` is empty.
+    #[serde(default)]
+    pub access_count: u32,
+    /// Ring buffer of the most recent access timestamps (cap = ACCESS_HISTORY_CAP).
+    /// Feeds the ACT-R BLL sum `B = ln(Σ t_k^{-d})`.
+    #[serde(default)]
+    pub access_history: Vec<DateTime<Utc>>,
+    /// Session this note was written in — required for PAS sequential linkage.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
+
+/// Maximum stamps retained in `MemoryNote::access_history`. Keeps per-note
+/// storage at ~160 B while giving ACT-R enough samples for bursty-access
+/// approximation.
+pub const ACCESS_HISTORY_CAP: usize = 8;
 
 impl MemoryNote {
     pub fn new(content: String) -> Self {
@@ -63,7 +79,21 @@ impl MemoryNote {
             last_accessed_at: now,
             turn_index: None,
             source_timestamp: None,
+            access_count: 0,
+            access_history: Vec::new(),
+            session_id: None,
         }
+    }
+
+    /// Record a retrieval access: bump counter, push stamp, truncate ring.
+    pub fn record_access(&mut self, at: DateTime<Utc>) {
+        self.access_count = self.access_count.saturating_add(1);
+        self.access_history.push(at);
+        if self.access_history.len() > ACCESS_HISTORY_CAP {
+            let excess = self.access_history.len() - ACCESS_HISTORY_CAP;
+            self.access_history.drain(..excess);
+        }
+        self.last_accessed_at = at;
     }
 
     pub fn is_active(&self) -> bool {

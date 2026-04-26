@@ -4,12 +4,27 @@ use std::sync::Arc;
 use chrono::Utc;
 use tracing::{debug, info};
 
+use crate::activate::ActivateEngine;
 use crate::config::ReadConfig;
 use crate::error::Result;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
 use crate::note::{AskResult, MemoryNote, Provenance, SearchResult};
 use crate::rerank::{Reranker, RerankerConfig};
 use crate::store::{GraphStore, VectorStore};
+
+/// True when the ACTIVATE pipeline should be used instead of `search_wide`.
+/// Honours both the config flag and the `KARTA_ACTIVATE_ENABLED` env var.
+fn activate_enabled(cfg: &ReadConfig) -> bool {
+    cfg.activate.enabled
+        || std::env::var("KARTA_ACTIVATE_ENABLED")
+            .map(|v| {
+                matches!(
+                    v.trim().to_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+}
 
 /// Query classification for mode-specific retrieval behavior.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -26,6 +41,22 @@ pub enum QueryMode {
     Temporal,
     /// "did I ever/is it true/still" — include contradiction dreams.
     Existence,
+}
+
+impl QueryMode {
+    /// Canonical string representation used as the key into
+    /// `ActivateConfig::channel_weights` and in ACTIVATE telemetry.
+    /// Keep in sync with `default_activate_channel_weights()` in config.rs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QueryMode::Standard => "Standard",
+            QueryMode::Recency => "Recency",
+            QueryMode::Breadth => "Breadth",
+            QueryMode::Computation => "Computation",
+            QueryMode::Temporal => "Temporal",
+            QueryMode::Existence => "Existence",
+        }
+    }
 }
 
 /// Prototype examples for embedding-based query classification.
@@ -429,6 +460,24 @@ impl ReadEngine {
             }
         }
 
+        // ACTIVATE Phase 7 (Trace): run on the truncated set only.
+        if activate_enabled(&self.config) {
+            let engine = ActivateEngine::new(
+                Arc::clone(&self.vector_store),
+                Arc::clone(&self.graph_store),
+                Arc::clone(&self.llm),
+                Arc::clone(&self.reranker),
+                self.config.clone(),
+                self.reranker_config.clone(),
+            );
+            if engine.should_sample_trace() {
+                let final_ids: Vec<String> = results.iter().map(|r| r.note.id.clone()).collect();
+                if let Err(e) = engine.phase_trace(&final_ids).await {
+                    debug!(error = %e, "ACTIVATE: phase_trace non-fatal failure");
+                }
+            }
+        }
+
         Ok(results)
     }
 
@@ -453,6 +502,29 @@ impl ReadEngine {
             classifier.classify(&query_embedding)
         };
         debug!(query_mode = ?mode, "Query classified");
+
+        // ACTIVATE dispatch: when enabled, route through the 6-phase pipeline
+        // and return fused top_k as SearchResults. The legacy scalar path below
+        // remains the fallback so BEAM can A/B the two by toggling the flag.
+        if activate_enabled(&self.config) {
+            let engine = ActivateEngine::new(
+                Arc::clone(&self.vector_store),
+                Arc::clone(&self.graph_store),
+                Arc::clone(&self.llm),
+                Arc::clone(&self.reranker),
+                self.config.clone(),
+                self.reranker_config.clone(),
+            );
+            let out = engine
+                .activate(query, &query_embedding, mode, top_k)
+                .await?;
+            info!(
+                results = out.results.len(),
+                channels = out.channels.len(),
+                "ACTIVATE: fused output"
+            );
+            return Ok((out.results, out.mode));
+        }
 
         // Mode-specific fetch_k: wide pool for reranker, but Computation stays tight (precision > recall)
         let fetch_k = match mode {
@@ -924,6 +996,26 @@ impl ReadEngine {
             if let Ok(Some(mut original)) = self.vector_store.get(&result.note.id).await {
                 original.last_accessed_at = Utc::now();
                 let _ = self.vector_store.upsert(&original).await;
+            }
+        }
+
+        // ACTIVATE Phase 7 (Trace): train activation state on the FINAL
+        // truncated set — items dropped during reranking must not bump
+        // access counters or co-activation Hebbian edges.
+        if activate_enabled(&self.config) {
+            let engine = ActivateEngine::new(
+                Arc::clone(&self.vector_store),
+                Arc::clone(&self.graph_store),
+                Arc::clone(&self.llm),
+                Arc::clone(&self.reranker),
+                self.config.clone(),
+                self.reranker_config.clone(),
+            );
+            if engine.should_sample_trace() {
+                let final_ids: Vec<String> = results.iter().map(|r| r.note.id.clone()).collect();
+                if let Err(e) = engine.phase_trace(&final_ids).await {
+                    debug!(error = %e, "ACTIVATE: phase_trace non-fatal failure");
+                }
             }
         }
 
@@ -1412,5 +1504,19 @@ impl ReadEngine {
             || lower.contains("not in the notes")
             || lower.contains("not provided in")
             || lower.contains("i don't see any note")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Control: a Standard-style question must not be misclassified as Existence.
+    #[test]
+    fn keyword_classifier_does_not_overmatch_existence() {
+        assert_ne!(
+            classify_query_keywords("What tools am I using?"),
+            QueryMode::Existence,
+        );
     }
 }

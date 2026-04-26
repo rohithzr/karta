@@ -1,3 +1,4 @@
+pub mod activate;
 pub mod config;
 pub mod dream;
 pub mod error;

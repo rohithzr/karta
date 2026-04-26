@@ -1,6 +1,7 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
-use crate::error::Result;
+use crate::error::{KartaError, Result};
 use crate::note::{
     AtomicFact, CrossEpisodeDigest, Episode, EpisodeDigest, ForesightSignal, MemoryNote,
 };
@@ -55,6 +56,58 @@ pub trait VectorStore: Send + Sync {
     async fn get_facts_for_note(&self, _note_id: &str) -> Result<Vec<AtomicFact>> {
         Ok(Vec::new())
     }
+
+    // --- ACTIVATE: access bookkeeping (Phase 7 — Trace) ---
+
+    /// Record a single access: bump `access_count`, append `at` to
+    /// `access_history` (capped at ACCESS_HISTORY_CAP), update `last_accessed_at`.
+    ///
+    /// WARNING: The default implementation does a non-atomic
+    /// read-modify-write via `get` + `upsert`. Concurrent bumps can lose
+    /// increments, and because the entire note is re-upserted it can also
+    /// clobber concurrent content/context updates from other writers.
+    /// Production stores should override this with a native atomic update
+    /// (CAS / partial-row merge). Only safe for single-writer workloads or
+    /// when callers serialize access to each note id themselves. The
+    /// ACTIVATE phase_trace sample rate (`trace_sample_rate`) is the main
+    /// knob for bounding the write pressure this path generates.
+    async fn bump_access(&self, id: &str, at: DateTime<Utc>) -> Result<()> {
+        if let Some(mut note) = self.get(id).await? {
+            note.record_access(at);
+            self.upsert(&note).await?;
+        }
+        Ok(())
+    }
+
+    /// Batch variant of `bump_access`. Stores must override this with a native
+    /// partial update / transaction before enabling ACTIVATE trace writes.
+    ///
+    /// The old default looped through `bump_access`, which can devolve into a
+    /// full-note read-modify-write via `get` + `upsert`. That is not silently
+    /// safe for batch trace updates because concurrent writers can lose access
+    /// increments or overwrite note content/context. Return an explicit
+    /// unsupported error instead of pretending the unsafe fallback is atomic.
+    async fn bump_access_many(&self, _ids: &[&str], _at: DateTime<Utc>) -> Result<()> {
+        Err(KartaError::VectorStore(
+            "bump_access_many requires a store-specific atomic implementation".into(),
+        ))
+    }
+
+    /// Find the most recent note in a given session (by turn_index, then
+    /// created_at). Used by the write path to re-hydrate the session-tail
+    /// cache after a restart.
+    ///
+    /// Default impl scans every note via `get_all()` and filters in-memory
+    /// (O(N) per session cold-start). Stores with indexed scan support
+    /// should override to push the filter down and use an ORDER BY.
+    async fn find_latest_by_session(&self, session_id: &str) -> Result<Option<MemoryNote>> {
+        // TODO: O(N) scan — Lance override pushes this to a filtered query.
+        let all = self.get_all().await?;
+        Ok(all
+            .into_iter()
+            .filter(|n| n.session_id.as_deref() == Some(session_id))
+            .max_by_key(|n| (n.turn_index.unwrap_or(0), n.created_at)))
+    }
 }
 
 /// Stores graph edges (links), evolution history, dream state,
@@ -75,6 +128,83 @@ pub trait GraphStore: Send + Sync {
     /// Get the number of links for a note (for graph-aware scoring).
     async fn get_link_count(&self, note_id: &str) -> Result<usize> {
         Ok(self.get_links(note_id).await?.len())
+    }
+
+    // --- ACTIVATE: typed + weighted links (Phases 2, 5b, 7) ---
+
+    /// Add a typed, weighted link. `link_type` is typically "semantic" or
+    /// "follows" (sequential). Direction of "follows" is preserved: it is a
+    /// single-direction edge (prev -> next) whose reverse is derived from
+    /// `turn_delta`.
+    async fn add_link_typed(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        link_type: &str,
+        reason: &str,
+        weight: f32,
+    ) -> Result<()> {
+        let _ = (link_type, weight);
+        self.add_link(from_id, to_id, reason).await
+    }
+
+    /// Return (neighbor_id, weight) for a note. Optionally filter by link_type.
+    async fn get_links_with_weights(
+        &self,
+        note_id: &str,
+        _link_type: Option<&str>,
+    ) -> Result<Vec<(String, f32)>> {
+        Ok(self
+            .get_links(note_id)
+            .await?
+            .into_iter()
+            .map(|id| (id, 1.0_f32))
+            .collect())
+    }
+
+    /// Follow the "follows" chain from `note_id` in both directions up to
+    /// `radius` turns. Returns (neighbor_id, turn_delta) where delta is the
+    /// signed offset (negative = earlier turn, positive = later turn).
+    async fn get_sequential_neighbors(
+        &self,
+        _note_id: &str,
+        _radius: usize,
+    ) -> Result<Vec<(String, i32)>> {
+        Ok(Vec::new())
+    }
+
+    /// Hebbian strengthening: `weight = min(max, weight + delta)` on the
+    /// semantic edge between `from` and `to`. No-op if no edge exists.
+    async fn bump_link_weight(
+        &self,
+        _from_id: &str,
+        _to_id: &str,
+        _delta: f32,
+        _max: f32,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Batched Hebbian bump for multiple co-activated pairs. Default impl
+    /// loops the single-pair method so stores that don't override keep
+    /// working. Stores with transaction support should override to commit
+    /// the whole batch atomically (see `SqliteGraphStore`).
+    async fn bump_link_weights_batch(
+        &self,
+        pairs: &[(&str, &str)],
+        delta: f32,
+        max: f32,
+    ) -> Result<()> {
+        for (a, b) in pairs {
+            self.bump_link_weight(a, b, delta, max).await?;
+        }
+        Ok(())
+    }
+
+    /// Apply multiplicative decay to every semantic edge: `weight = max(1.0, weight * factor)`.
+    /// Called from `ForgetConfig` sweep. Default is a no-op.
+    async fn decay_link_weights(&self, _factor: f32) -> Result<usize> {
+        Ok(0)
     }
 
     // --- Evolution history ---
