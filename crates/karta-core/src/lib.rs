@@ -7,6 +7,8 @@ pub mod migrate;
 pub mod note;
 pub mod read;
 pub mod rerank;
+pub mod rules;
+pub mod rules_engine;
 pub mod store;
 pub mod write;
 

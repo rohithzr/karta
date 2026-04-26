@@ -9,6 +9,8 @@ use crate::llm::LlmProvider;
 use crate::note::{MemoryNote, SearchResult};
 use crate::read::ReadEngine;
 use crate::rerank::{JinaReranker, LlmReranker, NoopReranker, Reranker};
+use crate::rules::{ProceduralRule, RuleContext, RuleEvaluation};
+use crate::rules_engine::RuleEngine;
 use crate::store::{GraphStore, VectorStore};
 use crate::write::WriteEngine;
 
@@ -280,6 +282,28 @@ impl Karta {
             pending_migrations: pending,
             warnings,
         })
+    }
+
+    // --- Rules ---
+
+    pub async fn evaluate_rules(&self, ctx: &RuleContext) -> Result<RuleEvaluation> {
+        let engine = RuleEngine::new(Arc::clone(&self.graph_store));
+        engine.evaluate(ctx).await
+    }
+
+    pub async fn add_rule(&self, rule: ProceduralRule) -> Result<()> {
+        let engine = RuleEngine::new(Arc::clone(&self.graph_store));
+        engine.add_rule(rule).await
+    }
+
+    pub async fn disable_rule(&self, rule_id: &str) -> Result<()> {
+        let engine = RuleEngine::new(Arc::clone(&self.graph_store));
+        engine.disable_rule(rule_id).await
+    }
+
+    pub async fn list_rules(&self) -> Result<Vec<ProceduralRule>> {
+        let engine = RuleEngine::new(Arc::clone(&self.graph_store));
+        engine.list_rules().await
     }
 }
 
