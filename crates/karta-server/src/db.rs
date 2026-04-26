@@ -335,7 +335,10 @@ impl AuthDb {
     }
 
     /// Validate an access token by its hash. Returns (user_id, scope) if valid.
-    pub fn validate_access_token(&self, token_hash: &str) -> Result<Option<(String, Option<String>)>> {
+    pub fn validate_access_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT user_id, scope, expires_at FROM access_tokens WHERE token_hash = ?1",
@@ -343,15 +346,18 @@ impl AuthDb {
         let result = stmt
             .query(params![token_hash])?
             .next()?
-            .map(|row| -> rusqlite::Result<(String, Option<String>, String)> {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
+            .map(
+                |row| -> rusqlite::Result<(String, Option<String>, String)> {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                },
+            )
             .transpose()?;
 
         match result {
             Some((user_id, scope, expires_at)) => {
-                let expires = chrono::NaiveDateTime::parse_from_str(&expires_at, "%Y-%m-%dT%H:%M:%SZ")
-                    .map_err(|e| ServerError::Internal(format!("Bad expiry timestamp: {e}")))?;
+                let expires =
+                    chrono::NaiveDateTime::parse_from_str(&expires_at, "%Y-%m-%dT%H:%M:%SZ")
+                        .map_err(|e| ServerError::Internal(format!("Bad expiry timestamp: {e}")))?;
                 let expires_utc = expires.and_utc();
                 if expires_utc < chrono::Utc::now() {
                     Ok(None)
@@ -399,9 +405,9 @@ impl AuthDb {
 
         if conn.changes() == 0 {
             // Check if token exists but was already revoked (breach detection)
-            let already_revoked: bool = conn.prepare(
-                "SELECT 1 FROM refresh_tokens WHERE token_hash = ?1 AND revoked = 1",
-            )?.exists(params![token_hash])?;
+            let already_revoked: bool = conn
+                .prepare("SELECT 1 FROM refresh_tokens WHERE token_hash = ?1 AND revoked = 1")?
+                .exists(params![token_hash])?;
 
             if already_revoked {
                 // Revoke all tokens for this client+user (token theft detected)
@@ -435,9 +441,11 @@ impl AuthDb {
         let result = stmt
             .query(params![token_hash])?
             .next()?
-            .map(|row| -> rusqlite::Result<(String, String, Option<String>)> {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
+            .map(
+                |row| -> rusqlite::Result<(String, String, Option<String>)> {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                },
+            )
             .transpose()?;
 
         Ok(result)
@@ -468,6 +476,36 @@ impl AuthDb {
             ],
         )?;
         Ok(())
+    }
+
+    /// Read a pending auth request without consuming it.
+    pub fn get_pending_auth(&self, idp_csrf: &str) -> Result<Option<PendingAuth>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT state_token, client_id, redirect_uri, code_challenge, code_challenge_method,
+                    scope, original_state, idp_csrf, idp_nonce, idp_pkce_verifier, provider, expires_at
+             FROM pending_auth_requests WHERE idp_csrf = ?1",
+        )?;
+        stmt.query(params![idp_csrf])?
+            .next()?
+            .map(|row| -> rusqlite::Result<PendingAuth> {
+                Ok(PendingAuth {
+                    state_token: row.get(0)?,
+                    client_id: row.get(1)?,
+                    redirect_uri: row.get(2)?,
+                    code_challenge: row.get(3)?,
+                    code_challenge_method: row.get(4)?,
+                    scope: row.get(5)?,
+                    original_state: row.get(6)?,
+                    idp_csrf: row.get(7)?,
+                    idp_nonce: row.get(8)?,
+                    idp_pkce_verifier: row.get(9)?,
+                    provider: row.get(10)?,
+                    expires_at: row.get(11)?,
+                })
+            })
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Consume a pending auth request by the IdP CSRF token.

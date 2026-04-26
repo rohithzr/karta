@@ -27,7 +27,10 @@ impl std::fmt::Debug for ServerConfig {
             .field("github_client_id", &self.github_client_id)
             .field("github_client_secret", &"[REDACTED]")
             .field("db_path", &self.db_path)
-            .field("registration_token", &self.registration_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "registration_token",
+                &self.registration_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("allowed_origins", &self.allowed_origins)
             .finish()
     }
@@ -46,14 +49,17 @@ impl ServerConfig {
             &base64::engine::general_purpose::URL_SAFE_NO_PAD,
             &cookie_secret_b64,
         )
-        .or_else(|_| base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &cookie_secret_b64,
-        ))
+        .or_else(|_| {
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &cookie_secret_b64,
+            )
+        })
         .map_err(|e| ServerError::Config(format!("Invalid KARTA_COOKIE_SECRET base64: {e}")))?;
         if cookie_secret.len() < 64 {
             return Err(ServerError::Config(
-                "KARTA_COOKIE_SECRET must decode to at least 64 bytes (88 base64 chars)".to_string(),
+                "KARTA_COOKIE_SECRET must decode to at least 64 bytes (88 base64 chars)"
+                    .to_string(),
             ));
         }
 
@@ -62,13 +68,18 @@ impl ServerConfig {
         let github_client_id = required_env("GITHUB_CLIENT_ID")?;
         let github_client_secret = required_env("GITHUB_CLIENT_SECRET")?;
 
-        let db_path = std::env::var("KARTA_AUTH_DB_PATH")
-            .unwrap_or_else(|_| "karta-auth.db".to_string());
+        let db_path =
+            std::env::var("KARTA_AUTH_DB_PATH").unwrap_or_else(|_| "karta-auth.db".to_string());
 
         let registration_token = std::env::var("KARTA_REGISTRATION_TOKEN").ok();
 
         let allowed_origins = std::env::var("KARTA_ALLOWED_ORIGINS")
-            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .unwrap_or_else(|_| vec![base_url.clone()]);
 
         Ok(Self {

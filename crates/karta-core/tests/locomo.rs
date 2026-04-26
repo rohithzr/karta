@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use karta_core::config::KartaConfig;
 use karta_core::Karta;
+use karta_core::config::KartaConfig;
 
 // ---------------------------------------------------------------------------
 // Data model (mirrors output of data/convert_locomo.py)
@@ -342,9 +342,7 @@ async fn eval_conversation(conv: &LocomoConversation) -> ConvResult {
         let score = llm_judge(&karta, &q.question, &answer, &q.answer, adv).await;
 
         total_judged += 1;
-        let entry = category_scores
-            .entry(q.category.clone())
-            .or_insert((0, 0));
+        let entry = category_scores.entry(q.category.clone()).or_insert((0, 0));
         entry.1 += 1;
 
         if score >= 0.5 {
@@ -413,13 +411,15 @@ fn print_category_table(scores: &HashMap<String, (usize, usize)>) {
 #[tokio::test]
 #[ignore]
 async fn locomo_single() {
-    let dataset_path = std::env::var("LOCOMO_DATASET_PATH")
-        .unwrap_or_else(|_| "data/locomo.json".to_string());
+    let dataset_path =
+        std::env::var("LOCOMO_DATASET_PATH").unwrap_or_else(|_| "data/locomo.json".to_string());
 
     if !Path::new(&dataset_path).exists() {
         eprintln!("LOCOMO dataset not found at {}.", dataset_path);
         eprintln!("Download and convert:");
-        eprintln!("  curl -L https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json -o data/locomo10_raw.json");
+        eprintln!(
+            "  curl -L https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json -o data/locomo10_raw.json"
+        );
         eprintln!("  python3 data/convert_locomo.py data/locomo10_raw.json data/locomo.json");
         return;
     }
@@ -433,7 +433,10 @@ async fn locomo_single() {
     println!("LOCOMO SINGLE CONVERSATION RESULT");
     println!("{}", "=".repeat(70));
     println!("  Questions: {}", result.questions_asked);
-    println!("  Passed:    {}/{}", result.total_passed, result.total_judged);
+    println!(
+        "  Passed:    {}/{}",
+        result.total_passed, result.total_judged
+    );
 
     let pass_rate = if result.total_judged > 0 {
         result.total_passed as f64 / result.total_judged as f64
@@ -460,13 +463,15 @@ async fn locomo_single() {
 #[tokio::test]
 #[ignore]
 async fn locomo_full() {
-    let dataset_path = std::env::var("LOCOMO_DATASET_PATH")
-        .unwrap_or_else(|_| "data/locomo.json".to_string());
+    let dataset_path =
+        std::env::var("LOCOMO_DATASET_PATH").unwrap_or_else(|_| "data/locomo.json".to_string());
 
     if !Path::new(&dataset_path).exists() {
         eprintln!("LOCOMO dataset not found at {}.", dataset_path);
         eprintln!("Download and convert:");
-        eprintln!("  curl -L https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json -o data/locomo10_raw.json");
+        eprintln!(
+            "  curl -L https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json -o data/locomo10_raw.json"
+        );
         eprintln!("  python3 data/convert_locomo.py data/locomo10_raw.json data/locomo.json");
         return;
     }

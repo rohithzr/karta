@@ -3,13 +3,13 @@
 //! Uses MockLlmProvider + real LanceDB + real SQLite.
 //! Run: cargo test --test eval
 
-use std::sync::Arc;
+use karta_core::Karta;
 use karta_core::config::KartaConfig;
 use karta_core::llm::MockLlmProvider;
 use karta_core::store::lance::LanceVectorStore;
 use karta_core::store::sqlite::SqliteGraphStore;
 use karta_core::store::{GraphStore, VectorStore};
-use karta_core::Karta;
+use std::sync::Arc;
 
 struct Scenario {
     name: &'static str,
@@ -58,14 +58,12 @@ fn scenarios() -> Vec<Scenario> {
                 "TechCorp is running a SOC 2 Type II audit in Q3 2025 and needs all vendor tooling to be compliant.",
                 "The ops team at TechCorp wants to automate their contractor onboarding — 50+ contractors per month.",
             ],
-            queries: vec![
-                Query {
-                    query: "What compliance requirements affect the TechCorp contractor onboarding automation?",
-                    must_contain: vec!["audit", "S3|SOC"],
-                    check_links: false,
-                    check_evolution: true,
-                },
-            ],
+            queries: vec![Query {
+                query: "What compliance requirements affect the TechCorp contractor onboarding automation?",
+                must_contain: vec!["audit", "S3|SOC"],
+                check_links: false,
+                check_evolution: true,
+            }],
         },
         Scenario {
             name: "Cross-entity knowledge graph",
@@ -76,14 +74,12 @@ fn scenarios() -> Vec<Scenario> {
                 "Marcus at Acme has a hard deadline: the workflow needs to be live before their Q4 sales push starts Oct 1.",
                 "The deduplication issue in HubSpot/Salesforce syncs can be solved with a normalisation step that lowercases emails before comparison.",
             ],
-            queries: vec![
-                Query {
-                    query: "What technical issues should I warn Marcus about before building the Acme CRM sync?",
-                    must_contain: vec!["deduplication|dedup", "conflict"],
-                    check_links: true,
-                    check_evolution: false,
-                },
-            ],
+            queries: vec![Query {
+                query: "What technical issues should I warn Marcus about before building the Acme CRM sync?",
+                must_contain: vec!["deduplication|dedup", "conflict"],
+                check_links: true,
+                check_evolution: false,
+            }],
         },
         Scenario {
             name: "Procedural memory",
@@ -142,14 +138,12 @@ fn scenarios() -> Vec<Scenario> {
                 "Dr. Amara Osei (CMIO at Pinnacle Health) requires all patient data pipelines to be HIPAA-compliant with end-to-end encryption and audit logging.",
                 "Pinnacle Health's previous vendor failed because they tried real-time sync via the FHIR API and hit the rate limit wall during peak hours.",
             ],
-            queries: vec![
-                Query {
-                    query: "Design the data flow for the Pinnacle Health appointment sync. What are the constraints at each stage?",
-                    must_contain: vec!["FHIR", "rate limit|100 request", "Snowflake", "HIPAA"],
-                    check_links: true,
-                    check_evolution: false,
-                },
-            ],
+            queries: vec![Query {
+                query: "Design the data flow for the Pinnacle Health appointment sync. What are the constraints at each stage?",
+                must_contain: vec!["FHIR", "rate limit|100 request", "Snowflake", "HIPAA"],
+                check_links: true,
+                check_evolution: false,
+            }],
         },
         Scenario {
             name: "Noisy context with distractors",
@@ -187,14 +181,12 @@ fn scenarios() -> Vec<Scenario> {
                 "Vanguard Logistics has a DPA (Data Processing Agreement) that specifies EU-only data residency. The DPA was signed Jan 2025 and is valid for 2 years.",
                 "The Vanguard Logistics engineering team started provisioning resources in us-east-1 on Mar 15 without informing the compliance team.",
             ],
-            queries: vec![
-                Query {
-                    query: "Where should Vanguard Logistics data be processed?",
-                    must_contain: vec!["EU|Frankfurt|eu-central", "US-East|Virginia|us-east"],
-                    check_links: false,
-                    check_evolution: false,
-                },
-            ],
+            queries: vec![Query {
+                query: "Where should Vanguard Logistics data be processed?",
+                must_contain: vec!["EU|Frankfurt|eu-central", "US-East|Virginia|us-east"],
+                check_links: false,
+                check_evolution: false,
+            }],
         },
         Scenario {
             name: "Implicit entity resolution",
@@ -206,14 +198,12 @@ fn scenarios() -> Vec<Scenario> {
                 "Apex Analytics uses Databricks as their lakehouse. All metrics must be pulled from Delta Lake tables, not raw source systems.",
                 "Jordan Reeves flagged a hard constraint: the dashboard must support SSO via Okta — no separate login credentials.",
             ],
-            queries: vec![
-                Query {
-                    query: "What are all of Jordan's requirements for the Apex dashboard?",
-                    must_contain: vec!["real-time|30 second|refresh", "Slack|alert", "SSO|Okta"],
-                    check_links: true,
-                    check_evolution: false,
-                },
-            ],
+            queries: vec![Query {
+                query: "What are all of Jordan's requirements for the Apex dashboard?",
+                must_contain: vec!["real-time|30 second|refresh", "Slack|alert", "SSO|Okta"],
+                check_links: true,
+                check_evolution: false,
+            }],
         },
         Scenario {
             name: "Long-chain dependency reasoning",
@@ -225,14 +215,12 @@ fn scenarios() -> Vec<Scenario> {
                 "ClearView's IT team has budget approval to modernize one system per quarter. The AS/400 migration is scheduled for Q1 2026.",
                 "The 2-minute SLA was promised to ClearView's board by the COO and is considered non-negotiable for the current quarter.",
             ],
-            queries: vec![
-                Query {
-                    query: "Can ClearView meet their 2-minute claims processing target? What's blocking it?",
-                    must_contain: vec!["AS/400|AS400|legacy", "nightly|batch", "SFTP"],
-                    check_links: true,
-                    check_evolution: false,
-                },
-            ],
+            queries: vec![Query {
+                query: "Can ClearView meet their 2-minute claims processing target? What's blocking it?",
+                must_contain: vec!["AS/400|AS400|legacy", "nightly|batch", "SFTP"],
+                check_links: true,
+                check_evolution: false,
+            }],
         },
     ]
 }
@@ -248,21 +236,15 @@ fn check_must_contain(answer: &str, pattern: &str) -> bool {
 async fn create_karta(scenario_name: &str) -> Karta {
     let data_dir = format!(
         "/tmp/karta-test-{}",
-        scenario_name
-            .replace(' ', "-")
-            .replace('/', "-")
-            .to_lowercase()
+        scenario_name.replace([' ', '/'], "-").to_lowercase()
     );
     // Clean up from previous runs
     let _ = std::fs::remove_dir_all(&data_dir);
 
-    let vector_store = Arc::new(
-        LanceVectorStore::new(&data_dir).await.unwrap(),
-    ) as Arc<dyn VectorStore>;
+    let vector_store =
+        Arc::new(LanceVectorStore::new(&data_dir).await.unwrap()) as Arc<dyn VectorStore>;
 
-    let graph_store = Arc::new(
-        SqliteGraphStore::new(&data_dir).unwrap(),
-    ) as Arc<dyn GraphStore>;
+    let graph_store = Arc::new(SqliteGraphStore::new(&data_dir).unwrap()) as Arc<dyn GraphStore>;
 
     let llm = Arc::new(MockLlmProvider::new()) as Arc<dyn karta_core::llm::LlmProvider>;
 
@@ -435,10 +417,16 @@ async fn eval_dreaming() {
             dream.dream_type.as_str(),
             dream.confidence
         );
-        println!("    Content: {}...", &dream.dream_content[..dream.dream_content.len().min(100)]);
+        println!(
+            "    Content: {}...",
+            &dream.dream_content[..dream.dream_content.len().min(100)]
+        );
     }
 
-    assert!(dream_run.dreams_attempted > 0, "Should have attempted dreams");
+    assert!(
+        dream_run.dreams_attempted > 0,
+        "Should have attempted dreams"
+    );
     assert!(dream_run.notes_inspected > 0, "Should have inspected notes");
 
     // After dreaming, note count should have increased (dreams written back)
@@ -458,23 +446,41 @@ async fn eval_incremental_dreaming() {
     let karta = create_karta("incremental-dreaming").await;
 
     // First batch of notes
-    karta.add_note("Alpha Corp uses AWS for all infrastructure.").await.unwrap();
-    karta.add_note("Alpha Corp requires SOC 2 compliance.").await.unwrap();
+    karta
+        .add_note("Alpha Corp uses AWS for all infrastructure.")
+        .await
+        .unwrap();
+    karta
+        .add_note("Alpha Corp requires SOC 2 compliance.")
+        .await
+        .unwrap();
 
     // First dream pass
     let run1 = karta.run_dreaming("workspace", "test").await.unwrap();
-    println!("Dream run 1: {} inspected, {} attempted", run1.notes_inspected, run1.dreams_attempted);
+    println!(
+        "Dream run 1: {} inspected, {} attempted",
+        run1.notes_inspected, run1.dreams_attempted
+    );
 
     // Add more notes
-    karta.add_note("Alpha Corp's CTO prefers serverless architectures.").await.unwrap();
+    karta
+        .add_note("Alpha Corp's CTO prefers serverless architectures.")
+        .await
+        .unwrap();
 
     // Second dream pass — should only process new/updated notes
     let run2 = karta.run_dreaming("workspace", "test").await.unwrap();
-    println!("Dream run 2: {} inspected, {} attempted", run2.notes_inspected, run2.dreams_attempted);
+    println!(
+        "Dream run 2: {} inspected, {} attempted",
+        run2.notes_inspected, run2.dreams_attempted
+    );
 
     // The second run should inspect fewer or equal notes (incremental cursor)
     // We can't strictly assert less because linked neighbors get pulled in,
     // but we verify the cursor mechanism works by checking it ran at all
     // Verify the second dream run completed successfully
-    println!("Second run completed: {} dreams attempted", run2.dreams_attempted);
+    println!(
+        "Second run completed: {} dreams attempted",
+        run2.dreams_attempted
+    );
 }

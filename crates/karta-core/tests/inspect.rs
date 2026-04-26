@@ -3,9 +3,8 @@
 //!
 //! Run: cargo test --test inspect -- --ignored --nocapture
 
-use std::sync::Arc;
-use karta_core::config::KartaConfig;
 use karta_core::Karta;
+use karta_core::config::KartaConfig;
 
 async fn create_karta() -> Karta {
     let data_dir = "/tmp/karta-inspect";
@@ -58,7 +57,10 @@ async fn inspect_ingestion() {
             result.links.len(),
             result.keywords.join(", ")
         );
-        println!("  Context: {}", &result.context[..result.context.len().min(120)]);
+        println!(
+            "  Context: {}",
+            &result.context[..result.context.len().min(120)]
+        );
         println!();
     }
 
@@ -81,17 +83,33 @@ async fn inspect_ingestion() {
             );
         }
     }
-    println!("Total links: {} (avg {:.1}/note)", total_links, total_links as f64 / all_notes.len() as f64);
+    println!(
+        "Total links: {} (avg {:.1}/note)",
+        total_links,
+        total_links as f64 / all_notes.len() as f64
+    );
 
     // Test retrieval for the abstention question
     println!("\n=== RETRIEVAL TESTS ===\n");
 
     let test_queries = vec![
-        ("ABSTENTION TEST", "Can you tell me about my background and previous development projects?"),
+        (
+            "ABSTENTION TEST",
+            "Can you tell me about my background and previous development projects?",
+        ),
         ("TEMPORAL TEST", "When does my first sprint end?"),
-        ("CONTRADICTION TEST", "Have I integrated Flask-Login for session management?"),
-        ("SUMMARIZATION TEST", "Give me a comprehensive summary of my project progress"),
-        ("INSTRUCTION TEST", "Could you show me how to implement a login feature?"),
+        (
+            "CONTRADICTION TEST",
+            "Have I integrated Flask-Login for session management?",
+        ),
+        (
+            "SUMMARIZATION TEST",
+            "Give me a comprehensive summary of my project progress",
+        ),
+        (
+            "INSTRUCTION TEST",
+            "Could you show me how to implement a login feature?",
+        ),
     ];
 
     for (label, query) in &test_queries {

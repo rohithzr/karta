@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KartaConfig {
     pub storage: StorageConfig,
     pub llm: LlmConfig,
@@ -11,21 +11,6 @@ pub struct KartaConfig {
     pub episode: EpisodeConfig,
     pub forget: ForgetConfig,
     pub reranker: crate::rerank::RerankerConfig,
-}
-
-impl Default for KartaConfig {
-    fn default() -> Self {
-        Self {
-            storage: StorageConfig::default(),
-            llm: LlmConfig::default(),
-            read: ReadConfig::default(),
-            write: WriteConfig::default(),
-            dream: DreamConfig::default(),
-            episode: EpisodeConfig::default(),
-            forget: ForgetConfig::default(),
-            reranker: Default::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,11 +1,8 @@
 use std::sync::Arc;
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
-    handler::server::router::tool::ToolRouter,
-    handler::server::wrapper::Parameters,
-    model::*,
-    schemars, tool, tool_handler, tool_router,
+    ErrorData as McpError, ServerHandler, handler::server::router::tool::ToolRouter,
+    handler::server::wrapper::Parameters, model::*, schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
 
@@ -95,7 +92,9 @@ impl KartaService {
     }
 
     /// Store a new memory note in the knowledge graph.
-    #[tool(description = "Store a new memory note in the knowledge graph. The note will be automatically enriched with LLM-extracted attributes, linked to related notes, and indexed for retrieval.")]
+    #[tool(
+        description = "Store a new memory note in the knowledge graph. The note will be automatically enriched with LLM-extracted attributes, linked to related notes, and indexed for retrieval."
+    )]
     async fn add_note(
         &self,
         Parameters(params): Parameters<AddNoteParams>,
@@ -133,12 +132,14 @@ impl KartaService {
     }
 
     /// Search stored memories by semantic similarity.
-    #[tool(description = "Search stored memories by semantic similarity. Returns the most relevant notes ranked by a combination of vector similarity, recency, and graph connectivity.")]
+    #[tool(
+        description = "Search stored memories by semantic similarity. Returns the most relevant notes ranked by a combination of vector similarity, recency, and graph connectivity."
+    )]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let top_k = params.top_k.min(100).max(1);
+        let top_k = params.top_k.clamp(1, 100);
         match self.karta.search(&params.query, top_k).await {
             Ok(results) => {
                 let response: Vec<serde_json::Value> = results
@@ -169,12 +170,14 @@ impl KartaService {
     }
 
     /// Ask a question and get a synthesized answer from stored memories.
-    #[tool(description = "Ask a question against stored memories and get a synthesized answer. Uses retrieval-augmented generation: searches for relevant notes, then synthesizes a coherent answer using an LLM.")]
+    #[tool(
+        description = "Ask a question against stored memories and get a synthesized answer. Uses retrieval-augmented generation: searches for relevant notes, then synthesizes a coherent answer using an LLM."
+    )]
     async fn ask(
         &self,
         Parameters(params): Parameters<AskParams>,
     ) -> Result<CallToolResult, McpError> {
-        let top_k = params.top_k.min(100).max(1);
+        let top_k = params.top_k.clamp(1, 100);
         match self.karta.ask(&params.query, top_k).await {
             Ok(result) => {
                 let response = serde_json::json!({
@@ -198,7 +201,9 @@ impl KartaService {
     }
 
     /// Retrieve a specific note by its ID.
-    #[tool(description = "Retrieve a specific memory note by its ID. Returns the full note content and metadata.")]
+    #[tool(
+        description = "Retrieve a specific memory note by its ID. Returns the full note content and metadata."
+    )]
     async fn get_note(
         &self,
         Parameters(params): Parameters<GetNoteParams>,
@@ -249,14 +254,22 @@ impl KartaService {
     }
 
     /// Run background reasoning over the knowledge graph.
-    #[tool(description = "Run background reasoning over the knowledge graph. Produces new inferred notes via deduction, induction, abduction, consolidation, contradiction detection, and episode digests.")]
+    #[tool(
+        description = "Run background reasoning over the knowledge graph. Produces new inferred notes via deduction, induction, abduction, consolidation, contradiction detection, and episode digests."
+    )]
     async fn dream(
         &self,
         Parameters(params): Parameters<DreamParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.karta.run_dreaming(&params.scope_type, &params.scope_id).await {
+        match self
+            .karta
+            .run_dreaming(&params.scope_type, &params.scope_id)
+            .await
+        {
             Ok(run) => {
-                let types: Vec<String> = run.dreams.iter()
+                let types: Vec<String> = run
+                    .dreams
+                    .iter()
                     .filter(|d| d.would_write)
                     .map(|d| d.dream_type.as_str().to_string())
                     .collect();

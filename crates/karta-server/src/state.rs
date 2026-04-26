@@ -1,8 +1,11 @@
 use axum_extra::extract::cookie::Key;
 use oauth2::basic::BasicClient;
-use oauth2::{AuthUrl, ClientId, ClientSecret, EndpointMaybeSet, EndpointNotSet, EndpointSet, RedirectUrl, TokenUrl};
+use oauth2::{
+    AuthUrl, ClientId, ClientSecret, EndpointMaybeSet, EndpointNotSet, EndpointSet, RedirectUrl,
+    TokenUrl,
+};
 use openidconnect::core::CoreClient;
-use openidconnect::{IssuerUrl, ClientId as OidcClientId, ClientSecret as OidcClientSecret};
+use openidconnect::{ClientId as OidcClientId, ClientSecret as OidcClientSecret, IssuerUrl};
 
 use crate::config::ServerConfig;
 use crate::db::AuthDb;
@@ -19,13 +22,8 @@ pub type GoogleClient = CoreClient<
 >;
 
 /// The GitHub OAuth2 client type with auth + token URLs set.
-pub type GithubClient = BasicClient<
-    EndpointSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointSet,
->;
+pub type GithubClient =
+    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -68,12 +66,10 @@ async fn build_google_client(
     let issuer = IssuerUrl::new("https://accounts.google.com".to_string())
         .map_err(|e| ServerError::Config(format!("Invalid Google issuer URL: {e}")))?;
 
-    let provider_metadata = openidconnect::core::CoreProviderMetadata::discover_async(
-        issuer,
-        http_client,
-    )
-    .await
-    .map_err(|e| ServerError::Config(format!("Failed to discover Google OIDC: {e}")))?;
+    let provider_metadata =
+        openidconnect::core::CoreProviderMetadata::discover_async(issuer, http_client)
+            .await
+            .map_err(|e| ServerError::Config(format!("Failed to discover Google OIDC: {e}")))?;
 
     let redirect_url = format!("{}/auth/google/callback", config.base_url);
 

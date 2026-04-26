@@ -52,10 +52,7 @@ pub async fn authorize(
         .code_challenge
         .as_deref()
         .ok_or_else(|| ServerError::BadRequest("code_challenge is required (PKCE)".to_string()))?;
-    let code_challenge_method = params
-        .code_challenge_method
-        .as_deref()
-        .unwrap_or("S256");
+    let code_challenge_method = params.code_challenge_method.as_deref().unwrap_or("S256");
     let client_state = params
         .state
         .as_deref()
@@ -83,14 +80,13 @@ pub async fn authorize(
     }
 
     // Validate client exists and redirect_uri matches
-    let client = state
-        .db
-        .get_client(client_id)?
-        .ok_or_else(|| ServerError::oauth(
+    let client = state.db.get_client(client_id)?.ok_or_else(|| {
+        ServerError::oauth(
             "invalid_client",
             "Unknown client_id",
             StatusCode::BAD_REQUEST,
-        ))?;
+        )
+    })?;
 
     if !client.redirect_uris.iter().any(|u| u == redirect_uri) {
         return Err(ServerError::oauth(
@@ -206,10 +202,7 @@ fn render_login_page(base_url: &str, params: &AuthorizeParams) -> Html<String> {
         qs.push(format!("code_challenge={}", urlencoding::encode(v)));
     }
     if let Some(v) = &params.code_challenge_method {
-        qs.push(format!(
-            "code_challenge_method={}",
-            urlencoding::encode(v)
-        ));
+        qs.push(format!("code_challenge_method={}", urlencoding::encode(v)));
     }
     if let Some(v) = &params.state {
         qs.push(format!("state={}", urlencoding::encode(v)));
@@ -219,12 +212,8 @@ fn render_login_page(base_url: &str, params: &AuthorizeParams) -> Html<String> {
     }
 
     let query_string = qs.join("&");
-    let google_url = format!(
-        "{base_url}/oauth/authorize?{query_string}&provider=google"
-    );
-    let github_url = format!(
-        "{base_url}/oauth/authorize?{query_string}&provider=github"
-    );
+    let google_url = format!("{base_url}/oauth/authorize?{query_string}&provider=google");
+    let github_url = format!("{base_url}/oauth/authorize?{query_string}&provider=github");
 
     Html(format!(
         r#"<!DOCTYPE html>

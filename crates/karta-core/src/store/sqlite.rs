@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 use crate::dream::DreamRun;
 use crate::error::{KartaError, Result};
+use crate::migrate;
 use crate::note::EvolutionRecord;
 
 pub struct SqliteGraphStore {
@@ -14,11 +15,9 @@ pub struct SqliteGraphStore {
 impl SqliteGraphStore {
     pub fn new(data_dir: &str) -> Result<Self> {
         let path = format!("{}/karta.db", data_dir);
-        std::fs::create_dir_all(data_dir)
-            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        std::fs::create_dir_all(data_dir).map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
-        let conn = Connection::open(&path)
-            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = Connection::open(&path).map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
         // Use DELETE journal mode for compatibility with network filesystems (e.g. GCS FUSE).
         // WAL requires shared memory / file locking that FUSE mounts don't support.
@@ -36,7 +35,10 @@ impl SqliteGraphStore {
 #[async_trait]
 impl crate::store::GraphStore for SqliteGraphStore {
     async fn init(&self) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS links (
@@ -172,11 +174,18 @@ impl crate::store::GraphStore for SqliteGraphStore {
             ",
         )
         .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+
+        // Initialize schema_meta table and apply pending migrations
+        migrate::init_and_migrate(&conn)?;
+
         Ok(())
     }
 
     async fn add_link(&self, from_id: &str, to_id: &str, reason: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
 
         // Bidirectional: insert both directions
@@ -196,7 +205,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn get_links(&self, note_id: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT to_id FROM links WHERE from_id = ?1")
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
@@ -211,7 +223,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn get_links_with_reasons(&self, note_id: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT to_id, reason FROM links WHERE from_id = ?1")
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
@@ -233,7 +248,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
         triggered_by: &str,
         previous_context: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
@@ -246,7 +264,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn get_evolution_history(&self, note_id: &str) -> Result<Vec<EvolutionRecord>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT triggered_by, previous_context, evolved_at FROM evolution_history WHERE note_id = ?1 ORDER BY id ASC",
@@ -273,7 +294,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn record_dream_run(&self, run: &DreamRun) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let dreams_json = serde_json::to_string(&run.dreams)?;
 
         conn.execute(
@@ -297,7 +321,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn get_dream_cursor(&self) -> Result<Option<DateTime<Utc>>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let result = conn.query_row(
             "SELECT last_processed_at FROM dream_cursor WHERE id = 1",
             [],
@@ -320,7 +347,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn set_dream_cursor(&self, cursor: DateTime<Utc>) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         conn.execute(
             "INSERT INTO dream_cursor (id, last_processed_at) VALUES (1, ?1)
              ON CONFLICT(id) DO UPDATE SET last_processed_at = ?1",
@@ -334,7 +364,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     // --- Foresight signals ---
 
     async fn upsert_foresight(&self, signal: &crate::note::ForesightSignal) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let status_str = serde_json::to_string(&signal.status)?;
         conn.execute(
             "INSERT INTO foresight_signals (id, content, valid_from, valid_until, source_note_id, confidence, status)
@@ -355,7 +388,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn get_active_foresights(&self) -> Result<Vec<crate::note::ForesightSignal>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT id, content, valid_from, valid_until, source_note_id, confidence FROM foresight_signals WHERE status = 'Active'")
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
@@ -370,7 +406,9 @@ impl crate::store::GraphStore for SqliteGraphStore {
                         .unwrap_or_default()
                         .with_timezone(&Utc),
                     valid_until: valid_until_str.and_then(|s| {
-                        DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+                        DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&Utc))
                     }),
                     source_note_id: row.get(4)?,
                     confidence: row.get(5)?,
@@ -385,7 +423,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn expire_foresights(&self, before: DateTime<Utc>) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let count = conn
             .execute(
                 "UPDATE foresight_signals SET status = 'Expired' WHERE status = 'Active' AND valid_until IS NOT NULL AND valid_until < ?1",
@@ -395,8 +436,14 @@ impl crate::store::GraphStore for SqliteGraphStore {
         Ok(count)
     }
 
-    async fn get_foresights_for_note(&self, note_id: &str) -> Result<Vec<crate::note::ForesightSignal>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+    async fn get_foresights_for_note(
+        &self,
+        note_id: &str,
+    ) -> Result<Vec<crate::note::ForesightSignal>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT id, content, valid_from, valid_until, source_note_id, confidence, status FROM foresight_signals WHERE source_note_id = ?1")
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
@@ -417,7 +464,9 @@ impl crate::store::GraphStore for SqliteGraphStore {
                         .unwrap_or_default()
                         .with_timezone(&Utc),
                     valid_until: valid_until_str.and_then(|s| {
-                        DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+                        DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&Utc))
                     }),
                     source_note_id: row.get(4)?,
                     confidence: row.get(5)?,
@@ -434,7 +483,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     // --- Profiles ---
 
     async fn upsert_profile(&self, entity_id: &str, note_id: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO profiles (entity_id, note_id, last_updated) VALUES (?1, ?2, ?3)
@@ -446,7 +498,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn get_profile_note_id(&self, entity_id: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let result = conn.query_row(
             "SELECT note_id FROM profiles WHERE entity_id = ?1",
             rusqlite::params![entity_id],
@@ -460,7 +515,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn get_all_profiles(&self) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT entity_id, note_id FROM profiles")
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
@@ -475,7 +533,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     // --- Episodes ---
 
     async fn upsert_episode(&self, episode: &crate::note::Episode) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let tags_json = serde_json::to_string(&episode.topic_tags)?;
         conn.execute(
             "INSERT INTO episodes (id, narrative_note_id, start_time, end_time, session_id, topic_tags_json)
@@ -496,7 +557,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
 
     async fn get_episode(&self, id: &str) -> Result<Option<crate::note::Episode>> {
         let episode_result = {
-            let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| KartaError::GraphStore(e.to_string()))?;
             conn.query_row(
                 "SELECT id, narrative_note_id, start_time, end_time, session_id, topic_tags_json FROM episodes WHERE id = ?1",
                 rusqlite::params![id],
@@ -530,9 +594,15 @@ impl crate::store::GraphStore for SqliteGraphStore {
         }
     }
 
-    async fn get_episodes_for_session(&self, session_id: &str) -> Result<Vec<crate::note::Episode>> {
+    async fn get_episodes_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::note::Episode>> {
         let ids: Vec<String> = {
-            let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| KartaError::GraphStore(e.to_string()))?;
             let mut stmt = conn
                 .prepare("SELECT id FROM episodes WHERE session_id = ?1 ORDER BY start_time ASC")
                 .map_err(|e| KartaError::GraphStore(e.to_string()))?;
@@ -552,7 +622,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn add_note_to_episode(&self, note_id: &str, episode_id: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         conn.execute(
             "INSERT OR IGNORE INTO note_episodes (note_id, episode_id) VALUES (?1, ?2)",
             rusqlite::params![note_id, episode_id],
@@ -562,7 +635,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn get_episode_for_note(&self, note_id: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let result = conn.query_row(
             "SELECT episode_id FROM note_episodes WHERE note_id = ?1 LIMIT 1",
             rusqlite::params![note_id],
@@ -576,7 +652,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn get_notes_for_episode(&self, episode_id: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT note_id FROM note_episodes WHERE episode_id = ?1")
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
@@ -591,7 +670,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
     // --- Efficient link count ---
 
     async fn get_link_count(&self, note_id: &str) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM links WHERE from_id = ?1",
@@ -605,9 +687,15 @@ impl crate::store::GraphStore for SqliteGraphStore {
     // --- Episode Digests (Phase Next) ---
 
     async fn upsert_episode_digest(&self, digest: &crate::note::EpisodeDigest) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let entities_json = serde_json::to_string(&digest.entities)?;
-        let date_range_json = digest.date_range.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default());
+        let date_range_json = digest
+            .date_range
+            .as_ref()
+            .map(|d| serde_json::to_string(d).unwrap_or_default());
         let aggregations_json = serde_json::to_string(&digest.aggregations)?;
         let topic_sequence_json = serde_json::to_string(&digest.topic_sequence)?;
         let events_json = serde_json::to_string(&digest.events)?;
@@ -618,8 +706,14 @@ impl crate::store::GraphStore for SqliteGraphStore {
         Ok(())
     }
 
-    async fn get_episode_digest(&self, episode_id: &str) -> Result<Option<crate::note::EpisodeDigest>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+    async fn get_episode_digest(
+        &self,
+        episode_id: &str,
+    ) -> Result<Option<crate::note::EpisodeDigest>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, events_json, digest_text, digest_note_id, created_at FROM episode_digests WHERE episode_id = ?1"
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
@@ -642,7 +736,8 @@ impl crate::store::GraphStore for SqliteGraphStore {
                 digest_text: row.get(7)?,
                 digest_note_id: row.get(8)?,
                 created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                    .unwrap_or_default().with_timezone(&chrono::Utc),
+                    .unwrap_or_default()
+                    .with_timezone(&chrono::Utc),
             })
         });
 
@@ -654,49 +749,65 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn get_all_episode_digests(&self) -> Result<Vec<crate::note::EpisodeDigest>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, events_json, digest_text, digest_note_id, created_at FROM episode_digests ORDER BY created_at"
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
-        let digests = stmt.query_map([], |row| {
-            let entities_str: String = row.get(2)?;
-            let date_range_str: Option<String> = row.get(3)?;
-            let agg_str: String = row.get(4)?;
-            let topic_str: String = row.get(5)?;
-            let events_str: String = row.get(6)?;
-            let created_str: String = row.get(9)?;
-            Ok(crate::note::EpisodeDigest {
-                id: row.get(0)?,
-                episode_id: row.get(1)?,
-                entities: serde_json::from_str(&entities_str).unwrap_or_default(),
-                date_range: date_range_str.and_then(|s| serde_json::from_str(&s).ok()),
-                aggregations: serde_json::from_str(&agg_str).unwrap_or_default(),
-                topic_sequence: serde_json::from_str(&topic_str).unwrap_or_default(),
-                events: serde_json::from_str(&events_str).unwrap_or_default(),
-                digest_text: row.get(7)?,
-                digest_note_id: row.get(8)?,
-                created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                    .unwrap_or_default().with_timezone(&chrono::Utc),
+        let digests = stmt
+            .query_map([], |row| {
+                let entities_str: String = row.get(2)?;
+                let date_range_str: Option<String> = row.get(3)?;
+                let agg_str: String = row.get(4)?;
+                let topic_str: String = row.get(5)?;
+                let events_str: String = row.get(6)?;
+                let created_str: String = row.get(9)?;
+                Ok(crate::note::EpisodeDigest {
+                    id: row.get(0)?,
+                    episode_id: row.get(1)?,
+                    entities: serde_json::from_str(&entities_str).unwrap_or_default(),
+                    date_range: date_range_str.and_then(|s| serde_json::from_str(&s).ok()),
+                    aggregations: serde_json::from_str(&agg_str).unwrap_or_default(),
+                    topic_sequence: serde_json::from_str(&topic_str).unwrap_or_default(),
+                    events: serde_json::from_str(&events_str).unwrap_or_default(),
+                    digest_text: row.get(7)?,
+                    digest_note_id: row.get(8)?,
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                        .unwrap_or_default()
+                        .with_timezone(&chrono::Utc),
+                })
             })
-        }).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
         Ok(digests.filter_map(|r| r.ok()).collect())
     }
 
     async fn get_undigested_episode_ids(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT e.id FROM episodes e LEFT JOIN episode_digests d ON e.id = d.episode_id WHERE d.id IS NULL"
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
-        let ids = stmt.query_map([], |row| row.get(0))
+        let ids = stmt
+            .query_map([], |row| row.get(0))
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         Ok(ids.filter_map(|r| r.ok()).collect())
     }
 
-    async fn upsert_cross_episode_digest(&self, digest: &crate::note::CrossEpisodeDigest) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+    async fn upsert_cross_episode_digest(
+        &self,
+        digest: &crate::note::CrossEpisodeDigest,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let entity_timeline_json = serde_json::to_string(&digest.entity_timeline)?;
         let cross_aggregations_json = serde_json::to_string(&digest.cross_aggregations)?;
         let events_json = serde_json::to_string(&digest.events)?;
@@ -709,37 +820,52 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn get_all_cross_episode_digests(&self) -> Result<Vec<crate::note::CrossEpisodeDigest>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT id, scope_id, entity_timeline_json, cross_aggregations_json, events_json, topic_progression_json, digest_text, created_at FROM cross_episode_digests ORDER BY created_at"
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
-        let digests = stmt.query_map([], |row| {
-            let timeline_str: String = row.get(2)?;
-            let agg_str: String = row.get(3)?;
-            let events_str: String = row.get(4)?;
-            let topic_str: String = row.get(5)?;
-            let created_str: String = row.get(7)?;
-            Ok(crate::note::CrossEpisodeDigest {
-                id: row.get(0)?,
-                scope_id: row.get(1)?,
-                entity_timeline: serde_json::from_str(&timeline_str).unwrap_or_default(),
-                cross_aggregations: serde_json::from_str(&agg_str).unwrap_or_default(),
-                events: serde_json::from_str(&events_str).unwrap_or_default(),
-                topic_progression: serde_json::from_str(&topic_str).unwrap_or_default(),
-                digest_text: row.get(6)?,
-                created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                    .unwrap_or_default().with_timezone(&chrono::Utc),
+        let digests = stmt
+            .query_map([], |row| {
+                let timeline_str: String = row.get(2)?;
+                let agg_str: String = row.get(3)?;
+                let events_str: String = row.get(4)?;
+                let topic_str: String = row.get(5)?;
+                let created_str: String = row.get(7)?;
+                Ok(crate::note::CrossEpisodeDigest {
+                    id: row.get(0)?,
+                    scope_id: row.get(1)?,
+                    entity_timeline: serde_json::from_str(&timeline_str).unwrap_or_default(),
+                    cross_aggregations: serde_json::from_str(&agg_str).unwrap_or_default(),
+                    events: serde_json::from_str(&events_str).unwrap_or_default(),
+                    topic_progression: serde_json::from_str(&topic_str).unwrap_or_default(),
+                    digest_text: row.get(6)?,
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                        .unwrap_or_default()
+                        .with_timezone(&chrono::Utc),
+                })
             })
-        }).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
         Ok(digests.filter_map(|r| r.ok()).collect())
     }
 
     // --- Atomic Fact Metadata (Phase Next) ---
 
-    async fn record_fact(&self, fact_id: &str, source_note_id: &str, ordinal: u32, subject: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+    async fn record_fact(
+        &self,
+        fact_id: &str,
+        source_note_id: &str,
+        ordinal: u32,
+        subject: Option<&str>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         conn.execute(
             "INSERT OR REPLACE INTO atomic_facts (id, source_note_id, ordinal, subject) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![fact_id, source_note_id, ordinal, subject],
@@ -748,19 +874,33 @@ impl crate::store::GraphStore for SqliteGraphStore {
     }
 
     async fn get_facts_by_subject(&self, subject: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
-        let mut stmt = conn.prepare(
-            "SELECT id FROM atomic_facts WHERE subject = ?1 ORDER BY created_at"
-        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
-        let ids = stmt.query_map(rusqlite::params![subject], |row| row.get(0))
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT id FROM atomic_facts WHERE subject = ?1 ORDER BY created_at")
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let ids = stmt
+            .query_map(rusqlite::params![subject], |row| row.get(0))
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         Ok(ids.filter_map(|r| r.ok()).collect())
     }
 
     // --- Episode Links (Phase Next) ---
 
-    async fn add_episode_link(&self, from_id: &str, to_id: &str, link_type: &str, entity: Option<&str>, reason: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+    async fn add_episode_link(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        link_type: &str,
+        entity: Option<&str>,
+        reason: &str,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         conn.execute(
             "INSERT OR IGNORE INTO episode_links (from_episode_id, to_episode_id, link_type, entity, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![from_id, to_id, link_type, entity, reason],
@@ -768,24 +908,44 @@ impl crate::store::GraphStore for SqliteGraphStore {
         Ok(())
     }
 
-    async fn get_episode_links(&self, episode_id: &str) -> Result<Vec<(String, String, Option<String>)>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+    async fn get_episode_links(
+        &self,
+        episode_id: &str,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT to_episode_id, link_type, entity FROM episode_links WHERE from_episode_id = ?1 UNION SELECT from_episode_id, link_type, entity FROM episode_links WHERE to_episode_id = ?1"
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
-        let links = stmt.query_map(rusqlite::params![episode_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        }).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let links = stmt
+            .query_map(rusqlite::params![episode_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         Ok(links.filter_map(|r| r.ok()).collect())
     }
 
     async fn get_episodes_for_entity(&self, entity: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT DISTINCT from_episode_id FROM episode_links WHERE entity = ?1 AND link_type = 'entity_continuity' UNION SELECT DISTINCT to_episode_id FROM episode_links WHERE entity = ?1 AND link_type = 'entity_continuity'"
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
-        let ids = stmt.query_map(rusqlite::params![entity], |row| row.get(0))
+        let ids = stmt
+            .query_map(rusqlite::params![entity], |row| row.get(0))
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         Ok(ids.filter_map(|r| r.ok()).collect())
+    }
+
+    async fn get_schema_meta(&self) -> Result<crate::migrate::SchemaMeta> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        migrate::load_schema_meta(&conn)
     }
 }

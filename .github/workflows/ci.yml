@@ -44,16 +44,12 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
-      # rustfmt + clippy -D warnings are intentionally lenient today — the
-      # tree has pre-existing style drift that will be cleaned up in a
-      # dedicated PR. For now, these run as informational checks so we at
-      # least surface regressions without blocking on the historical debt.
-      - name: rustfmt (informational)
-        run: cargo fmt --all -- --check || echo "::warning::fmt drift detected; not blocking CI yet"
+      # rustfmt and clippy are strict CI gates; formatting or lint warnings fail the run.
+      - name: rustfmt
+        run: cargo fmt --all -- --check
 
-      - name: clippy (informational)
-        run: cargo clippy --workspace --all-targets 2>&1 | tee clippy.log
-        # No -D warnings yet; see above.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: build
         run: cargo build --workspace --all-targets

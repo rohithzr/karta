@@ -25,9 +25,11 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
             .get("authorization")
             .ok_or_else(|| ServerError::Unauthorized("Missing Authorization header".to_string()))?;
 
-        let auth_header = auth_header_value
-            .to_str()
-            .map_err(|_| ServerError::Unauthorized("Authorization header contains invalid characters".to_string()))?;
+        let auth_header = auth_header_value.to_str().map_err(|_| {
+            ServerError::Unauthorized(
+                "Authorization header contains invalid characters".to_string(),
+            )
+        })?;
 
         let token = auth_header
             .strip_prefix("Bearer ")

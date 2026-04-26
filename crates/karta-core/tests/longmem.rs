@@ -24,9 +24,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
+use karta_core::Karta;
 use karta_core::config::KartaConfig;
 use karta_core::llm::{ChatMessage, GenConfig, Role};
-use karta_core::Karta;
 
 // ---------------------------------------------------------------------------
 // Data model matching the JSON from convert_longmem.py
@@ -63,6 +63,7 @@ struct LongMemMessage {
     #[serde(default)]
     date: String,
     #[serde(default)]
+    #[allow(dead_code)]
     session_id: String,
 }
 
@@ -81,11 +82,21 @@ where
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("string or number")
         }
-        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<String, E> { Ok(v.to_string()) }
-        fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<String, E> { Ok(v) }
-        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<String, E> { Ok(v.to_string()) }
-        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<String, E> { Ok(v.to_string()) }
-        fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<String, E> { Ok(v.to_string()) }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<String, E> {
+            Ok(v)
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<String, E> {
+            Ok(v.to_string())
+        }
     }
     deserializer.deserialize_any(StringOrNumber)
 }
@@ -262,15 +273,16 @@ impl CategoryResults {
 
     fn merge(&mut self, other: &CategoryResults) {
         for (cat, scores) in &other.scores {
-            self.scores
-                .entry(cat.clone())
-                .or_default()
-                .extend(scores);
+            self.scores.entry(cat.clone()).or_default().extend(scores);
         }
     }
 
     fn total_correct(&self) -> usize {
-        self.scores.values().flat_map(|v| v.iter()).filter(|&&b| b).count()
+        self.scores
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|&&b| b)
+            .count()
     }
 
     fn total_count(&self) -> usize {
@@ -300,7 +312,11 @@ impl CategoryResults {
             let scores = &self.scores[cat];
             let c = scores.iter().filter(|&&b| b).count();
             let t = scores.len();
-            let rate = if t > 0 { c as f64 / t as f64 * 100.0 } else { 0.0 };
+            let rate = if t > 0 {
+                c as f64 / t as f64 * 100.0
+            } else {
+                0.0
+            };
             println!("    {:40} {}/{} ({:.0}%)", cat, c, t, rate);
         }
     }
@@ -311,10 +327,7 @@ impl CategoryResults {
 /// 1. Ingest all user messages from all sessions as notes (with date prefix for temporal context)
 /// 2. Ask the evaluation question via karta.ask()
 /// 3. Use LLM-as-judge to score the answer
-async fn eval_entry(
-    entry: &LongMemEntry,
-    results: &mut CategoryResults,
-) {
+async fn eval_entry(entry: &LongMemEntry, results: &mut CategoryResults) {
     println!(
         "\n  --- [{}] {} ---",
         entry.question_type, entry.question_id
@@ -374,14 +387,8 @@ async fn eval_entry(
     };
     let query_ms = query_start.elapsed().as_millis();
 
-    println!(
-        "    Q: {}",
-        safe_truncate(&entry.question, 100)
-    );
-    println!(
-        "    Expected: {}",
-        safe_truncate(&entry.answer, 100)
-    );
+    println!("    Q: {}", safe_truncate(&entry.question, 100));
+    println!("    Expected: {}", safe_truncate(&entry.answer, 100));
     println!(
         "    Got ({:.1}s): {}",
         query_ms as f64 / 1000.0,
@@ -424,9 +431,7 @@ async fn longmem_single() {
 
     if !Path::new(&dataset_path).exists() {
         eprintln!("LongMemEval dataset not found at {}.", dataset_path);
-        eprintln!(
-            "Run: python3 data/convert_longmem.py oracle data/longmemeval-oracle.json"
-        );
+        eprintln!("Run: python3 data/convert_longmem.py oracle data/longmemeval-oracle.json");
         return;
     }
 
@@ -459,17 +464,15 @@ async fn longmem_ten() {
 
     let dataset = load_dataset(&dataset_path);
     let count = dataset.questions.len().min(10);
-    println!("LongMemEval [{}]: running first {} of {} questions", dataset.split, count, dataset.total_questions);
+    println!(
+        "LongMemEval [{}]: running first {} of {} questions",
+        dataset.split, count, dataset.total_questions
+    );
 
     let mut results = CategoryResults::new();
 
     for (i, entry) in dataset.questions.iter().take(count).enumerate() {
-        println!(
-            "\n{} [{}/{}]",
-            "=".repeat(70),
-            i + 1,
-            count,
-        );
+        println!("\n{} [{}/{}]", "=".repeat(70), i + 1, count,);
         eval_entry(entry, &mut results).await;
     }
 
@@ -489,17 +492,14 @@ async fn longmem_full() {
 
     if !Path::new(&dataset_path).exists() {
         eprintln!("LongMemEval dataset not found at {}.", dataset_path);
-        eprintln!(
-            "Run: python3 data/convert_longmem.py oracle data/longmemeval-oracle.json"
-        );
+        eprintln!("Run: python3 data/convert_longmem.py oracle data/longmemeval-oracle.json");
         return;
     }
 
     let dataset = load_dataset(&dataset_path);
     println!(
         "LongMemEval Full [{}]: {} questions",
-        dataset.split,
-        dataset.total_questions,
+        dataset.split, dataset.total_questions,
     );
 
     let full_start = Instant::now();
@@ -522,7 +522,11 @@ async fn longmem_full() {
         if (i + 1) % 10 == 0 {
             let c = results.total_correct();
             let t = results.total_count();
-            let rate = if t > 0 { c as f64 / t as f64 * 100.0 } else { 0.0 };
+            let rate = if t > 0 {
+                c as f64 / t as f64 * 100.0
+            } else {
+                0.0
+            };
             println!(
                 "\n  Running total: {}/{} ({:.1}%) after {} entries",
                 c,

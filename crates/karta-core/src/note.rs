@@ -103,21 +103,13 @@ pub enum Provenance {
         confidence: f32,
     },
     /// Entity profile built from consolidation dreams.
-    Profile {
-        entity_id: String,
-    },
+    Profile { entity_id: String },
     /// Episode narrative synthesis.
-    Episode {
-        episode_id: String,
-    },
+    Episode { episode_id: String },
     /// Atomic fact extracted from a note.
-    Fact {
-        source_note_id: String,
-    },
+    Fact { source_note_id: String },
     /// Episode digest produced by dream engine.
-    Digest {
-        episode_id: String,
-    },
+    Digest { episode_id: String },
 }
 
 /// Result of a similarity search.
@@ -206,7 +198,11 @@ pub enum ForesightStatus {
 }
 
 impl ForesightSignal {
-    pub fn new(content: String, source_note_id: String, valid_until: Option<DateTime<Utc>>) -> Self {
+    pub fn new(
+        content: String,
+        source_note_id: String,
+        valid_until: Option<DateTime<Utc>>,
+    ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             content,
@@ -404,16 +400,15 @@ pub struct AggregationEntry {
 
 // ─── Note Lifecycle (Phase 3.1) ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum NoteStatus {
+    #[default]
     Active,
-    Deprecated { by: String },
-    Superseded { by: String },
+    Deprecated {
+        by: String,
+    },
+    Superseded {
+        by: String,
+    },
     Archived,
-}
-
-impl Default for NoteStatus {
-    fn default() -> Self {
-        NoteStatus::Active
-    }
 }

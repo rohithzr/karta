@@ -1,6 +1,6 @@
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -38,11 +38,15 @@ pub async fn register_client(
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(|| ServerError::Unauthorized(
-                "Registration requires Authorization: Bearer <token>".to_string(),
-            ))?;
+            .ok_or_else(|| {
+                ServerError::Unauthorized(
+                    "Registration requires Authorization: Bearer <token>".to_string(),
+                )
+            })?;
         if provided != expected_token {
-            return Err(ServerError::Unauthorized("Invalid registration token".to_string()));
+            return Err(ServerError::Unauthorized(
+                "Invalid registration token".to_string(),
+            ));
         }
     }
 
@@ -66,15 +70,12 @@ pub async fn register_client(
         }
     }
 
-    let auth_method = req
-        .token_endpoint_auth_method
-        .as_deref()
-        .unwrap_or("none");
+    let auth_method = req.token_endpoint_auth_method.as_deref().unwrap_or("none");
 
     if auth_method != "none" && auth_method != "client_secret_post" {
-        return Err(ServerError::BadRequest(
-            format!("Unsupported token_endpoint_auth_method: {auth_method}. Supported: none, client_secret_post")
-        ));
+        return Err(ServerError::BadRequest(format!(
+            "Unsupported token_endpoint_auth_method: {auth_method}. Supported: none, client_secret_post"
+        )));
     }
 
     let client_id = uuid::Uuid::new_v4().to_string();

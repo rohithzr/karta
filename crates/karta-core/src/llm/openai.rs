@@ -109,18 +109,16 @@ fn build_messages(messages: &[ChatMessage]) -> Vec<ChatCompletionRequestMessage>
     messages
         .iter()
         .map(|m| match m.role {
-            Role::System => ChatCompletionRequestMessage::System(
-                ChatCompletionRequestSystemMessage {
+            Role::System => {
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                     content: m.content.clone().into(),
                     name: None,
-                },
-            ),
-            Role::User => ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessage {
-                    content: m.content.clone().into(),
-                    name: None,
-                },
-            ),
+                })
+            }
+            Role::User => ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: m.content.clone().into(),
+                name: None,
+            }),
             Role::Assistant => ChatCompletionRequestMessage::Assistant(
                 async_openai::types::ChatCompletionRequestAssistantMessage {
                     content: Some(m.content.clone().into()),
@@ -136,9 +134,7 @@ fn build_chat_request(
     messages: Vec<ChatCompletionRequestMessage>,
     config: &GenConfig,
 ) -> std::result::Result<async_openai::types::CreateChatCompletionRequest, KartaError> {
-    use async_openai::types::{
-        ResponseFormat, ResponseFormatJsonSchema,
-    };
+    use async_openai::types::{ResponseFormat, ResponseFormatJsonSchema};
 
     let mut builder = CreateChatCompletionRequestArgs::default();
     builder
@@ -257,10 +253,7 @@ impl LlmProvider for OpenAiProvider {
                 .and_then(|c| c.message.content.clone())
                 .unwrap_or_default();
 
-            let tokens_used = response
-                .usage
-                .map(|u| u.total_tokens as u64)
-                .unwrap_or(0);
+            let tokens_used = response.usage.map(|u| u.total_tokens as u64).unwrap_or(0);
 
             Ok(ChatResponse {
                 content,

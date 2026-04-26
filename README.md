@@ -157,12 +157,17 @@ karta/
 # Run tests (mock LLM, no API keys needed)
 cargo test
 
+# Run synthetic memory evals (zero API keys, deterministic)
+cargo test -p karta-core --test synthetic_memory_eval
+
 # Run real eval (requires .env credentials)
 cargo test --test real_eval -- --ignored --nocapture
 
 # Run BEAM benchmark
 BEAM_DATASET_PATH=data/beam-100k.json cargo test --test beam_100k beam_100k_single -- --ignored --nocapture
 ```
+
+CI gates on every PR: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo nextest run --workspace --no-fail-fast`.
 
 ## Documentation
 

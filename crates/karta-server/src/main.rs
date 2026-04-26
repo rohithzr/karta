@@ -10,14 +10,13 @@ mod state;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::http::{Method, HeaderValue, header};
+use axum::http::{HeaderValue, Method, header};
 use axum::routing::{get, post};
-use tower_http::cors::{CorsLayer, AllowOrigin, Any as CorsAny};
-use tower_http::trace::TraceLayer;
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpService, StreamableHttpServerConfig,
-    session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
+use tower_http::cors::{AllowOrigin, Any as CorsAny, CorsLayer};
+use tower_http::trace::TraceLayer;
 
 use config::ServerConfig;
 use db::AuthDb;
@@ -138,12 +137,11 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|u| u.host_str().map(String::from))
             .unwrap_or_else(|| "localhost".to_string());
 
-        let mcp_config = StreamableHttpServerConfig::default()
-            .with_allowed_hosts([
-                "localhost".to_string(),
-                "127.0.0.1".to_string(),
-                allowed_host,
-            ]);
+        let mcp_config = StreamableHttpServerConfig::default().with_allowed_hosts([
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            allowed_host,
+        ]);
 
         let base_url = config.base_url.clone();
         let mcp_service: StreamableHttpService<mcp::KartaService, LocalSessionManager> =

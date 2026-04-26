@@ -40,20 +40,17 @@ impl WriteEngine {
         let preview_end = {
             let max = 60;
             let mut end = content.len().min(max);
-            while end > 0 && !content.is_char_boundary(end) { end -= 1; }
+            while end > 0 && !content.is_char_boundary(end) {
+                end -= 1;
+            }
             end
         };
         info!("Adding note: \"{}...\"", &content[..preview_end]);
 
         // 1. Generate attributes + embed raw content in parallel
         let content_owned = content.to_string();
-        let embed_fut = async {
-            self.llm.embed(&[&content_owned]).await
-        };
-        let (attrs, raw_embeddings) = tokio::join!(
-            self.generate_attributes(content),
-            embed_fut
-        );
+        let embed_fut = async { self.llm.embed(&[&content_owned]).await };
+        let (attrs, raw_embeddings) = tokio::join!(self.generate_attributes(content), embed_fut);
         let attrs = attrs?;
         let raw_embedding = raw_embeddings?.into_iter().next().unwrap_or_default();
         debug!(context = %attrs.context, "Generated attributes");
@@ -71,12 +68,7 @@ impl WriteEngine {
             .await?;
 
         // 4. Compute enriched embedding for storage (content + context + keywords)
-        let embedding_text = format!(
-            "{} {} {}",
-            content,
-            note.context,
-            note.keywords.join(" ")
-        );
+        let embedding_text = format!("{} {} {}", content, note.context, note.keywords.join(" "));
         let enriched_embeddings = self.llm.embed(&[&embedding_text]).await?;
         note.embedding = enriched_embeddings.into_iter().next().unwrap_or_default();
 
@@ -89,7 +81,8 @@ impl WriteEngine {
 
         // 5. LLM decides which candidates to link
         let link_decisions = if !candidates.is_empty() {
-            self.decide_links(content, &note.context, &candidates).await?
+            self.decide_links(content, &note.context, &candidates)
+                .await?
         } else {
             Vec::new()
         };
@@ -101,10 +94,8 @@ impl WriteEngine {
             for decision in &link_decisions {
                 if let Some(existing) = self.vector_store.get(&decision.note_id).await? {
                     // Check evolution count — skip if over threshold (needs consolidation instead)
-                    let evolution_history = self
-                        .graph_store
-                        .get_evolution_history(&existing.id)
-                        .await?;
+                    let evolution_history =
+                        self.graph_store.get_evolution_history(&existing.id).await?;
 
                     if evolution_history.len() >= self.config.max_evolutions_per_note {
                         debug!(
@@ -180,15 +171,19 @@ impl WriteEngine {
 
         // 10. Store atomic facts (each with its own embedding for fine-grained retrieval)
         if !attrs.atomic_facts.is_empty() {
-            let fact_texts: Vec<&str> = attrs.atomic_facts.iter()
+            let fact_texts: Vec<&str> = attrs
+                .atomic_facts
+                .iter()
                 .take(self.config.max_facts_per_note)
                 .map(|f| f.content.as_str())
                 .collect();
 
             match self.llm.embed(&fact_texts).await {
                 Ok(fact_embeddings) => {
-                    for (i, (extraction, embedding)) in attrs.atomic_facts.iter()
-                        .take(5)
+                    for (i, (extraction, embedding)) in attrs
+                        .atomic_facts
+                        .iter()
+                        .take(fact_texts.len())
                         .zip(fact_embeddings)
                         .enumerate()
                     {
@@ -202,9 +197,10 @@ impl WriteEngine {
                         fact.created_at = note.created_at;
 
                         let _ = self.vector_store.upsert_fact(&fact).await;
-                        let _ = self.graph_store.record_fact(
-                            &fact.id, &note.id, i as u32, fact.subject.as_deref()
-                        ).await;
+                        let _ = self
+                            .graph_store
+                            .record_fact(&fact.id, &note.id, i as u32, fact.subject.as_deref())
+                            .await;
                     }
                     debug!(count = fact_texts.len(), note_id = %note.id, "Stored atomic facts");
                 }
@@ -245,9 +241,7 @@ impl WriteEngine {
         let should_new_episode = match current_episode {
             None => true,
             Some(ep) => {
-                let time_gap = Utc::now()
-                    .signed_duration_since(ep.end_time)
-                    .num_seconds();
+                let time_gap = Utc::now().signed_duration_since(ep.end_time).num_seconds();
 
                 // Hard boundary: time gap exceeds threshold
                 if time_gap > self.episode_config.time_gap_threshold_secs {
@@ -267,12 +261,8 @@ impl WriteEngine {
                     if last_note_content.is_empty() {
                         false
                     } else {
-                        self.detect_episode_boundary(
-                            &last_note_content,
-                            content,
-                            time_gap,
-                        )
-                        .await?
+                        self.detect_episode_boundary(&last_note_content, content, time_gap)
+                            .await?
                     }
                 }
             }
@@ -290,9 +280,7 @@ impl WriteEngine {
             episode.topic_tags = tags;
 
             // Create narrative note
-            let narrative_note = self
-                .create_narrative_note(&narrative, &episode.id)
-                .await?;
+            let narrative_note = self.create_narrative_note(&narrative, &episode.id).await?;
             episode.narrative_note_id = Some(narrative_note.id.clone());
 
             self.graph_store.upsert_episode(&episode).await?;
@@ -308,10 +296,7 @@ impl WriteEngine {
                 .await?;
 
             // Re-synthesize narrative with all notes in the episode
-            let all_note_ids = self
-                .graph_store
-                .get_notes_for_episode(&ep.id)
-                .await?;
+            let all_note_ids = self.graph_store.get_notes_for_episode(&ep.id).await?;
             let all_refs: Vec<&str> = all_note_ids.iter().map(|s| s.as_str()).collect();
             let all_notes = self.vector_store.get_many(&all_refs).await?;
             let contents: Vec<&str> = all_notes.iter().map(|n| n.content.as_str()).collect();
@@ -325,14 +310,14 @@ impl WriteEngine {
             updated.topic_tags = tags;
 
             // Update or create narrative note
-            if let Some(ref nar_id) = updated.narrative_note_id {
-                if let Some(mut nar_note) = self.vector_store.get(nar_id).await? {
-                    nar_note.content = narrative;
-                    nar_note.updated_at = Utc::now();
-                    let emb = self.llm.embed(&[&nar_note.content]).await?;
-                    nar_note.embedding = emb.into_iter().next().unwrap_or_default();
-                    self.vector_store.upsert(&nar_note).await?;
-                }
+            if let Some(ref nar_id) = updated.narrative_note_id
+                && let Some(mut nar_note) = self.vector_store.get(nar_id).await?
+            {
+                nar_note.content = narrative;
+                nar_note.updated_at = Utc::now();
+                let emb = self.llm.embed(&[&nar_note.content]).await?;
+                nar_note.embedding = emb.into_iter().next().unwrap_or_default();
+                self.vector_store.upsert(&nar_note).await?;
             }
 
             self.graph_store.upsert_episode(&updated).await?;
@@ -364,8 +349,7 @@ impl WriteEngine {
         ];
 
         let response = self.llm.chat(&messages, &GenConfig::default()).await?;
-        let parsed: serde_json::Value =
-            serde_json::from_str(&response.content).unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(&response.content).unwrap_or_default();
 
         // If sameEpisode is false, we need a new episode
         Ok(!parsed["sameEpisode"].as_bool().unwrap_or(true))
@@ -391,8 +375,7 @@ impl WriteEngine {
         ];
 
         let response = self.llm.chat(&messages, &GenConfig::default()).await?;
-        let parsed: serde_json::Value =
-            serde_json::from_str(&response.content).unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(&response.content).unwrap_or_default();
 
         let narrative = parsed["narrative"]
             .as_str()
@@ -400,17 +383,17 @@ impl WriteEngine {
             .to_string();
         let tags = parsed["topicTags"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         Ok((narrative, tags))
     }
 
-    async fn create_narrative_note(
-        &self,
-        narrative: &str,
-        episode_id: &str,
-    ) -> Result<MemoryNote> {
+    async fn create_narrative_note(&self, narrative: &str, episode_id: &str) -> Result<MemoryNote> {
         let embeddings = self.llm.embed(&[narrative]).await?;
         let embedding = embeddings.into_iter().next().unwrap_or_default();
 
@@ -460,21 +443,25 @@ impl WriteEngine {
 
         let response = self.llm.chat(&messages, &config).await?;
 
-        let parsed: serde_json::Value =
-            serde_json::from_str(&response.content).unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(&response.content).unwrap_or_default();
 
         Ok(NoteAttributes {
-            context: parsed["context"]
-                .as_str()
-                .unwrap_or(content)
-                .to_string(),
+            context: parsed["context"].as_str().unwrap_or(content).to_string(),
             keywords: parsed["keywords"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
             tags: parsed["tags"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
             foresight_signals: parsed["foresight_signals"]
                 .as_array()
@@ -491,9 +478,7 @@ impl WriteEngine {
                             } else {
                                 Some(crate::note::ForesightExtraction {
                                     content: v["content"].as_str()?.to_string(),
-                                    valid_until: v["valid_until"]
-                                        .as_str()
-                                        .map(String::from),
+                                    valid_until: v["valid_until"].as_str().map(String::from),
                                 })
                             }
                         })
@@ -551,8 +536,7 @@ impl WriteEngine {
 
         let response = self.llm.chat(&messages, &GenConfig::default()).await?;
 
-        let parsed: serde_json::Value =
-            serde_json::from_str(&response.content).unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(&response.content).unwrap_or_default();
 
         let links = parsed["links"]
             .as_array()
@@ -596,8 +580,7 @@ impl WriteEngine {
 
         let response = self.llm.chat(&messages, &GenConfig::default()).await?;
 
-        let parsed: serde_json::Value =
-            serde_json::from_str(&response.content).unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(&response.content).unwrap_or_default();
 
         Ok(parsed["updatedContext"]
             .as_str()
