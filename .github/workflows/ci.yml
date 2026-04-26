@@ -48,12 +48,11 @@ jobs:
       # tree has pre-existing style drift that will be cleaned up in a
       # dedicated PR. For now, these run as informational checks so we at
       # least surface regressions without blocking on the historical debt.
-      - name: rustfmt (informational)
-        run: cargo fmt --all -- --check || echo "::warning::fmt drift detected; not blocking CI yet"
+      - name: rustfmt
+        run: cargo fmt --all -- --check
 
-      - name: clippy (informational)
-        run: cargo clippy --workspace --all-targets 2>&1 | tee clippy.log
-        # No -D warnings yet; see above.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: build
         run: cargo build --workspace --all-targets
@@ -65,3 +64,6 @@ jobs:
           # real Azure OpenAI + Jina credentials. CI never runs them. Only the
           # unit tests + mock-LLM integration tests execute here.
           KARTA_CI: "1"
+
+      - name: synthetic memory eval
+        run: cargo test -p karta-core --test synthetic_memory_eval
