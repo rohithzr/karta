@@ -37,13 +37,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use karta_core::Karta;
 use karta_core::config::KartaConfig;
+use karta_core::llm::LlmProvider;
 use karta_core::llm::MockLlmProvider;
 use karta_core::store::lance::LanceVectorStore;
 use karta_core::store::sqlite::SqliteGraphStore;
 use karta_core::store::{GraphStore, VectorStore};
-use karta_core::llm::LlmProvider;
-use karta_core::Karta;
 
 // ---------------------------------------------------------------------------
 // Data structures (aligned with BEAM's format)
@@ -160,16 +160,14 @@ fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 /// Normalize unicode dashes/quotes to ASCII equivalents for matching.
 fn normalize_for_matching(s: &str) -> String {
     s.to_lowercase()
-        .replace('\u{2010}', "-") // hyphen
-        .replace('\u{2011}', "-") // non-breaking hyphen
-        .replace('\u{2012}', "-") // figure dash
-        .replace('\u{2013}', "-") // en dash
-        .replace('\u{2014}', "-") // em dash
-        .replace('\u{2015}', "-") // horizontal bar
-        .replace('\u{2018}', "'") // left single quote
-        .replace('\u{2019}', "'") // right single quote
-        .replace('\u{201C}', "\"") // left double quote
-        .replace('\u{201D}', "\"") // right double quote
+        .replace(
+            [
+                '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}',
+            ],
+            "-",
+        ) // dash and hyphen-like characters
+        .replace(['\u{2018}', '\u{2019}'], "'") // left and right single quotes
+        .replace(['\u{201C}', '\u{201D}'], "\"") // left and right double quotes
 }
 
 /// Check if `answer` contains at least one alternative from a `|`-separated pattern.
@@ -218,24 +216,23 @@ async fn ingest_sessions(karta: &Karta, sessions: &[Session]) -> usize {
 }
 
 fn data_dir(prefix: &str, scenario_name: &str) -> String {
-    format!(
-        "/tmp/karta-{}-{}",
+    let dir_name = format!(
+        "karta-{}-{}",
         prefix,
-        scenario_name
-            .replace(' ', "-")
-            .replace('/', "-")
-            .to_lowercase()
-    )
+        scenario_name.replace([' ', '/'], "-").to_lowercase()
+    );
+    std::env::temp_dir()
+        .join(dir_name)
+        .to_string_lossy()
+        .into_owned()
 }
 
 async fn create_karta_mock(scenario_name: &str) -> Karta {
     let dir = data_dir("beam-mock", scenario_name);
     let _ = std::fs::remove_dir_all(&dir);
 
-    let vector_store = Arc::new(LanceVectorStore::new(&dir).await.unwrap())
-        as Arc<dyn VectorStore>;
-    let graph_store =
-        Arc::new(SqliteGraphStore::new(&dir).unwrap()) as Arc<dyn GraphStore>;
+    let vector_store = Arc::new(LanceVectorStore::new(&dir).await.unwrap()) as Arc<dyn VectorStore>;
+    let graph_store = Arc::new(SqliteGraphStore::new(&dir).unwrap()) as Arc<dyn GraphStore>;
     let llm = Arc::new(MockLlmProvider::new()) as Arc<dyn LlmProvider>;
 
     let mut config = KartaConfig::default();
@@ -273,13 +270,34 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 session_id: 1,
                 label: "2025-03-10",
                 messages: vec![
-                    Message { role: "user", content: "I just hired Elena Vasquez as our new VP of Engineering. She's coming from Stripe where she led the payments infrastructure team." },
-                    Message { role: "assistant", content: "Great hire! What's her start date?" },
-                    Message { role: "user", content: "She starts April 1st. Her first project will be migrating our monolith to microservices." },
-                    Message { role: "assistant", content: "Makes sense given her infrastructure background." },
-                    Message { role: "user", content: "Elena's team will be 12 engineers. She wants to use Kubernetes on GCP, not AWS — she had bad experiences with EKS at Stripe." },
-                    Message { role: "assistant", content: "Noted. GCP + GKE it is." },
-                    Message { role: "user", content: "Budget for the migration is $2.4M over 18 months. Elena has full authority on technical decisions." },
+                    Message {
+                        role: "user",
+                        content: "I just hired Elena Vasquez as our new VP of Engineering. She's coming from Stripe where she led the payments infrastructure team.",
+                    },
+                    Message {
+                        role: "assistant",
+                        content: "Great hire! What's her start date?",
+                    },
+                    Message {
+                        role: "user",
+                        content: "She starts April 1st. Her first project will be migrating our monolith to microservices.",
+                    },
+                    Message {
+                        role: "assistant",
+                        content: "Makes sense given her infrastructure background.",
+                    },
+                    Message {
+                        role: "user",
+                        content: "Elena's team will be 12 engineers. She wants to use Kubernetes on GCP, not AWS — she had bad experiences with EKS at Stripe.",
+                    },
+                    Message {
+                        role: "assistant",
+                        content: "Noted. GCP + GKE it is.",
+                    },
+                    Message {
+                        role: "user",
+                        content: "Budget for the migration is $2.4M over 18 months. Elena has full authority on technical decisions.",
+                    },
                 ],
             }],
             questions: vec![
@@ -303,7 +321,6 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 },
             ],
         },
-
         // --- 2. Cross-session reasoning + Multi-hop ---
         BeamScenario {
             name: "Cross-session multi-hop reasoning",
@@ -312,27 +329,54 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                     session_id: 1,
                     label: "2025-01-10",
                     messages: vec![
-                        Message { role: "user", content: "Our data warehouse is on Snowflake. We're paying $8K/month and growing 20% quarter over quarter." },
-                        Message { role: "assistant", content: "That's solid growth. Any cost concerns?" },
-                        Message { role: "user", content: "Not yet, but our CFO Rachel wants a cost projection for the next 12 months." },
+                        Message {
+                            role: "user",
+                            content: "Our data warehouse is on Snowflake. We're paying $8K/month and growing 20% quarter over quarter.",
+                        },
+                        Message {
+                            role: "assistant",
+                            content: "That's solid growth. Any cost concerns?",
+                        },
+                        Message {
+                            role: "user",
+                            content: "Not yet, but our CFO Rachel wants a cost projection for the next 12 months.",
+                        },
                     ],
                 },
                 Session {
                     session_id: 2,
                     label: "2025-02-15",
                     messages: vec![
-                        Message { role: "user", content: "We just signed a deal with MegaCorp — they'll send us 50GB of event data daily starting March 1." },
-                        Message { role: "assistant", content: "That's a lot of data. Will your Snowflake setup handle it?" },
-                        Message { role: "user", content: "That's exactly what I'm worried about. The MegaCorp data needs to be queryable within 4 hours of arrival." },
+                        Message {
+                            role: "user",
+                            content: "We just signed a deal with MegaCorp — they'll send us 50GB of event data daily starting March 1.",
+                        },
+                        Message {
+                            role: "assistant",
+                            content: "That's a lot of data. Will your Snowflake setup handle it?",
+                        },
+                        Message {
+                            role: "user",
+                            content: "That's exactly what I'm worried about. The MegaCorp data needs to be queryable within 4 hours of arrival.",
+                        },
                     ],
                 },
                 Session {
                     session_id: 3,
                     label: "2025-03-05",
                     messages: vec![
-                        Message { role: "user", content: "Snowflake costs jumped to $18K this month after the MegaCorp data started flowing. Rachel is not happy." },
-                        Message { role: "assistant", content: "That's more than double. What changed?" },
-                        Message { role: "user", content: "The auto-scaling warehouses are running hot processing the MegaCorp ingestion. We need a cheaper approach." },
+                        Message {
+                            role: "user",
+                            content: "Snowflake costs jumped to $18K this month after the MegaCorp data started flowing. Rachel is not happy.",
+                        },
+                        Message {
+                            role: "assistant",
+                            content: "That's more than double. What changed?",
+                        },
+                        Message {
+                            role: "user",
+                            content: "The auto-scaling warehouses are running hot processing the MegaCorp ingestion. We need a cheaper approach.",
+                        },
                     ],
                 },
             ],
@@ -351,7 +395,6 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 },
             ],
         },
-
         // --- 3. Temporal reasoning ---
         BeamScenario {
             name: "Temporal ordering and awareness",
@@ -359,23 +402,26 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 Session {
                     session_id: 1,
                     label: "2025-01-05",
-                    messages: vec![
-                        Message { role: "user", content: "We decided to use PostgreSQL as our primary database. The team evaluated MongoDB and Postgres and chose Postgres for ACID compliance." },
-                    ],
+                    messages: vec![Message {
+                        role: "user",
+                        content: "We decided to use PostgreSQL as our primary database. The team evaluated MongoDB and Postgres and chose Postgres for ACID compliance.",
+                    }],
                 },
                 Session {
                     session_id: 2,
                     label: "2025-02-20",
-                    messages: vec![
-                        Message { role: "user", content: "We're hitting performance issues with PostgreSQL on our analytics queries. Looking at adding a read replica." },
-                    ],
+                    messages: vec![Message {
+                        role: "user",
+                        content: "We're hitting performance issues with PostgreSQL on our analytics queries. Looking at adding a read replica.",
+                    }],
                 },
                 Session {
                     session_id: 3,
                     label: "2025-03-15",
-                    messages: vec![
-                        Message { role: "user", content: "We've decided to move analytics workloads off Postgres entirely. We'll use ClickHouse for analytics and keep Postgres for OLTP only." },
-                    ],
+                    messages: vec![Message {
+                        role: "user",
+                        content: "We've decided to move analytics workloads off Postgres entirely. We'll use ClickHouse for analytics and keep Postgres for OLTP only.",
+                    }],
                 },
             ],
             questions: vec![
@@ -399,7 +445,6 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 },
             ],
         },
-
         // --- 4. Contradiction resolution ---
         BeamScenario {
             name: "Contradiction detection and resolution",
@@ -408,18 +453,36 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                     session_id: 1,
                     label: "2025-01-20",
                     messages: vec![
-                        Message { role: "user", content: "Our security policy requires all data to be encrypted at rest using AES-256. No exceptions — the CISO signed off on this." },
-                        Message { role: "assistant", content: "Clear. AES-256 at rest, no exceptions." },
-                        Message { role: "user", content: "We also require all API traffic to go through our API gateway. Direct service-to-service calls over the public internet are banned." },
+                        Message {
+                            role: "user",
+                            content: "Our security policy requires all data to be encrypted at rest using AES-256. No exceptions — the CISO signed off on this.",
+                        },
+                        Message {
+                            role: "assistant",
+                            content: "Clear. AES-256 at rest, no exceptions.",
+                        },
+                        Message {
+                            role: "user",
+                            content: "We also require all API traffic to go through our API gateway. Direct service-to-service calls over the public internet are banned.",
+                        },
                     ],
                 },
                 Session {
                     session_id: 2,
                     label: "2025-03-01",
                     messages: vec![
-                        Message { role: "user", content: "The new CTO says we can relax encryption to AES-128 for non-PII data to save on compute costs. PII data stays AES-256." },
-                        Message { role: "assistant", content: "That contradicts the earlier blanket AES-256 policy." },
-                        Message { role: "user", content: "Yes, the CTO overrode the CISO on this. The updated policy is AES-128 for non-PII, AES-256 for PII." },
+                        Message {
+                            role: "user",
+                            content: "The new CTO says we can relax encryption to AES-128 for non-PII data to save on compute costs. PII data stays AES-256.",
+                        },
+                        Message {
+                            role: "assistant",
+                            content: "That contradicts the earlier blanket AES-256 policy.",
+                        },
+                        Message {
+                            role: "user",
+                            content: "Yes, the CTO overrode the CISO on this. The updated policy is AES-128 for non-PII, AES-256 for PII.",
+                        },
                     ],
                 },
             ],
@@ -438,7 +501,6 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 },
             ],
         },
-
         // --- 5. Preference following ---
         BeamScenario {
             name: "Evolving user preferences",
@@ -446,23 +508,26 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 Session {
                     session_id: 1,
                     label: "2025-01-10",
-                    messages: vec![
-                        Message { role: "user", content: "I prefer getting status updates via email. Send me a daily digest every morning at 9am." },
-                    ],
+                    messages: vec![Message {
+                        role: "user",
+                        content: "I prefer getting status updates via email. Send me a daily digest every morning at 9am.",
+                    }],
                 },
                 Session {
                     session_id: 2,
                     label: "2025-02-05",
-                    messages: vec![
-                        Message { role: "user", content: "Actually, email is too slow. Switch all my notifications to Slack. Use the #ops-alerts channel." },
-                    ],
+                    messages: vec![Message {
+                        role: "user",
+                        content: "Actually, email is too slow. Switch all my notifications to Slack. Use the #ops-alerts channel.",
+                    }],
                 },
                 Session {
                     session_id: 3,
                     label: "2025-03-01",
-                    messages: vec![
-                        Message { role: "user", content: "Keep Slack for urgent alerts only. For routine status updates, go back to email but make it a weekly digest on Mondays." },
-                    ],
+                    messages: vec![Message {
+                        role: "user",
+                        content: "Keep Slack for urgent alerts only. For routine status updates, go back to email but make it a weekly digest on Mondays.",
+                    }],
                 },
             ],
             questions: vec![
@@ -480,7 +545,6 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 },
             ],
         },
-
         // --- 6. Instruction following ---
         BeamScenario {
             name: "Sustained instruction adherence",
@@ -489,17 +553,27 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                     session_id: 1,
                     label: "",
                     messages: vec![
-                        Message { role: "user", content: "Important rule: never suggest deploying to production on Fridays. Our change freeze runs Friday 3pm through Monday 8am." },
-                        Message { role: "assistant", content: "Understood. No Friday deploys." },
-                        Message { role: "user", content: "Also, always recommend staging environment testing before any production deployment. This is non-negotiable." },
+                        Message {
+                            role: "user",
+                            content: "Important rule: never suggest deploying to production on Fridays. Our change freeze runs Friday 3pm through Monday 8am.",
+                        },
+                        Message {
+                            role: "assistant",
+                            content: "Understood. No Friday deploys.",
+                        },
+                        Message {
+                            role: "user",
+                            content: "Also, always recommend staging environment testing before any production deployment. This is non-negotiable.",
+                        },
                     ],
                 },
                 Session {
                     session_id: 2,
                     label: "",
-                    messages: vec![
-                        Message { role: "user", content: "We have a critical bug fix for the payment system. It's Thursday evening and the fix is ready. When should we deploy?" },
-                    ],
+                    messages: vec![Message {
+                        role: "user",
+                        content: "We have a critical bug fix for the payment system. It's Thursday evening and the fix is ready. When should we deploy?",
+                    }],
                 },
             ],
             questions: vec![
@@ -517,7 +591,6 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 },
             ],
         },
-
         // --- 7. Entity tracking across sessions ---
         BeamScenario {
             name: "Entity tracking across sessions",
@@ -526,26 +599,45 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                     session_id: 1,
                     label: "2025-01-15",
                     messages: vec![
-                        Message { role: "user", content: "Our client Nexus Corp has 3 active projects with us: Project Alpha (data pipeline), Project Beta (ML platform), and Project Gamma (dashboard)." },
-                        Message { role: "assistant", content: "Got it, 3 Nexus projects tracked." },
-                        Message { role: "user", content: "Project Alpha's lead is Tom Chen. Budget: $500K. Deadline: March 30." },
+                        Message {
+                            role: "user",
+                            content: "Our client Nexus Corp has 3 active projects with us: Project Alpha (data pipeline), Project Beta (ML platform), and Project Gamma (dashboard).",
+                        },
+                        Message {
+                            role: "assistant",
+                            content: "Got it, 3 Nexus projects tracked.",
+                        },
+                        Message {
+                            role: "user",
+                            content: "Project Alpha's lead is Tom Chen. Budget: $500K. Deadline: March 30.",
+                        },
                     ],
                 },
                 Session {
                     session_id: 2,
                     label: "2025-02-10",
                     messages: vec![
-                        Message { role: "user", content: "Project Beta at Nexus Corp just got cancelled. Budget was reallocated to Project Alpha, which now has $750K." },
-                        Message { role: "assistant", content: "Noted. Beta cancelled, Alpha budget increased." },
-                        Message { role: "user", content: "Also, Tom Chen moved to Project Gamma. The new Alpha lead is Priya Sharma." },
+                        Message {
+                            role: "user",
+                            content: "Project Beta at Nexus Corp just got cancelled. Budget was reallocated to Project Alpha, which now has $750K.",
+                        },
+                        Message {
+                            role: "assistant",
+                            content: "Noted. Beta cancelled, Alpha budget increased.",
+                        },
+                        Message {
+                            role: "user",
+                            content: "Also, Tom Chen moved to Project Gamma. The new Alpha lead is Priya Sharma.",
+                        },
                     ],
                 },
                 Session {
                     session_id: 3,
                     label: "2025-03-01",
-                    messages: vec![
-                        Message { role: "user", content: "Project Alpha at Nexus Corp was delivered on time. Nexus is very happy. They want to expand Gamma's scope." },
-                    ],
+                    messages: vec![Message {
+                        role: "user",
+                        content: "Project Alpha at Nexus Corp was delivered on time. Nexus is very happy. They want to expand Gamma's scope.",
+                    }],
                 },
             ],
             questions: vec![
@@ -569,7 +661,6 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 },
             ],
         },
-
         // --- 8. Abstention (unanswerable questions) ---
         BeamScenario {
             name: "Abstention on unknown information",
@@ -577,9 +668,18 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 session_id: 1,
                 label: "",
                 messages: vec![
-                    Message { role: "user", content: "Our vendor for cloud hosting is AWS. We pay them about $45K/month." },
-                    Message { role: "assistant", content: "Got it." },
-                    Message { role: "user", content: "The DevOps team lead is Kai Nakamura. He manages 5 engineers." },
+                    Message {
+                        role: "user",
+                        content: "Our vendor for cloud hosting is AWS. We pay them about $45K/month.",
+                    },
+                    Message {
+                        role: "assistant",
+                        content: "Got it.",
+                    },
+                    Message {
+                        role: "user",
+                        content: "The DevOps team lead is Kai Nakamura. He manages 5 engineers.",
+                    },
                 ],
             }],
             questions: vec![
@@ -604,7 +704,6 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 },
             ],
         },
-
         // --- 9. Summarization ---
         BeamScenario {
             name: "Summarization across sessions",
@@ -612,63 +711,92 @@ fn beam_scenarios() -> Vec<BeamScenario> {
                 Session {
                     session_id: 1,
                     label: "2025-01-05",
-                    messages: vec![
-                        Message { role: "user", content: "We launched the customer portal v2 today. Key features: SSO integration, real-time usage dashboard, and self-service billing." },
-                    ],
+                    messages: vec![Message {
+                        role: "user",
+                        content: "We launched the customer portal v2 today. Key features: SSO integration, real-time usage dashboard, and self-service billing.",
+                    }],
                 },
                 Session {
                     session_id: 2,
                     label: "2025-01-20",
-                    messages: vec![
-                        Message { role: "user", content: "Portal v2 bug reports are coming in. The SSO flow breaks on Safari, and the billing page shows wrong currency for EU customers." },
-                    ],
+                    messages: vec![Message {
+                        role: "user",
+                        content: "Portal v2 bug reports are coming in. The SSO flow breaks on Safari, and the billing page shows wrong currency for EU customers.",
+                    }],
                 },
                 Session {
                     session_id: 3,
                     label: "2025-02-10",
-                    messages: vec![
-                        Message { role: "user", content: "Fixed the Safari SSO bug. The billing currency issue is still open — waiting on the payments team to expose a locale API." },
-                    ],
+                    messages: vec![Message {
+                        role: "user",
+                        content: "Fixed the Safari SSO bug. The billing currency issue is still open — waiting on the payments team to expose a locale API.",
+                    }],
                 },
                 Session {
                     session_id: 4,
                     label: "2025-03-01",
-                    messages: vec![
-                        Message { role: "user", content: "Portal v2 is now stable. All bugs resolved. Customer satisfaction score went from 3.2 to 4.5 after the fixes." },
-                    ],
+                    messages: vec![Message {
+                        role: "user",
+                        content: "Portal v2 is now stable. All bugs resolved. Customer satisfaction score went from 3.2 to 4.5 after the fixes.",
+                    }],
                 },
             ],
-            questions: vec![
-                BeamQuestion {
-                    question: "Summarize the customer portal v2 journey from launch to stabilization.",
-                    ability: BeamAbility::Summarization,
-                    must_contain: vec!["SSO|portal", "bug|issue", "stable|fixed|resolved"],
-                    expects_abstention: false,
-                },
-            ],
+            questions: vec![BeamQuestion {
+                question: "Summarize the customer portal v2 journey from launch to stabilization.",
+                ability: BeamAbility::Summarization,
+                must_contain: vec!["SSO|portal", "bug|issue", "stable|fixed|resolved"],
+                expects_abstention: false,
+            }],
         },
-
         // --- 10. Token efficiency scenario (many messages, few relevant) ---
         BeamScenario {
             name: "Token efficiency under noise",
-            sessions: vec![
-                Session {
-                    session_id: 1,
-                    label: "",
-                    messages: vec![
-                        Message { role: "user", content: "The marketing team wants to try TikTok ads for Q2. Budget: $15K." },
-                        Message { role: "user", content: "Lunch order for the team meeting: 10 pizzas from Mario's." },
-                        Message { role: "user", content: "Reminder: office party next Friday at 5pm." },
-                        Message { role: "user", content: "CRITICAL: Our database backup job has been failing silently for 3 weeks. Last successful backup was February 28." },
-                        Message { role: "user", content: "New coffee machine in the break room. It's a Breville Barista Express." },
-                        Message { role: "user", content: "IT ticket #4521: Replace the projector in conference room B." },
-                        Message { role: "user", content: "CRITICAL: The backup failure means we have no point-in-time recovery capability. RTO is currently infinite." },
-                        Message { role: "user", content: "Company retreat is scheduled for June 15-17 in Lake Tahoe." },
-                        Message { role: "user", content: "The backup runs on a cron job at 2am. The job's S3 credential expired and nobody rotated it." },
-                        Message { role: "user", content: "Fantasy football draft is Thursday. Don't forget to set your lineups." },
-                    ],
-                },
-            ],
+            sessions: vec![Session {
+                session_id: 1,
+                label: "",
+                messages: vec![
+                    Message {
+                        role: "user",
+                        content: "The marketing team wants to try TikTok ads for Q2. Budget: $15K.",
+                    },
+                    Message {
+                        role: "user",
+                        content: "Lunch order for the team meeting: 10 pizzas from Mario's.",
+                    },
+                    Message {
+                        role: "user",
+                        content: "Reminder: office party next Friday at 5pm.",
+                    },
+                    Message {
+                        role: "user",
+                        content: "CRITICAL: Our database backup job has been failing silently for 3 weeks. Last successful backup was February 28.",
+                    },
+                    Message {
+                        role: "user",
+                        content: "New coffee machine in the break room. It's a Breville Barista Express.",
+                    },
+                    Message {
+                        role: "user",
+                        content: "IT ticket #4521: Replace the projector in conference room B.",
+                    },
+                    Message {
+                        role: "user",
+                        content: "CRITICAL: The backup failure means we have no point-in-time recovery capability. RTO is currently infinite.",
+                    },
+                    Message {
+                        role: "user",
+                        content: "Company retreat is scheduled for June 15-17 in Lake Tahoe.",
+                    },
+                    Message {
+                        role: "user",
+                        content: "The backup runs on a cron job at 2am. The job's S3 credential expired and nobody rotated it.",
+                    },
+                    Message {
+                        role: "user",
+                        content: "Fantasy football draft is Thursday. Don't forget to set your lineups.",
+                    },
+                ],
+            }],
             questions: vec![
                 BeamQuestion {
                     question: "What is the critical infrastructure issue and what caused it?",
@@ -742,16 +870,8 @@ async fn run_beam_benchmark(scenarios: &[BeamScenario], use_real_llm: bool) -> B
             metrics.query_latencies_ms.push(query_ms);
             report.total_query_ms += query_ms;
 
-            println!(
-                "\n  [{}] Q: {}",
-                q.ability.as_str(),
-                q.question
-            );
-            println!(
-                "  A ({}ms): {}...",
-                query_ms,
-                safe_truncate(&answer, 200)
-            );
+            println!("\n  [{}] Q: {}", q.ability.as_str(), q.question);
+            println!("  A ({}ms): {}...", query_ms, safe_truncate(&answer, 200));
 
             let mut question_passed = true;
 
@@ -761,9 +881,7 @@ async fn run_beam_benchmark(scenarios: &[BeamScenario], use_real_llm: bool) -> B
                 // With MockLlm this is hard to test precisely, so we just
                 // track it as a pass if the answer is short or hedging.
                 metrics.checks_total += 1;
-                let entry = ability_map
-                    .entry(q.ability)
-                    .or_insert((0, 0));
+                let entry = ability_map.entry(q.ability).or_insert((0, 0));
                 entry.1 += 1;
 
                 let lower = answer.to_lowercase();
@@ -784,9 +902,7 @@ async fn run_beam_benchmark(scenarios: &[BeamScenario], use_real_llm: bool) -> B
             } else {
                 for pattern in &q.must_contain {
                     metrics.checks_total += 1;
-                    let entry = ability_map
-                        .entry(q.ability)
-                        .or_insert((0, 0));
+                    let entry = ability_map.entry(q.ability).or_insert((0, 0));
                     entry.1 += 1;
 
                     if check_must_contain(&answer, pattern) {
@@ -807,9 +923,7 @@ async fn run_beam_benchmark(scenarios: &[BeamScenario], use_real_llm: bool) -> B
 
         // Collect ability scores
         for (ability, (passed, total)) in &ability_map {
-            metrics
-                .ability_scores
-                .push((*ability, *passed, *total));
+            metrics.ability_scores.push((*ability, *passed, *total));
         }
 
         report.scenario_metrics.push(metrics);
@@ -893,10 +1007,7 @@ fn print_report(report: &BenchmarkReport) {
         } else {
             0.0
         };
-        println!(
-            "    {:30} {}/{} ({:.0}%)",
-            name, passed, total, rate
-        );
+        println!("    {:30} {}/{} ({:.0}%)", name, passed, total, rate);
     }
 }
 
@@ -916,10 +1027,18 @@ async fn beam_mock_sanity() {
     print_report(&report);
 
     let total_checks: usize = report.scenario_metrics.iter().map(|m| m.checks_total).sum();
-    let passed_checks: usize = report.scenario_metrics.iter().map(|m| m.checks_passed).sum();
+    let passed_checks: usize = report
+        .scenario_metrics
+        .iter()
+        .map(|m| m.checks_passed)
+        .sum();
     if total_checks > 0 {
         let rate = passed_checks as f64 / total_checks as f64;
-        assert!(rate >= 0.40, "Mock sanity pass rate {:.1}% below 40%", rate * 100.0);
+        assert!(
+            rate >= 0.40,
+            "Mock sanity pass rate {:.1}% below 40%",
+            rate * 100.0
+        );
     }
 }
 
@@ -934,11 +1053,19 @@ async fn beam_real() {
     print_report(&report);
 
     let total_checks: usize = report.scenario_metrics.iter().map(|m| m.checks_total).sum();
-    let passed_checks: usize = report.scenario_metrics.iter().map(|m| m.checks_passed).sum();
+    let passed_checks: usize = report
+        .scenario_metrics
+        .iter()
+        .map(|m| m.checks_passed)
+        .sum();
     if total_checks > 0 {
         let rate = passed_checks as f64 / total_checks as f64;
         println!("\n  REAL LLM pass rate: {:.1}%", rate * 100.0);
-        assert!(rate >= 0.70, "Real LLM pass rate {:.1}% below 70%", rate * 100.0);
+        assert!(
+            rate >= 0.70,
+            "Real LLM pass rate {:.1}% below 70%",
+            rate * 100.0
+        );
     }
 }
 
@@ -959,7 +1086,10 @@ async fn beam_real_with_dreaming() {
         })
         .collect();
 
-    println!("Running {} dream-relevant scenarios with real LLM", dream_relevant.len());
+    println!(
+        "Running {} dream-relevant scenarios with real LLM",
+        dream_relevant.len()
+    );
 
     for scenario in &dream_relevant {
         println!("\n{}", "=".repeat(70));
@@ -976,10 +1106,7 @@ async fn beam_real_with_dreaming() {
 
         // Dream
         let dream_start = Instant::now();
-        let dream_run = karta
-            .run_dreaming("benchmark", "beam")
-            .await
-            .unwrap();
+        let dream_run = karta.run_dreaming("benchmark", "beam").await.unwrap();
         let dream_ms = dream_start.elapsed().as_millis();
 
         let post_dream_count = karta.note_count().await.unwrap();
@@ -991,8 +1118,11 @@ async fn beam_real_with_dreaming() {
 
         for d in &dream_run.dreams {
             let icon = if d.would_write { "W" } else { "." };
-            println!("    [{}] {} conf={:.2}: {}",
-                icon, d.dream_type.as_str(), d.confidence,
+            println!(
+                "    [{}] {} conf={:.2}: {}",
+                icon,
+                d.dream_type.as_str(),
+                d.confidence,
                 safe_truncate(&d.dream_content, 120)
             );
         }
@@ -1000,15 +1130,8 @@ async fn beam_real_with_dreaming() {
         // Query (post-dream)
         for q in &scenario.questions {
             let answer = karta.ask(q.question, 5).await.unwrap().answer;
-            println!(
-                "\n  [{}] Q: {}",
-                q.ability.as_str(),
-                q.question
-            );
-            println!(
-                "  A: {}...",
-                safe_truncate(&answer, 300)
-            );
+            println!("\n  [{}] Q: {}", q.ability.as_str(), q.question);
+            println!("  A: {}...", safe_truncate(&answer, 300));
 
             for pattern in &q.must_contain {
                 if check_must_contain(&answer, pattern) {

@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 use crate::dream::DreamRun;
 use crate::error::{KartaError, Result};
+use crate::migrate;
 use crate::note::EvolutionRecord;
 
 pub struct SqliteGraphStore {
@@ -18,8 +19,9 @@ impl SqliteGraphStore {
 
         let conn = Connection::open(&path).map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
-        // Enable WAL mode for concurrent reads during dream writes
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        // Use DELETE journal mode for compatibility with network filesystems (e.g. GCS FUSE).
+        // WAL requires shared memory / file locking that FUSE mounts don't support.
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA foreign_keys=ON;")
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
         let store = Self {
@@ -254,9 +256,28 @@ impl crate::store::GraphStore for SqliteGraphStore {
             CREATE INDEX IF NOT EXISTS idx_ep_links_from ON episode_links(from_episode_id);
             CREATE INDEX IF NOT EXISTS idx_ep_links_to ON episode_links(to_episode_id);
             CREATE INDEX IF NOT EXISTS idx_ep_links_entity ON episode_links(entity);
+
+            -- Procedural rules (Issue #6)
+            CREATE TABLE IF NOT EXISTS procedural_rules (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                condition_json TEXT NOT NULL,
+                actions_json TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                protected INTEGER NOT NULL DEFAULT 0,
+                source_note_id TEXT,
+                fire_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_rules_enabled ON procedural_rules(enabled);
             ",
         )
         .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+
+        // Initialize schema_meta table and apply pending migrations
+        migrate::init_and_migrate(&conn)?;
 
         Ok(())
     }
@@ -1229,6 +1250,116 @@ impl crate::store::GraphStore for SqliteGraphStore {
             .query_map(rusqlite::params![entity], |row| row.get(0))
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
         Ok(ids.filter_map(|r| r.ok()).collect())
+    }
+
+    async fn get_schema_meta(&self) -> Result<crate::migrate::SchemaMeta> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        migrate::load_schema_meta(&conn)
+    }
+
+    // --- Procedural Rules ---
+
+    async fn upsert_procedural_rule(&self, rule: &crate::rules::ProceduralRule) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let condition_json =
+            serde_json::to_string(&rule.condition).map_err(KartaError::Serialization)?;
+        let actions_json =
+            serde_json::to_string(&rule.actions).map_err(KartaError::Serialization)?;
+        conn.execute(
+            "INSERT INTO procedural_rules (id, name, description, condition_json, actions_json, enabled, protected, source_note_id, fire_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(id) DO UPDATE SET
+                 name=?2, description=?3, condition_json=?4, actions_json=?5,
+                 enabled=?6, protected=?7, source_note_id=?8, fire_count=?9, updated_at=?11",
+            rusqlite::params![
+                rule.id,
+                rule.name,
+                rule.description,
+                condition_json,
+                actions_json,
+                rule.enabled as i32,
+                rule.protected as i32,
+                rule.source_note_id,
+                rule.fire_count as i64,
+                rule.created_at.to_rfc3339(),
+                rule.updated_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_procedural_rules(&self) -> Result<Vec<crate::rules::ProceduralRule>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, condition_json, actions_json, enabled, protected, source_note_id, fire_count, created_at, updated_at FROM procedural_rules ORDER BY name"
+        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let condition: crate::rules::RuleCondition =
+                    serde_json::from_str(&row.get::<_, String>(3)?)
+                        .unwrap_or(crate::rules::RuleCondition::Always);
+                let actions: Vec<crate::rules::RuleAction> =
+                    serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default();
+                let created_at = DateTime::parse_from_rfc3339(&row.get::<_, String>(9)?)
+                    .unwrap_or_default()
+                    .with_timezone(&Utc);
+                let updated_at = DateTime::parse_from_rfc3339(&row.get::<_, String>(10)?)
+                    .unwrap_or_default()
+                    .with_timezone(&Utc);
+                Ok(crate::rules::ProceduralRule {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    condition,
+                    actions,
+                    enabled: row.get::<_, i32>(5)? != 0,
+                    protected: row.get::<_, i32>(6)? != 0,
+                    source_note_id: row.get(7)?,
+                    fire_count: row.get::<_, i64>(8)? as u64,
+                    created_at,
+                    updated_at,
+                })
+            })
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    async fn disable_procedural_rule(&self, rule_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE procedural_rules SET enabled = 0, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![rule_id, now],
+        )
+        .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn increment_rule_fire_count(&self, rule_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE procedural_rules SET fire_count = fire_count + 1, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![rule_id, now],
+        )
+        .map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        Ok(())
     }
 }
 

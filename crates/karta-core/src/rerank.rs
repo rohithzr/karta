@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::Result;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Role};
@@ -110,7 +110,16 @@ impl Reranker for LlmReranker {
             .enumerate()
             .map(|(i, (note, _))| {
                 let content = if note.content.len() > 200 {
-                    format!("{}...", &note.content[..note.content.char_indices().take(200).last().map(|(i,_)|i).unwrap_or(200)])
+                    format!(
+                        "{}...",
+                        &note.content[..note
+                            .content
+                            .char_indices()
+                            .take(200)
+                            .last()
+                            .map(|(i, ch)| i + ch.len_utf8())
+                            .unwrap_or(note.content.len())]
+                    )
                 } else {
                     note.content.clone()
                 };
@@ -142,8 +151,13 @@ impl Reranker for LlmReranker {
         };
 
         let response = self.llm.chat(&messages, &config).await?;
-        let parsed: serde_json::Value =
-            serde_json::from_str(&response.content).unwrap_or_default();
+        let parsed: serde_json::Value = match serde_json::from_str(&response.content) {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(error = %e, raw_response = %response.content, "LLM reranker returned invalid JSON; using neutral fallback");
+                serde_json::Value::Null
+            }
+        };
 
         let scores: Vec<f32> = parsed["scores"]
             .as_array()
@@ -226,7 +240,15 @@ impl Reranker for JinaReranker {
             .map(|(note, _)| {
                 let content = &note.content;
                 if content.len() > 500 {
-                    format!("{}...", &content[..content.char_indices().take(500).last().map(|(i,_)|i).unwrap_or(500)])
+                    format!(
+                        "{}...",
+                        &content[..content
+                            .char_indices()
+                            .take(500)
+                            .last()
+                            .map(|(i, ch)| i + ch.len_utf8())
+                            .unwrap_or(content.len())]
+                    )
                 } else {
                     content.clone()
                 }
@@ -257,14 +279,16 @@ impl Reranker for JinaReranker {
             .map_err(|e| crate::error::KartaError::Llm(format!("Jina parse error: {}", e)))?;
 
         // Parse Jina response: results[].index + results[].relevance_score
-        let jina_results = resp_body["results"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let jina_results = resp_body["results"].as_array().ok_or_else(|| {
+            crate::error::KartaError::Llm(format!(
+                "Jina rerank response missing array field 'results': {}",
+                resp_body
+            ))
+        })?;
 
         // Build index → score map
         let mut score_map: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
-        for r in &jina_results {
+        for r in jina_results {
             let idx = r["index"].as_u64().unwrap_or(0) as usize;
             let score = r["relevance_score"].as_f64().unwrap_or(0.0) as f32;
             score_map.insert(idx, score);

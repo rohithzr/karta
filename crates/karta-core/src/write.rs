@@ -246,7 +246,7 @@ impl WriteEngine {
                     for (i, (extraction, embedding)) in attrs
                         .atomic_facts
                         .iter()
-                        .take(5)
+                        .take(fact_texts.len())
                         .zip(fact_embeddings)
                         .enumerate()
                     {
@@ -378,14 +378,14 @@ impl WriteEngine {
             updated.topic_tags = tags;
 
             // Update or create narrative note
-            if let Some(ref nar_id) = updated.narrative_note_id {
-                if let Some(mut nar_note) = self.vector_store.get(nar_id).await? {
-                    nar_note.content = narrative;
-                    nar_note.updated_at = Utc::now();
-                    let emb = self.llm.embed(&[&nar_note.content]).await?;
-                    nar_note.embedding = emb.into_iter().next().unwrap_or_default();
-                    self.vector_store.upsert(&nar_note).await?;
-                }
+            if let Some(ref nar_id) = updated.narrative_note_id
+                && let Some(mut nar_note) = self.vector_store.get(nar_id).await?
+            {
+                nar_note.content = narrative;
+                nar_note.updated_at = Utc::now();
+                let emb = self.llm.embed(&[&nar_note.content]).await?;
+                nar_note.embedding = emb.into_iter().next().unwrap_or_default();
+                self.vector_store.upsert(&nar_note).await?;
             }
 
             self.graph_store.upsert_episode(&updated).await?;

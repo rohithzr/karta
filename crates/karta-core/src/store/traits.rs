@@ -350,4 +350,29 @@ pub trait GraphStore: Send + Sync {
 
     /// Initialize tables/schema if needed.
     async fn init(&self) -> Result<()>;
+
+    /// Get current schema metadata (version, applied/pending migrations).
+    async fn get_schema_meta(&self) -> Result<crate::migrate::SchemaMeta> {
+        Ok(crate::migrate::SchemaMeta::new(
+            0,
+            Vec::new(),
+            Vec::new(),
+            vec!["Migration tracking unavailable for this graph store".to_string()],
+        ))
+    }
+
+    // --- Procedural Rules (Issue #6) ---
+
+    async fn upsert_procedural_rule(&self, _rule: &crate::rules::ProceduralRule) -> Result<()> {
+        Ok(())
+    }
+    async fn list_procedural_rules(&self) -> Result<Vec<crate::rules::ProceduralRule>> {
+        Ok(Vec::new())
+    }
+    async fn disable_procedural_rule(&self, _rule_id: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn increment_rule_fire_count(&self, _rule_id: &str) -> Result<()> {
+        Ok(())
+    }
 }

@@ -581,21 +581,20 @@ impl ReadEngine {
             let matched = tokens
                 .iter()
                 .any(|t| query_lower.contains(&t.to_lowercase()));
-            if matched {
-                if let Some(note) = self.vector_store.get(note_id).await? {
-                    if note.is_active() {
-                        let link_count = self.graph_store.get_link_count(note_id).await?;
-                        let graph_bonus = self.config.graph_weight * (1.0 + link_count as f32).ln();
-                        let score = 1.0 + graph_bonus;
-                        profile_note_ids.insert(note_id.clone());
-                        debug!(entity_id = %entity_id, score = score, "Profile auto-include");
-                        profile_results.push(SearchResult {
-                            note,
-                            score,
-                            linked_notes: Vec::new(),
-                        });
-                    }
-                }
+            if matched
+                && let Some(note) = self.vector_store.get(note_id).await?
+                && note.is_active()
+            {
+                let link_count = self.graph_store.get_link_count(note_id).await?;
+                let graph_bonus = self.config.graph_weight * (1.0 + link_count as f32).ln();
+                let score = 1.0 + graph_bonus;
+                profile_note_ids.insert(note_id.clone());
+                debug!(entity_id = %entity_id, score = score, "Profile auto-include");
+                profile_results.push(SearchResult {
+                    note,
+                    score,
+                    linked_notes: Vec::new(),
+                });
             }
         }
 
@@ -634,15 +633,14 @@ impl ReadEngine {
                 final_score += foresight_boost;
             }
 
-            if self.config.episode_retrieval_enabled {
-                if let Provenance::Episode { ref episode_id } = note.provenance {
-                    if final_score >= self.config.episode_drilldown_min_score {
-                        episode_hits.push((episode_id.clone(), final_score));
-                        continue; // Only skip flat if we're drilling down
-                    }
-                    // Below threshold: fall through to flat_hits — narrative may still be useful
-                }
+            if self.config.episode_retrieval_enabled
+                && let Provenance::Episode { ref episode_id } = note.provenance
+                && final_score >= self.config.episode_drilldown_min_score
+            {
+                episode_hits.push((episode_id.clone(), final_score));
+                continue; // Only skip flat if we're drilling down
             }
+            // Below threshold: fall through to flat_hits — narrative may still be useful
 
             flat_hits.push((note, final_score));
         }
@@ -728,22 +726,22 @@ impl ReadEngine {
             if *score < 0.3 {
                 continue;
             }
-            if seen_note_ids.insert(fact.source_note_id.clone()) {
-                if let Ok(Some(parent)) = self.vector_store.get(&fact.source_note_id).await {
-                    if parent.is_active() {
-                        // Clone the parent and prepend the matched fact text so the
-                        // synthesis LLM sees the exact value. The clone prevents
-                        // the access-tracking upsert from corrupting stored content.
-                        let mut annotated = parent.clone();
-                        annotated.content =
-                            format!("[Matched fact: {}]\n\n{}", fact.content, annotated.content);
-                        fact_expanded.push(SearchResult {
-                            note: annotated,
-                            score: score + fact_boost,
-                            linked_notes: Vec::new(),
-                        });
-                    }
-                }
+            // seen_note_ids.insert intentionally runs before self.vector_store.get and parent.is_active to preserve prior no-retry behavior.
+            if seen_note_ids.insert(fact.source_note_id.clone())
+                && let Ok(Some(parent)) = self.vector_store.get(&fact.source_note_id).await
+                && parent.is_active()
+            {
+                // Clone the parent and prepend the matched fact text so the
+                // synthesis LLM sees the exact value. The clone prevents
+                // the access-tracking upsert from corrupting stored content.
+                let mut annotated = parent.clone();
+                annotated.content =
+                    format!("[Matched fact: {}]\n\n{}", fact.content, annotated.content);
+                fact_expanded.push(SearchResult {
+                    note: annotated,
+                    score: score + fact_boost,
+                    linked_notes: Vec::new(),
+                });
             }
         }
 
@@ -759,21 +757,17 @@ impl ReadEngine {
                 for (linked_ep_id, _link_type, _entity) in &links {
                     if let Ok(Some(digest)) =
                         self.graph_store.get_episode_digest(linked_ep_id).await
+                        && let Some(ref note_id) = digest.digest_note_id
+                        // seen_note_ids.insert intentionally runs before self.vector_store.get and digest_note.is_active to preserve prior no-retry behavior.
+                        && seen_note_ids.insert(note_id.clone())
+                        && let Ok(Some(digest_note)) = self.vector_store.get(note_id).await
+                        && digest_note.is_active()
                     {
-                        if let Some(ref note_id) = digest.digest_note_id {
-                            if seen_note_ids.insert(note_id.clone()) {
-                                if let Ok(Some(digest_note)) = self.vector_store.get(note_id).await
-                                {
-                                    if digest_note.is_active() {
-                                        linked_digest_results.push(SearchResult {
-                                            note: digest_note,
-                                            score: 0.5, // Moderate score for linked digests
-                                            linked_notes: Vec::new(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
+                        linked_digest_results.push(SearchResult {
+                            note: digest_note,
+                            score: 0.5, // Moderate score for linked digests
+                            linked_notes: Vec::new(),
+                        });
                     }
                 }
             }
@@ -806,10 +800,9 @@ impl ReadEngine {
                 for entity in &digest.entities {
                     if query_lower.contains(&entity.name.to_lowercase())
                         || entity.name.to_lowercase().contains(
-                            &query_lower
+                            query_lower
                                 .split_whitespace()
-                                .filter(|w| w.len() > 3)
-                                .next()
+                                .find(|w| w.len() > 3)
                                 .unwrap_or(""),
                         )
                     {
@@ -850,20 +843,18 @@ impl ReadEngine {
                     }
                 }
 
-                if matched {
-                    if let Some(ref note_id) = digest.digest_note_id {
-                        if seen_note_ids.insert(note_id.clone()) {
-                            if let Ok(Some(digest_note)) = self.vector_store.get(note_id).await {
-                                if digest_note.is_active() {
-                                    digest_matched_results.push(SearchResult {
-                                        note: digest_note,
-                                        score: 0.8, // High score: structured match is strong signal
-                                        linked_notes: Vec::new(),
-                                    });
-                                }
-                            }
-                        }
-                    }
+                if matched
+                    && let Some(ref note_id) = digest.digest_note_id
+                    // seen_note_ids.insert intentionally runs before self.vector_store.get and digest_note.is_active to preserve prior no-retry behavior.
+                    && seen_note_ids.insert(note_id.clone())
+                    && let Ok(Some(digest_note)) = self.vector_store.get(note_id).await
+                    && digest_note.is_active()
+                {
+                    digest_matched_results.push(SearchResult {
+                        note: digest_note,
+                        score: 0.8, // High score: structured match is strong signal
+                        linked_notes: Vec::new(),
+                    });
                 }
             }
 
@@ -927,6 +918,7 @@ impl ReadEngine {
                 contradiction_injected: 0,
                 has_contradiction: false,
                 reranker_best_score: None,
+                evidence: None,
             });
         }
 
@@ -1051,6 +1043,7 @@ impl ReadEngine {
                 contradiction_injected: 0,
                 has_contradiction: false,
                 reranker_best_score: reranker_best,
+                evidence: None,
             });
         }
 
@@ -1081,12 +1074,11 @@ impl ReadEngine {
                 source_note_ids,
                 ..
             } = &note.provenance
+                && dream_type == "contradiction"
             {
-                if dream_type == "contradiction" {
-                    for sid in source_note_ids {
-                        if !seen_ids.contains(sid) {
-                            contradiction_inject_ids.insert(sid.clone());
-                        }
+                for sid in source_note_ids {
+                    if !seen_ids.contains(sid) {
+                        contradiction_inject_ids.insert(sid.clone());
                     }
                 }
             }
@@ -1096,20 +1088,21 @@ impl ReadEngine {
         for note in all_notes.iter().take(10) {
             if let Ok(links) = self.graph_store.get_links_with_reasons(&note.id).await {
                 for (linked_id, reason) in &links {
-                    if reason.contains("contradiction dream") && !seen_ids.contains(linked_id) {
-                        if let Ok(Some(dream_note)) = self.vector_store.get(linked_id).await {
-                            if let Provenance::Dream {
-                                source_note_ids, ..
-                            } = &dream_note.provenance
-                            {
-                                for sid in source_note_ids {
-                                    if !seen_ids.contains(sid) {
-                                        contradiction_inject_ids.insert(sid.clone());
-                                    }
+                    if reason.contains("contradiction dream")
+                        && !seen_ids.contains(linked_id)
+                        && let Ok(Some(dream_note)) = self.vector_store.get(linked_id).await
+                    {
+                        if let Provenance::Dream {
+                            source_note_ids, ..
+                        } = &dream_note.provenance
+                        {
+                            for sid in source_note_ids {
+                                if !seen_ids.contains(sid) {
+                                    contradiction_inject_ids.insert(sid.clone());
                                 }
                             }
-                            contradiction_inject_ids.insert(linked_id.clone());
                         }
+                        contradiction_inject_ids.insert(linked_id.clone());
                     }
                 }
             }
@@ -1263,6 +1256,7 @@ impl ReadEngine {
                         contradiction_injected: contradiction_count,
                         has_contradiction,
                         reranker_best_score: reranker_best,
+                        evidence: None,
                     });
                 }
                 response.content.clone()
@@ -1354,34 +1348,34 @@ impl ReadEngine {
                 if let Ok(retry_response) = self.llm.chat(&retry_messages, &config).await {
                     let retry_parsed: serde_json::Value =
                         serde_json::from_str(&retry_response.content).unwrap_or_default();
-                    if let Some(retry_answer) = retry_parsed["answer"].as_str() {
-                        if !retry_answer.is_empty()
-                            && !Self::answer_admits_insufficient_info(retry_answer)
-                        {
-                            let retry_note_ids: Vec<String> =
-                                retry_notes.iter().map(|n| n.id.clone()).collect();
-                            let retry_has_contradiction =
-                                retry_parsed["has_contradiction"].as_bool().unwrap_or(false);
+                    if let Some(retry_answer) = retry_parsed["answer"].as_str()
+                        && !retry_answer.is_empty()
+                        && !Self::answer_admits_insufficient_info(retry_answer)
+                    {
+                        let retry_note_ids: Vec<String> =
+                            retry_notes.iter().map(|n| n.id.clone()).collect();
+                        let retry_has_contradiction =
+                            retry_parsed["has_contradiction"].as_bool().unwrap_or(false);
 
-                            let mut final_answer = retry_answer.to_string();
-                            if retry_has_contradiction {
-                                final_answer = format!(
-                                    "**Note: The memories contain contradictory information on this topic.**\n\n{}",
-                                    final_answer
-                                );
-                            }
-
-                            info!("Retry produced confident answer, using it");
-                            return Ok(AskResult {
-                                answer: final_answer,
-                                query_mode: mode_str,
-                                notes_used: retry_notes.len(),
-                                note_ids: retry_note_ids,
-                                contradiction_injected: 0,
-                                has_contradiction: retry_has_contradiction,
-                                reranker_best_score: reranker_best,
-                            });
+                        let mut final_answer = retry_answer.to_string();
+                        if retry_has_contradiction {
+                            final_answer = format!(
+                                "**Note: The memories contain contradictory information on this topic.**\n\n{}",
+                                final_answer
+                            );
                         }
+
+                        info!("Retry produced confident answer, using it");
+                        return Ok(AskResult {
+                            answer: final_answer,
+                            query_mode: mode_str,
+                            notes_used: retry_notes.len(),
+                            note_ids: retry_note_ids,
+                            contradiction_injected: 0,
+                            has_contradiction: retry_has_contradiction,
+                            reranker_best_score: reranker_best,
+                            evidence: None,
+                        });
                     }
                 }
                 info!("Retry also insufficient or failed, keeping original answer");
@@ -1396,6 +1390,7 @@ impl ReadEngine {
             contradiction_injected: contradiction_count,
             has_contradiction,
             reranker_best_score: reranker_best,
+            evidence: None,
         })
     }
 

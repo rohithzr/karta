@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KartaConfig {
     pub storage: StorageConfig,
     pub llm: LlmConfig,
@@ -11,21 +11,6 @@ pub struct KartaConfig {
     pub episode: EpisodeConfig,
     pub forget: ForgetConfig,
     pub reranker: crate::rerank::RerankerConfig,
-}
-
-impl Default for KartaConfig {
-    fn default() -> Self {
-        Self {
-            storage: StorageConfig::default(),
-            llm: LlmConfig::default(),
-            read: ReadConfig::default(),
-            write: WriteConfig::default(),
-            dream: DreamConfig::default(),
-            episode: EpisodeConfig::default(),
-            forget: ForgetConfig::default(),
-            reranker: Default::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,14 +32,18 @@ impl Default for EpisodeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// Directory for embedded storage (LanceDB + SQLite).
+    /// Directory for embedded storage (SQLite graph store).
     pub data_dir: String,
+    /// Optional URI for LanceDB vector store (e.g. "gs://bucket/path").
+    /// If not set, defaults to "{data_dir}/lance".
+    pub lance_uri: Option<String>,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             data_dir: ".karta".into(),
+            lance_uri: None,
         }
     }
 }

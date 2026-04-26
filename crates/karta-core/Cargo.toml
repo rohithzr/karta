@@ -40,7 +40,7 @@ tracing = "0.1"
 dotenvy = "0.15"
 
 # Vector store: LanceDB
-lancedb = { version = "0.27", optional = true }
+lancedb = { version = "0.27", optional = true, features = ["gcs"] }
 arrow-array = { version = "57", optional = true }
 arrow-schema = { version = "57", optional = true }
 

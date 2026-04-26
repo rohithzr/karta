@@ -133,21 +133,13 @@ pub enum Provenance {
         confidence: f32,
     },
     /// Entity profile built from consolidation dreams.
-    Profile {
-        entity_id: String,
-    },
+    Profile { entity_id: String },
     /// Episode narrative synthesis.
-    Episode {
-        episode_id: String,
-    },
+    Episode { episode_id: String },
     /// Atomic fact extracted from a note.
-    Fact {
-        source_note_id: String,
-    },
+    Fact { source_note_id: String },
     /// Episode digest produced by dream engine.
-    Digest {
-        episode_id: String,
-    },
+    Digest { episode_id: String },
 }
 
 /// Result of a similarity search.
@@ -175,6 +167,37 @@ pub struct AskResult {
     pub has_contradiction: bool,
     /// Best reranker relevance score (None if reranker disabled).
     pub reranker_best_score: Option<f32>,
+    /// Evidence packets explaining why each note was retrieved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<EvidencePacket>,
+}
+
+/// Evidence packet explaining why notes were retrieved for an answer.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EvidencePacket {
+    /// Per-channel retrieval traces (e.g., "ann", "facts", "profile").
+    pub channel_traces: Vec<ChannelTrace>,
+    /// IDs of fired procedural rules.
+    pub fired_rule_ids: Vec<String>,
+    /// IDs of unresolved contradictions affecting this answer.
+    pub contradiction_ids: Vec<String>,
+    /// Human-readable explanation of why these notes were retrieved.
+    pub why_retrieved: String,
+}
+
+/// Trace for a single retrieval channel.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelTrace {
+    pub channel: String,
+    /// Ranked hits for this channel, in retrieval order.
+    pub ranked: Vec<RankedHit>,
+    pub rrf_contribution: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RankedHit {
+    pub note_id: String,
+    pub score: f32,
 }
 
 /// A forward-looking statement extracted by the LLM during attribute generation.
@@ -236,7 +259,11 @@ pub enum ForesightStatus {
 }
 
 impl ForesightSignal {
-    pub fn new(content: String, source_note_id: String, valid_until: Option<DateTime<Utc>>) -> Self {
+    pub fn new(
+        content: String,
+        source_note_id: String,
+        valid_until: Option<DateTime<Utc>>,
+    ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             content,
@@ -434,16 +461,15 @@ pub struct AggregationEntry {
 
 // ─── Note Lifecycle (Phase 3.1) ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum NoteStatus {
+    #[default]
     Active,
-    Deprecated { by: String },
-    Superseded { by: String },
+    Deprecated {
+        by: String,
+    },
+    Superseded {
+        by: String,
+    },
     Archived,
-}
-
-impl Default for NoteStatus {
-    fn default() -> Self {
-        NoteStatus::Active
-    }
 }

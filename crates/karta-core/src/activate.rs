@@ -190,16 +190,16 @@ impl ActivateEngine {
 
         let mut results: Vec<SearchResult> = Vec::with_capacity(top_k.min(fused.len()));
         for (id, fused_score) in fused {
-            if let Some(note) = notes_by_id.remove(&id) {
-                if note.is_active() {
-                    results.push(SearchResult {
-                        note,
-                        score: fused_score,
-                        linked_notes: Vec::new(),
-                    });
-                    if results.len() >= top_k {
-                        break;
-                    }
+            if let Some(note) = notes_by_id.remove(&id)
+                && note.is_active()
+            {
+                results.push(SearchResult {
+                    note,
+                    score: fused_score,
+                    linked_notes: Vec::new(),
+                });
+                if results.len() >= top_k {
+                    break;
                 }
             }
         }
@@ -274,11 +274,12 @@ impl ActivateEngine {
                         // already ranked via ANN; keep first-seen order
                         continue;
                     }
-                    if let Ok(Some(parent)) = self.vector_store.get(&fact.source_note_id).await {
-                        if parent.is_active() && seen.insert(parent.id.clone()) {
-                            facts_ranked.push(parent.id.clone());
-                            pool.push(parent);
-                        }
+                    if let Ok(Some(parent)) = self.vector_store.get(&fact.source_note_id).await
+                        && parent.is_active()
+                        && seen.insert(parent.id.clone())
+                    {
+                        facts_ranked.push(parent.id.clone());
+                        pool.push(parent);
                     }
                 }
             }
@@ -305,11 +306,12 @@ impl ActivateEngine {
             if !matched {
                 continue;
             }
-            if let Ok(Some(note)) = self.vector_store.get(&note_id).await {
-                if note.is_active() && seen.insert(note.id.clone()) {
-                    profile_ranked.push(note.id.clone());
-                    pool.push(note);
-                }
+            if let Ok(Some(note)) = self.vector_store.get(&note_id).await
+                && note.is_active()
+                && seen.insert(note.id.clone())
+            {
+                profile_ranked.push(note.id.clone());
+                pool.push(note);
             }
         }
 
@@ -324,11 +326,11 @@ impl ActivateEngine {
         };
         for s in signals {
             if seen.insert(s.source_note_id.clone()) {
-                if let Ok(Some(note)) = self.vector_store.get(&s.source_note_id).await {
-                    if note.is_active() {
-                        foresight_ranked.push(note.id.clone());
-                        pool.push(note);
-                    }
+                if let Ok(Some(note)) = self.vector_store.get(&s.source_note_id).await
+                    && note.is_active()
+                {
+                    foresight_ranked.push(note.id.clone());
+                    pool.push(note);
                 }
             } else {
                 foresight_ranked.push(s.source_note_id);

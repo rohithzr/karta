@@ -19,6 +19,12 @@ pub struct MockLlmProvider {
     call_count: AtomicU64,
 }
 
+impl Default for MockLlmProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockLlmProvider {
     pub fn new() -> Self {
         Self {
@@ -28,7 +34,10 @@ impl MockLlmProvider {
 
     fn extract_words(text: &str) -> Vec<String> {
         text.split_whitespace()
-            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase()
+            })
             .filter(|w| w.len() > 3)
             .collect()
     }
@@ -136,22 +145,16 @@ impl MockLlmProvider {
         for block in candidates_text.split("[").skip(1) {
             // Extract the ID
             if let Some(id_line) = block.lines().find(|l| l.contains("ID:")) {
-                let id = id_line
-                    .split("ID:")
-                    .nth(1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
+                let id = id_line.split("ID:").nth(1).unwrap_or("").trim().to_string();
 
                 if id.is_empty() {
                     continue;
                 }
 
-                let candidate_words: std::collections::HashSet<String> =
-                    Self::extract_words(block)
-                        .into_iter()
-                        .filter(|w| w.len() > 4)
-                        .collect();
+                let candidate_words: std::collections::HashSet<String> = Self::extract_words(block)
+                    .into_iter()
+                    .filter(|w| w.len() > 4)
+                    .collect();
 
                 let shared: Vec<&String> = new_words.intersection(&candidate_words).collect();
                 if shared.len() >= 2 {
@@ -237,7 +240,8 @@ impl MockLlmProvider {
                     "reasoning": "Insufficient linked notes for deduction",
                     "conclusion": null,
                     "confidence": 0.0
-                }).to_string();
+                })
+                .to_string();
             };
             serde_json::json!({
                 "reasoning": "Analyzing the linked notes reveals logically connected constraints that entail a combined conclusion.",
@@ -334,13 +338,19 @@ impl LlmProvider for MockLlmProvider {
             self.handle_linking(user_msg)
         } else if system_msg.contains("Update the existing memory") {
             self.handle_evolution(user_msg)
-        } else if system_msg.to_lowercase().contains("answer questions using only") {
+        } else if system_msg
+            .to_lowercase()
+            .contains("answer questions using only")
+        {
             self.handle_synthesis(user_msg)
         } else if full_prompt.contains("updating an entity profile")
             || user_msg.contains("updating an entity profile")
         {
             // Profile merge
-            let new_info = user_msg.split("New information:").nth(1).unwrap_or(user_msg);
+            let new_info = user_msg
+                .split("New information:")
+                .nth(1)
+                .unwrap_or(user_msg);
             serde_json::json!({
                 "updatedProfile": format!("Updated profile incorporating new information. {}", new_info.trim().chars().take(200).collect::<String>())
             })
@@ -369,7 +379,11 @@ impl LlmProvider for MockLlmProvider {
             || full_prompt.contains("CONSPICUOUSLY ABSENT")
             || full_prompt.contains("CONTRADICT")
         {
-            self.handle_dream(if full_prompt.is_empty() { user_msg } else { full_prompt })
+            self.handle_dream(if full_prompt.is_empty() {
+                user_msg
+            } else {
+                full_prompt
+            })
         } else {
             // Fallback
             serde_json::json!({

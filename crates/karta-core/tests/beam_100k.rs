@@ -16,9 +16,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use karta_core::Karta;
 use karta_core::config::KartaConfig;
 use karta_core::note::AskResult;
-use karta_core::Karta;
 
 #[derive(serde::Deserialize)]
 #[allow(dead_code)] // Some fields are parsed for schema completeness but unread by the harness.
@@ -99,6 +99,7 @@ fn load_dataset(path: &str) -> BeamDataset {
 ///   1. `BEAM_DATASET_PATH` env (explicit override, absolute or relative)
 ///   2. `data/beam-100k.json` relative to CWD
 ///   3. `<CARGO_MANIFEST_DIR>/../../data/beam-100k.json` (workspace root)
+///
 /// Panic loudly if none exist, so a missing dataset fails the test instead
 /// of making it pass with zero work.
 fn resolve_dataset_path() -> String {
@@ -117,8 +118,8 @@ fn resolve_dataset_path() -> String {
         return cwd_relative.to_string();
     }
 
-    let workspace_relative = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../data/beam-100k.json");
+    let workspace_relative =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/beam-100k.json");
     if workspace_relative.exists() {
         return workspace_relative.to_string_lossy().into_owned();
     }
@@ -215,12 +216,7 @@ async fn llm_judge_rubric_arc(
 
 /// LLM-as-judge using the exact BEAM official prompt and 3-tier scoring (1.0/0.5/0.0).
 /// Returns score 0.0, 0.5, or 1.0.
-async fn llm_judge_rubric(
-    karta: &Karta,
-    question: &str,
-    answer: &str,
-    rubric_item: &str,
-) -> f64 {
+async fn llm_judge_rubric(karta: &Karta, question: &str, answer: &str, rubric_item: &str) -> f64 {
     use karta_core::llm::{ChatMessage, GenConfig, Role};
 
     // Build the prompt exactly as BEAM does: substitute placeholders
@@ -247,9 +243,13 @@ async fn llm_judge_rubric(
                 serde_json::from_str(&response.content).unwrap_or_default();
             let score = parsed["score"].as_f64().unwrap_or(0.0);
             // Clamp to valid BEAM scores
-            if score >= 0.75 { 1.0 }
-            else if score >= 0.25 { 0.5 }
-            else { 0.0 }
+            if score >= 0.75 {
+                1.0
+            } else if score >= 0.25 {
+                0.5
+            } else {
+                0.0
+            }
         }
         Err(e) => {
             eprintln!("    Judge error: {}", e);
@@ -259,13 +259,22 @@ async fn llm_judge_rubric(
 }
 
 fn env_f32(key: &str, default: f32) -> f32 {
-    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 fn env_bool(key: &str, default: bool) -> bool {
-    std::env::var(key).ok().map(|s| s == "1" || s == "true").unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .map(|s| s == "1" || s == "true")
+        .unwrap_or(default)
 }
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn apply_config_env(config: &mut KartaConfig) {
@@ -287,10 +296,16 @@ fn apply_config_env(config: &mut KartaConfig) {
     config.read.fact_match_boost = env_f32("K_FACT_BOOST", 0.1);
 
     let exp = std::env::var("K_EXPERIMENT").unwrap_or_else(|_| "default".to_string());
-    println!("  Config [{}]: episode={}, ep_retrieval={}, graph={}, foresight={}, reranker={}, abstention_thresh={}",
-        exp, config.episode.enabled, config.read.episode_retrieval_enabled,
-        config.read.graph_weight, config.read.foresight_boost,
-        config.reranker.enabled, config.reranker.abstention_threshold);
+    println!(
+        "  Config [{}]: episode={}, ep_retrieval={}, graph={}, foresight={}, reranker={}, abstention_thresh={}",
+        exp,
+        config.episode.enabled,
+        config.read.episode_retrieval_enabled,
+        config.read.graph_weight,
+        config.read.foresight_boost,
+        config.reranker.enabled,
+        config.reranker.abstention_threshold
+    );
 }
 
 /// Find a data directory for a conversation ID.
@@ -310,7 +325,9 @@ fn find_latest_data_dir(conv_id: &str) -> Option<String> {
         .ok()?
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.file_name().to_string_lossy().starts_with(&format!("karta-beam100k-{}-", conv_id))
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("karta-beam100k-{}-", conv_id))
                 && e.path().is_dir()
         })
         .filter_map(|e| {
@@ -326,7 +343,7 @@ fn find_latest_data_dir(conv_id: &str) -> Option<String> {
             }
         })
         .collect();
-    dirs.sort_by(|a, b| b.1.cmp(&a.1)); // most recently created first
+    dirs.sort_by_key(|(_, created)| std::cmp::Reverse(*created)); // most recently created first
     dirs.into_iter().next().map(|(path, _)| path)
 }
 
@@ -342,7 +359,10 @@ async fn create_karta(conv_id: &str) -> Karta {
                 .await
                 .expect("Failed to open existing Karta data dir");
         } else {
-            panic!("BEAM_SKIP_INGEST=true but no data dir found for conv {}", conv_id);
+            panic!(
+                "BEAM_SKIP_INGEST=true but no data dir found for conv {}",
+                conv_id
+            );
         }
     }
 
@@ -427,11 +447,19 @@ async fn eval_conversation(
                 format!("[{}] {}", msg.time_anchor, msg.content)
             };
 
-            match karta.add_note_with_metadata(&content, &session_id, Some(i as u32), source_timestamp).await {
+            match karta
+                .add_note_with_metadata(&content, &session_id, Some(i as u32), source_timestamp)
+                .await
+            {
                 Ok(note) => {
                     ingested += 1;
                     if (i + 1) % 20 == 0 || i == 0 {
-                        println!("  Ingested {}/{} notes ({} links)", i + 1, conv.user_messages.len(), note.links.len());
+                        println!(
+                            "  Ingested {}/{} notes ({} links)",
+                            i + 1,
+                            conv.user_messages.len(),
+                            note.links.len()
+                        );
                     }
                 }
                 Err(e) => {
@@ -472,18 +500,26 @@ async fn eval_conversation(
 
     // JSONL debug log setup
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap();
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
     let results_dir = repo_root.join(".results");
     let _ = std::fs::create_dir_all(&results_dir);
-    let run_ts = std::env::var("BEAM_RUN_ID").unwrap_or_else(|_| {
-        chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string()
+    let run_ts = std::env::var("BEAM_RUN_ID")
+        .unwrap_or_else(|_| chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string());
+    let debug_path = std::env::var("BEAM_DEBUG_PATH").unwrap_or_else(|_| {
+        results_dir
+            .join(format!("beam-debug-{}-{}.jsonl", conv.id, run_ts))
+            .to_string_lossy()
+            .to_string()
     });
-    let debug_path = std::env::var("BEAM_DEBUG_PATH")
-        .unwrap_or_else(|_| results_dir.join(format!("beam-debug-{}-{}.jsonl", conv.id, run_ts)).to_string_lossy().to_string());
 
     // Phase 1: Ask questions with bounded concurrency via semaphore
     let query_concurrency: usize = std::env::var("BEAM_QUERY_CONCURRENCY")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(query_concurrency));
     let mut ask_handles = Vec::new();
 
@@ -538,7 +574,8 @@ async fn eval_conversation(
             let question = q.question.clone();
             let answer_clone = answer.clone();
             judge_handles.push(tokio::spawn(async move {
-                let score = llm_judge_rubric_arc(&karta_ref, &question, &answer_clone, &rubric).await;
+                let score =
+                    llm_judge_rubric_arc(&karta_ref, &question, &answer_clone, &rubric).await;
                 (qi, ri, rubric, score)
             }));
         }
@@ -574,11 +611,14 @@ async fn eval_conversation(
 
         println!(
             "\n  [{}] Q{}: {}",
-            q.ability, qi + 1, safe_truncate(&q.question, 80)
+            q.ability,
+            qi + 1,
+            safe_truncate(&q.question, 80)
         );
         println!(
             "  A ({:.1}s): {}",
-            *query_ms as f64 / 1000.0, safe_truncate(answer, 200)
+            *query_ms as f64 / 1000.0,
+            safe_truncate(answer, 200)
         );
 
         let entry = ability_scores.entry(q.ability.clone()).or_insert((0, 0));
@@ -609,12 +649,24 @@ async fn eval_conversation(
                 entry.1 += 1;
                 rubric_score_sum += score;
 
-                let label = if *score >= 1.0 { "FULL" } else if *score >= 0.5 { "PART" } else { "FAIL" };
+                let label = if *score >= 1.0 {
+                    "FULL"
+                } else if *score >= 0.5 {
+                    "PART"
+                } else {
+                    "FAIL"
+                };
                 if *score >= 0.5 {
                     total_passed += 1;
                     entry.0 += 1;
                 }
-                println!("    [{}] R{}: {:.1} ({})", label, ri + 1, score, safe_truncate(rubric, 70));
+                println!(
+                    "    [{}] R{}: {:.1} ({})",
+                    label,
+                    ri + 1,
+                    score,
+                    safe_truncate(rubric, 70)
+                );
 
                 rubric_scores_debug.push(serde_json::json!({
                     "item": rubric, "score": score, "grade": label,
@@ -650,7 +702,12 @@ async fn eval_conversation(
         }
     }
 
-    (conv.questions.len(), total_passed, total_checks, ability_scores)
+    (
+        conv.questions.len(),
+        total_passed,
+        total_checks,
+        ability_scores,
+    )
 }
 
 /// Run BEAM 100K on a single conversation (for quick testing).
@@ -679,14 +736,22 @@ async fn beam_100k_single() {
     println!("  Questions: {}", questions);
     println!("  Rubric checks: {}/{} passed (>= 0.5)", passed, total);
 
-    let pass_rate = if total > 0 { passed as f64 / total as f64 } else { 0.0 };
+    let pass_rate = if total > 0 {
+        passed as f64 / total as f64
+    } else {
+        0.0
+    };
     println!("  Pass rate: {:.1}%", pass_rate * 100.0);
 
     println!("\n  Per-ability (rubric items >= 0.5):");
     let mut abilities: Vec<_> = ability_scores.into_iter().collect();
     abilities.sort_by_key(|(name, _)| name.clone());
     for (name, (p, t)) in &abilities {
-        let rate = if *t > 0 { *p as f64 / *t as f64 * 100.0 } else { 0.0 };
+        let rate = if *t > 0 {
+            *p as f64 / *t as f64 * 100.0
+        } else {
+            0.0
+        };
         println!("    {:30} {}/{} ({:.0}%)", name, p, t, rate);
     }
 }
@@ -701,8 +766,10 @@ async fn beam_100k_single() {
 async fn beam_100k_full() {
     let dataset_path = resolve_dataset_path();
     let dataset = load_dataset(&dataset_path);
-    println!("BEAM 100K Full Benchmark: {} conversations, {} questions",
-        dataset.num_conversations, dataset.total_questions);
+    println!(
+        "BEAM 100K Full Benchmark: {} conversations, {} questions",
+        dataset.num_conversations, dataset.total_questions
+    );
 
     let concurrency: usize = std::env::var("BEAM_CONCURRENCY")
         .ok()
@@ -794,7 +861,10 @@ async fn beam_100k_full() {
     println!("{}", "=".repeat(70));
     println!("  Conversations: {}", dataset.num_conversations);
     println!("  Questions:     {}", grand_total_q);
-    println!("  Passed:        {}/{}", grand_total_passed, grand_total_checks);
+    println!(
+        "  Passed:        {}/{}",
+        grand_total_passed, grand_total_checks
+    );
 
     let pass_rate = if grand_total_checks > 0 {
         grand_total_passed as f64 / grand_total_checks as f64
@@ -808,7 +878,11 @@ async fn beam_100k_full() {
     let mut abilities: Vec<_> = grand_ability.into_iter().collect();
     abilities.sort_by_key(|(name, _)| name.clone());
     for (name, (p, t)) in &abilities {
-        let rate = if *t > 0 { *p as f64 / *t as f64 * 100.0 } else { 0.0 };
+        let rate = if *t > 0 {
+            *p as f64 / *t as f64 * 100.0
+        } else {
+            0.0
+        };
         println!("    {:30} {}/{} ({:.0}%)", name, p, t, rate);
     }
 }
