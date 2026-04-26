@@ -269,24 +269,32 @@ impl Karta {
     // --- Health ---
 
     pub async fn health_check(&self) -> Result<KartaHealth> {
-        let vector_ok = self.vector_store.count().await.is_ok();
+        let vector_count = self.vector_store.count().await;
+        let vector_ok = vector_count.is_ok();
         let graph_meta = self.graph_store.get_schema_meta().await;
         let graph_ok = graph_meta.is_ok();
 
         let (schema_version, pending, mut warnings) = match graph_meta {
-            Ok(meta) => (
-                Some(meta.schema_version.to_string()),
-                meta.pending_migrations,
-                meta.warnings,
-            ),
+            Ok(meta) => {
+                let schema_version = Some(meta.schema_version.to_string());
+                let mut warnings = meta.warnings;
+                if meta.schema_version != crate::migrate::CURRENT_SCHEMA_VERSION {
+                    warnings.push(format!(
+                        "Schema version mismatch: found {}, expected {}",
+                        meta.schema_version,
+                        crate::migrate::CURRENT_SCHEMA_VERSION
+                    ));
+                }
+                (schema_version, meta.pending_migrations, warnings)
+            }
             Err(ref e) => (
                 None,
                 vec![],
                 vec![format!("Graph store schema meta unavailable: {e}")],
             ),
         };
-        if !vector_ok {
-            warnings.push("Vector store health check failed".into());
+        if let Err(e) = vector_count {
+            warnings.push(format!("Vector store health check failed: {e}"));
         }
         if !pending.is_empty() {
             warnings.push(format!(
