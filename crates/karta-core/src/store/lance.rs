@@ -131,6 +131,13 @@ impl LanceVectorStore {
         ))
     }
 
+    fn normalize_embedding(embedding: &[f32]) -> Vec<f32> {
+        let mut normalized = embedding.to_vec();
+        normalized.resize(EMBEDDING_DIM, 0.0);
+        normalized.truncate(EMBEDDING_DIM);
+        normalized
+    }
+
     async fn ensure_table(&self) -> Result<()> {
         let mut table_lock = self.table.write().await;
         if table_lock.is_some() {
@@ -617,8 +624,9 @@ impl crate::store::VectorStore for LanceVectorStore {
     ) -> Result<Vec<(MemoryNote, f32)>> {
         let table = self.get_table().await?;
 
+        let normalized_embedding = Self::normalize_embedding(embedding);
         let query = table
-            .vector_search(embedding)
+            .vector_search(normalized_embedding.as_slice())
             .map_err(|e| KartaError::VectorStore(e.to_string()))?
             .limit(top_k + exclude_ids.len());
 
@@ -742,8 +750,9 @@ impl crate::store::VectorStore for LanceVectorStore {
         exclude_source_note_ids: &[&str],
     ) -> Result<Vec<(crate::note::AtomicFact, f32)>> {
         let table = self.get_facts_table().await?;
+        let normalized_embedding = Self::normalize_embedding(embedding);
         let query = table
-            .vector_search(embedding)
+            .vector_search(normalized_embedding.as_slice())
             .map_err(|e| KartaError::VectorStore(e.to_string()))?
             .limit(top_k + exclude_source_note_ids.len() * 5);
         let results = query
