@@ -209,9 +209,21 @@ export KARTA_LANCE_URI=.karta/lance   # optional LanceDB URI override
 export KARTA_TIMEOUT_MS=120000        # extension command timeout
 ```
 
-Memory policy instructions for pi live in `.pi/APPEND_SYSTEM.md`. The extension
-intentionally starts with explicit tools only; automatic recall/write should be
-added only after memory quality is validated.
+The pi extension also performs automatic memory recall before each agent turn.
+It builds a search query from the user prompt, cwd, and exact-match tokens such
+as paths, symbols, constants, issue IDs, and code spans, then injects a compact,
+provenance-rich memory message. Configure it with:
+
+```bash
+export KARTA_AUTO_CONTEXT=0             # disable automatic recall
+export KARTA_AUTO_CONTEXT_TOP_K=5       # retrieved memories, 1-20
+export KARTA_AUTO_CONTEXT_MAX_CHARS=4000 # injected context budget
+export KARTA_AUTO_CONTEXT_DISPLAY=1     # show injected memory messages in the TUI
+```
+
+Memory policy instructions for pi live in `.pi/APPEND_SYSTEM.md`. Automatic
+recall is intentionally read-only; writes still happen through explicit memory
+tools so durable memory promotion remains conservative.
 
 ## Documentation
 

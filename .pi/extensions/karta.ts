@@ -16,6 +16,18 @@ const KARTA_USAGE_GUIDELINES = [
   "Search Karta before answering questions that may depend on prior project context or decisions.",
 ];
 
+const AUTO_CONTEXT_DEFAULT_TOP_K = 5;
+const AUTO_CONTEXT_DEFAULT_MAX_CHARS = 4_000;
+
+const HARD_TOKEN_PATTERNS = [
+  /`([^`]+)`/g,
+  /[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+/g,
+  /\b[A-Z_][A-Z0-9_]{2,}\b/g,
+  /\b[A-Z][A-Za-z0-9_]{2,}\b/g,
+  /#[0-9]+\b/g,
+  /\b[A-Za-z0-9_.-]+@[0-9][A-Za-z0-9_.-]*\b/g,
+];
+
 type JsonObject = Record<string, unknown>;
 type ExecFileFailure = Error & { stdout?: string; stderr?: string; code?: unknown; signal?: unknown };
 
@@ -30,6 +42,108 @@ function topK(value: unknown): string {
   const parsed = Number(value ?? 5);
   const clamped = Math.max(1, Math.min(100, Number.isFinite(parsed) ? Math.trunc(parsed) : 5));
   return String(clamped);
+}
+
+function envFlag(name: string, defaultValue: boolean): boolean {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return defaultValue;
+  return !["0", "false", "no", "off"].includes(raw.toLowerCase());
+}
+
+function envInt(name: string, defaultValue: number, min: number, max: number): number {
+  const parsed = Number(process.env[name]);
+  if (!Number.isFinite(parsed)) return defaultValue;
+  return Math.max(min, Math.min(max, Math.trunc(parsed)));
+}
+
+function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 24)).trimEnd()}\n…[truncated]`;
+}
+
+function extractHardTokens(text: string): string[] {
+  const tokens = new Set<string>();
+
+  for (const pattern of HARD_TOKEN_PATTERNS) {
+    pattern.lastIndex = 0;
+    for (const match of text.matchAll(pattern)) {
+      const token = (match[1] ?? match[0]).trim();
+      if (token.length >= 2 && token.length <= 160) tokens.add(token);
+    }
+  }
+
+  return [...tokens].slice(0, 24);
+}
+
+function buildAutoContextQuery(prompt: string, cwd: string | undefined): string {
+  const hardTokens = extractHardTokens(prompt);
+  return [
+    prompt,
+    cwd ? `cwd:${cwd}` : undefined,
+    hardTokens.length ? `exact tokens: ${hardTokens.join(" ")}` : undefined,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function getStringField(value: unknown, field: string): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const fieldValue = (value as JsonObject)[field];
+  return typeof fieldValue === "string" ? fieldValue : undefined;
+}
+
+function getNumberField(value: unknown, field: string): number | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const fieldValue = (value as JsonObject)[field];
+  return typeof fieldValue === "number" && Number.isFinite(fieldValue) ? fieldValue : undefined;
+}
+
+function formatAutoContext(result: JsonObject, maxChars: number): string | undefined {
+  const hits = Array.isArray(result.results) ? result.results : [];
+  const blocks: string[] = [];
+
+  for (const hit of hits) {
+    if (!hit || typeof hit !== "object") continue;
+    const hitObject = hit as JsonObject;
+    const note = hitObject.note;
+    if (!note || typeof note !== "object") continue;
+
+    const id = getStringField(note, "id") ?? "unknown";
+    const content = getStringField(note, "content");
+    if (!content?.trim()) continue;
+
+    const score = getNumberField(hitObject, "score");
+    const updatedAt = getStringField(note, "updated_at") ?? getStringField(note, "created_at");
+    const provenance = getStringField(note, "provenance");
+    const keywords = Array.isArray((note as JsonObject).keywords)
+      ? ((note as JsonObject).keywords as unknown[]).filter((item): item is string => typeof item === "string").slice(0, 6)
+      : [];
+
+    const metadata = [
+      `id=${id}`,
+      score === undefined ? undefined : `score=${score.toFixed(3)}`,
+      updatedAt ? `updated=${updatedAt}` : undefined,
+      provenance ? `provenance=${provenance}` : undefined,
+      keywords.length ? `keywords=${keywords.join(", ")}` : undefined,
+    ]
+      .filter(Boolean)
+      .join("; ");
+
+    blocks.push(`- ${metadata}\n  ${truncateText(content.replace(/\s+/g, " ").trim(), 700)}`);
+  }
+
+  if (!blocks.length) return undefined;
+
+  return truncateText(
+    [
+      "Relevant durable Karta memories were retrieved automatically for this turn.",
+      "Use them as background context only when relevant; prefer current user instructions and repository state if they conflict.",
+      "Do not expose private memory details unless the user asks about memory.",
+      "",
+      ...blocks,
+    ].join("\n"),
+    maxChars,
+  );
 }
 
 async function runKarta(args: string[], signal?: AbortSignal): Promise<JsonObject> {
@@ -122,7 +236,33 @@ function toolResult(result: JsonObject) {
 
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.setStatus("karta", process.env.KARTA_BIN ? "Karta memory" : "Karta memory (cargo)");
+    const mode = process.env.KARTA_BIN ? "Karta memory" : "Karta memory (cargo)";
+    const auto = envFlag("KARTA_AUTO_CONTEXT", true) ? ", auto-context" : "";
+    ctx.ui.setStatus("karta", `${mode}${auto}`);
+  });
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (!envFlag("KARTA_AUTO_CONTEXT", true)) return;
+
+    const topKValue = envInt("KARTA_AUTO_CONTEXT_TOP_K", AUTO_CONTEXT_DEFAULT_TOP_K, 1, 20);
+    const maxChars = envInt("KARTA_AUTO_CONTEXT_MAX_CHARS", AUTO_CONTEXT_DEFAULT_MAX_CHARS, 500, 20_000);
+    const query = buildAutoContextQuery(event.prompt, event.systemPromptOptions.cwd);
+
+    try {
+      const result = await runKarta(["search", "--query", query, "--top-k", String(topKValue)], ctx.signal);
+      const content = formatAutoContext(result, maxChars);
+      if (!content) return;
+
+      return {
+        message: {
+          customType: "karta-memory",
+          content,
+          display: envFlag("KARTA_AUTO_CONTEXT_DISPLAY", false),
+        },
+      };
+    } catch (error) {
+      ctx.ui.notify(`Karta auto-context failed: ${(error as Error).message}`, "warning");
+    }
   });
 
   pi.registerTool({
