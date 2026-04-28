@@ -51,9 +51,6 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: build
-        run: cargo build --workspace --all-targets
-
       - name: nextest
         run: cargo nextest run --workspace --no-fail-fast
         env:
