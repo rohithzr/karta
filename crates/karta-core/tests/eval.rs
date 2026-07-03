@@ -1,7 +1,8 @@
 //! Integration eval tests — ports the 10 TypeScript PoC scenarios to Rust.
 //!
 //! Uses MockLlmProvider + real LanceDB + real SQLite.
-//! Run: cargo test --test eval
+//! Run: cargo test --test eval --features lance
+#![cfg(feature = "lance")]
 
 use std::sync::Arc;
 use karta_core::config::KartaConfig;

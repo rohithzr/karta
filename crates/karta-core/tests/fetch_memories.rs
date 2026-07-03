@@ -4,7 +4,8 @@
 //! Uses `MockLlmProvider` + real LanceDB + real SQLite so the retrieval
 //! pipeline is exercised end-to-end without any network calls.
 //!
-//! Run: cargo test --test fetch_memories
+//! Run: cargo test --test fetch_memories --features lance
+#![cfg(feature = "lance")]
 
 use std::sync::Arc;
 

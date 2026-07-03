@@ -32,7 +32,8 @@
 //! with questions in 5 categories: single-hop, multi-hop, temporal, commonsense,
 //! and adversarial. Dataset: https://github.com/snap-research/locomo
 //!
-//! Run: cargo test --test bench_beam -- --ignored --nocapture
+//! Run: cargo test --test bench_beam --features lance -- --ignored --nocapture
+#![cfg(feature = "lance")]
 
 use std::sync::Arc;
 use std::time::Instant;
