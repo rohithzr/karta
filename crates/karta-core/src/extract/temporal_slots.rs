@@ -113,6 +113,33 @@ fn has_temporal_marker(span: &str) -> bool {
     false
 }
 
+/// Derive a missing `occurred_end` from `occurred_start` using the same
+/// convention the JSON schema documents: next day for date-only (midnight-
+/// aligned) starts, start + 1ns for instants.
+///
+/// Small models reliably emit `occurred_start` but leave `occurred_end`
+/// null — the prompt examples are start-centric and structured output
+/// biases optional fields to null. Without derivation those facts die in
+/// `validate_occurred` as unpaired bounds, which silently discards the
+/// exact past-event facts the event_ordering ability depends on. A
+/// model-provided end always wins; end-without-start is left untouched
+/// for `validate_occurred` to reject.
+pub fn derive_occurred_end(
+    occurred_start: Option<DateTime<Utc>>,
+    occurred_end: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    if occurred_end.is_some() {
+        return occurred_end;
+    }
+    let start = occurred_start?;
+    let is_midnight_aligned = start.time() == chrono::NaiveTime::MIN;
+    if is_midnight_aligned {
+        Some(start + chrono::Duration::days(1))
+    } else {
+        Some(start + chrono::Duration::nanoseconds(1))
+    }
+}
+
 /// If a fact has `occurred_*` populated but no supporting_span contains a
 /// temporal marker (literal date or relative phrase), the bounds were
 /// inferred rather than grounded. Strip them.
@@ -260,5 +287,37 @@ mod tests {
             validate_occurred_grounding(Some(t()), 0.7, &spans),
             OccurredOutcome::Keep
         );
+    }
+
+    // ---- occurred_end derivation ----
+
+    #[test]
+    fn derive_end_from_midnight_aligned_start_is_next_day() {
+        let start = Utc.with_ymd_and_hms(2024, 3, 29, 0, 0, 0).unwrap();
+        let want = Utc.with_ymd_and_hms(2024, 3, 30, 0, 0, 0).unwrap();
+        assert_eq!(derive_occurred_end(Some(start), None), Some(want));
+    }
+
+    #[test]
+    fn derive_end_from_instant_start_is_start_plus_1ns() {
+        let start = Utc.with_ymd_and_hms(2024, 3, 29, 14, 30, 0).unwrap();
+        let want = start + chrono::Duration::nanoseconds(1);
+        assert_eq!(derive_occurred_end(Some(start), None), Some(want));
+    }
+
+    #[test]
+    fn derive_end_keeps_model_provided_end() {
+        let start = Utc.with_ymd_and_hms(2024, 3, 29, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2024, 4, 2, 0, 0, 0).unwrap();
+        assert_eq!(derive_occurred_end(Some(start), Some(end)), Some(end));
+    }
+
+    #[test]
+    fn derive_end_without_start_stays_none() {
+        assert_eq!(derive_occurred_end(None, None), None);
+        // end-without-start is unpaired garbage — leave it for
+        // validate_occurred to reject rather than inventing a start.
+        let end = Utc.with_ymd_and_hms(2024, 4, 2, 0, 0, 0).unwrap();
+        assert_eq!(derive_occurred_end(None, Some(end)), Some(end));
     }
 }

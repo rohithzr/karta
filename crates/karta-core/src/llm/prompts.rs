@@ -163,14 +163,18 @@ Band rules:
         — resolve against reference_time
   0.5 — vague temporal word ("recently", "around March")
 
+occurred_start and occurred_end are a PAIR: populate both or neither.
+For a date-only reference, occurred_end is the NEXT day (exclusive
+upper bound).
+
 Examples:
   "Sprint 1 ended on March 29"
-    → facet=event, occurred_start=2024-03-29, conf=0.8,
-      supporting_spans includes "March 29"
+    → facet=event, occurred_start=2024-03-29, occurred_end=2024-03-30,
+      conf=0.8, supporting_spans includes "March 29"
 
   "yesterday I closed the auth ticket" (ref_time=2024-04-22)
-    → facet=event, occurred_start=2024-04-21, conf=0.7,
-      supporting_spans includes "yesterday"
+    → facet=event, occurred_start=2024-04-21, occurred_end=2024-04-22,
+      conf=0.7, supporting_spans includes "yesterday"
 
 The reference_time in the user message preamble is for resolving
 relative phrases. It is NOT a default timestamp — do not stamp

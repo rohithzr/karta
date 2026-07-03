@@ -415,7 +415,13 @@ impl WriteEngine {
                         // marker. Mirrors the temporal_evidence cite-and-validate
                         // pattern from F7-v3.
                         let mut occ_start = extraction.occurred_start;
-                        let mut occ_end = extraction.occurred_end;
+                        // Small models emit occurred_start but leave occurred_end
+                        // null; derive the end per the schema convention so the
+                        // fact survives validate_occurred's pairing invariant.
+                        let mut occ_end = crate::extract::temporal_slots::derive_occurred_end(
+                            extraction.occurred_start,
+                            extraction.occurred_end,
+                        );
                         let mut occ_conf = extraction.occurred_confidence;
                         match crate::extract::temporal_slots::validate_occurred_grounding(
                             occ_start,
