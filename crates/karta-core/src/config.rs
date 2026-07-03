@@ -47,7 +47,7 @@ impl Default for EpisodeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// Directory for embedded storage (LanceDB + SQLite).
+    /// Directory for embedded storage (sqlite-vec + SQLite).
     pub data_dir: String,
 }
 

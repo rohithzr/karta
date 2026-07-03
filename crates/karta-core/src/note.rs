@@ -343,7 +343,7 @@ impl Episode {
 // ─── Atomic Facts (Phase Next) ─────────────────────────────────────────────
 
 /// A single, independently verifiable statement extracted from a MemoryNote.
-/// Each fact gets its own embedding in a dedicated LanceDB table for fine-grained retrieval.
+/// Each fact gets its own embedding in a dedicated vector table for fine-grained retrieval.
 /// Intentionally lightweight: the fact IS the embedding unit. No context/keywords/tags.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtomicFact {

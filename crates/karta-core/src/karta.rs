@@ -86,7 +86,7 @@ impl Karta {
         })
     }
 
-    /// Create with default embedded stores (LanceDB + SQLite) and OpenAI-compatible LLM.
+    /// Create with default embedded stores (sqlite-vec + SQLite) and OpenAI-compatible LLM.
     ///
     /// Loads `.env` file if present (via dotenvy). Backend is chosen in this order:
     ///
@@ -111,7 +111,7 @@ impl Karta {
     /// OpenAI-compatible endpoint and embeddings go to Azure. This is the
     /// recommended BEAM config: local GPU for gen throughput, Azure for
     /// high-quality embeddings that match the P1 baseline's vector space.
-    #[cfg(all(feature = "sqlite-vec", feature = "sqlite", feature = "openai", not(feature = "lance")))]
+    #[cfg(all(feature = "sqlite-vec", feature = "sqlite", feature = "openai"))]
     pub async fn with_defaults(config: KartaConfig) -> Result<Self> {
         use crate::llm::{OpenAiProvider, SplitProvider};
         use crate::store::sqlite::SqliteGraphStore;
@@ -240,187 +240,6 @@ impl Karta {
         Self::new_with_synthesis(vector_store, graph_store, llm, synthesis_llm, config).await
     }
 
-    #[cfg(all(feature = "lance", feature = "sqlite", feature = "openai"))]
-    pub async fn with_defaults(config: KartaConfig) -> Result<Self> {
-        use crate::llm::{OpenAiProvider, SplitProvider};
-        use crate::store::lance::{DEFAULT_EMBEDDING_DIM, LanceVectorStore};
-        use crate::store::sqlite::SqliteGraphStore;
-
-        // Load .env if present (silently ignore if missing)
-        let _ = dotenvy::dotenv();
-
-        let model_ref = &config.llm.default;
-
-        // Core model: `KARTA_CORE_MODEL` (preferred, names the model used
-        // for all of Karta's *internal* LLM work — write, dream, link
-        // analysis, query classification, rerank) wins over the legacy
-        // `KARTA_CHAT_MODEL` name. Both fall back to the config default.
-        // The Azure branch may further override with `AZURE_OPENAI_CHAT_MODEL`.
-        let chat_model_base = std::env::var("KARTA_CORE_MODEL")
-            .or_else(|_| std::env::var("KARTA_CHAT_MODEL"))
-            .unwrap_or_else(|_| model_ref.model.clone());
-
-        // Embedding model: KARTA_EMBEDDING_MODEL → AZURE_OPENAI_EMBEDDING_MODEL → default
-        let embedding_model = std::env::var("KARTA_EMBEDDING_MODEL")
-            .unwrap_or_else(|_| {
-                std::env::var("AZURE_OPENAI_EMBEDDING_MODEL")
-                    .unwrap_or_else(|_| "text-embedding-3-small".to_string())
-            });
-
-        let openai_base = model_ref
-            .base_url
-            .clone()
-            .or_else(|| std::env::var("OPENAI_API_BASE").ok());
-        let azure_creds = match (
-            std::env::var("AZURE_OPENAI_API_KEY").ok(),
-            std::env::var("AZURE_OPENAI_ENDPOINT").ok(),
-        ) {
-            (Some(key), Some(endpoint)) => Some((key, endpoint)),
-            (Some(_), None) => {
-                return Err(KartaError::Config(
-                    "AZURE_OPENAI_API_KEY is set but AZURE_OPENAI_ENDPOINT is missing".into(),
-                ));
-            }
-            _ => None,
-        };
-
-        // Chat backend: OPENAI_API_BASE > Azure > standard OpenAI
-        let chat_llm: Arc<dyn LlmProvider> = if let Some(ref base_url) = openai_base {
-            // OpenAI-compatible endpoint (Ollama, vLLM, Groq, Together, …).
-            let api_key = std::env::var("OPENAI_API_KEY")
-                .unwrap_or_else(|_| "ollama".to_string());
-            Arc::new(OpenAiProvider::with_api_key(
-                &chat_model_base,
-                &embedding_model,
-                &api_key,
-                Some(base_url),
-            ))
-        } else if let Some((azure_key, endpoint)) = azure_creds.clone() {
-            let chat_model = std::env::var("AZURE_OPENAI_CHAT_MODEL")
-                .unwrap_or_else(|_| chat_model_base.clone());
-            let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
-                .unwrap_or_else(|_| "2025-04-01-preview".to_string());
-            Arc::new(OpenAiProvider::azure(
-                &endpoint,
-                &azure_key,
-                &api_version,
-                &chat_model,
-                &embedding_model,
-            ))
-        } else {
-            Arc::new(OpenAiProvider::new(&chat_model_base, &embedding_model))
-        };
-
-        // Three-model architecture:
-        //   1. CORE (`KARTA_CORE_MODEL` / `chat_llm`) — powers every Karta-
-        //      internal LLM call: write-side fact extraction, dream digest
-        //      generation, link analysis, query classification, reranking.
-        //      Pointed at by `OPENAI_API_BASE` (typically local Ollama) or
-        //      falls back to Azure / OpenAI.
-        //   2. ANSWER (`KARTA_ANSWER_MODEL`, optional) — powers ONLY the
-        //      final answer-composition call in `read.rs::synthesize`. If
-        //      set, Karta builds a dedicated answer backend and passes it
-        //      through as `synthesis_llm`. If unset, the answer step uses
-        //      the core LLM. This split lets you use a cheap/local core
-        //      for the 97% of internal work and reserve a premium model
-        //      for the 3% that's user-facing.
-        //   3. JUDGE (`KARTA_JUDGE_MODEL`) — NOT built here; it lives in
-        //      the BEAM benchmark harness because Karta itself never
-        //      calls a judge in normal operation.
-        //
-        // Embedding backend: only split when chat is hitting an OpenAI-
-        // compatible endpoint (Ollama) *and* Azure creds are available.
-        // In split mode the embedding deployment comes from
-        // `AZURE_OPENAI_EMBEDDING_MODEL`, NOT `KARTA_EMBEDDING_MODEL`
-        // (which names the Ollama-native embedder and does not exist as
-        // an Azure deployment).
-        //
-        // Answer backend resolution, in order of precedence:
-        //   a) `KARTA_ANSWER_BASE_URL` set → use it as an OpenAI-compatible
-        //      endpoint with `KARTA_ANSWER_MODEL` as the model name and
-        //      `KARTA_ANSWER_API_KEY` (or placeholder) as the key.
-        //   b) Azure creds present → treat `KARTA_ANSWER_MODEL` as an
-        //      Azure deployment id and build an Azure client.
-        //   c) No way to build a dedicated answer backend → fall back to
-        //      the core LLM for synthesis.
-        let answer_model_opt = std::env::var("KARTA_ANSWER_MODEL").ok();
-        let mut synthesis_llm: Option<Arc<dyn LlmProvider>> = None;
-
-        let llm: Arc<dyn LlmProvider> = if openai_base.is_some() {
-            if let Some((azure_key, endpoint)) = azure_creds.clone() {
-                let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
-                    .unwrap_or_else(|_| "2025-04-01-preview".to_string());
-                let azure_chat_model = std::env::var("AZURE_OPENAI_CHAT_MODEL")
-                    .unwrap_or_else(|_| chat_model_base.clone());
-                let azure_embedding_model = std::env::var("AZURE_OPENAI_EMBEDDING_MODEL")
-                    .unwrap_or_else(|_| "text-embedding-3-small".to_string());
-                let embed_llm: Arc<dyn LlmProvider> = Arc::new(OpenAiProvider::azure(
-                    &endpoint,
-                    &azure_key,
-                    &api_version,
-                    &azure_chat_model,
-                    &azure_embedding_model,
-                ));
-                Arc::new(SplitProvider::new(chat_llm, embed_llm))
-            } else {
-                chat_llm
-            }
-        } else {
-            chat_llm
-        };
-
-        // Build the optional answer backend after the core llm so it can
-        // be handed to ReadEngine alongside it. Independent of whether
-        // the core path is split or not.
-        if let Some(answer_model) = answer_model_opt {
-            if let Ok(answer_base) = std::env::var("KARTA_ANSWER_BASE_URL") {
-                let answer_key = std::env::var("KARTA_ANSWER_API_KEY")
-                    .unwrap_or_else(|_| "placeholder".to_string());
-                synthesis_llm = Some(Arc::new(OpenAiProvider::with_api_key(
-                    &answer_model,
-                    &embedding_model,
-                    &answer_key,
-                    Some(&answer_base),
-                )));
-            } else if let Some((azure_key, endpoint)) = azure_creds {
-                let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
-                    .unwrap_or_else(|_| "2025-04-01-preview".to_string());
-                let azure_embedding_model = std::env::var("AZURE_OPENAI_EMBEDDING_MODEL")
-                    .unwrap_or_else(|_| "text-embedding-3-small".to_string());
-                synthesis_llm = Some(Arc::new(OpenAiProvider::azure(
-                    &endpoint,
-                    &azure_key,
-                    &api_version,
-                    &answer_model,
-                    &azure_embedding_model,
-                )));
-            }
-            // else: no way to build a dedicated backend; leave None, answer
-            // step falls through to the core LLM automatically.
-        }
-
-        // Probe the embedding model once to detect its dimensionality so the
-        // LanceDB schema matches the provider (nomic-embed-text is 768, OpenAI
-        // text-embedding-3-small is 1536, etc.). Falls back to the historical
-        // default if the probe fails so we still surface a clearer error from
-        // the real query path rather than failing the constructor silently.
-        let embedding_dim = match llm.embed(&["karta-init-probe"]).await {
-            Ok(vectors) if !vectors.is_empty() && !vectors[0].is_empty() => {
-                vectors[0].len()
-            }
-            _ => DEFAULT_EMBEDDING_DIM,
-        };
-
-        let vector_store = Arc::new(
-            LanceVectorStore::new(&config.storage.data_dir, embedding_dim).await?,
-        ) as Arc<dyn VectorStore>;
-
-        let graph_store = Arc::new(
-            SqliteGraphStore::new(&config.storage.data_dir)?,
-        ) as Arc<dyn GraphStore>;
-
-        Self::new_with_synthesis(vector_store, graph_store, llm, synthesis_llm, config).await
-    }
 
     // --- Write ---
 

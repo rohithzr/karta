@@ -1,37 +1,32 @@
 //! Tests for the retrieve-only `fetch_memories` API and the three-model
 //! environment plumbing (CORE / ANSWER / JUDGE split).
 //!
-//! Uses `MockLlmProvider` + real LanceDB + real SQLite so the retrieval
+//! Uses `MockLlmProvider` + real sqlite-vec + real SQLite so the retrieval
 //! pipeline is exercised end-to-end without any network calls.
 //!
-//! Run: cargo test --test fetch_memories --features lance
-#![cfg(feature = "lance")]
+//! Run: cargo test --test fetch_memories
+#![cfg(feature = "sqlite-vec")]
 
 use std::sync::Arc;
 
 use karta_core::config::KartaConfig;
 use karta_core::llm::{LlmProvider, MockLlmProvider};
-use karta_core::store::lance::LanceVectorStore;
+use karta_core::store::sqlite_vec::SqliteVectorStore;
 use karta_core::store::sqlite::SqliteGraphStore;
 use karta_core::store::{GraphStore, VectorStore};
 use karta_core::Karta;
 
-/// Build a fresh Karta backed by MockLlmProvider + on-disk Lance/SQLite.
+/// Build a fresh Karta backed by MockLlmProvider + on-disk sqlite-vec/SQLite.
 /// Wiping any previous data dir so the test starts from a clean slate.
 async fn make_karta(tag: &str) -> Karta {
     let data_dir = format!("/tmp/karta-test-fetch-memories-{}", tag);
     let _ = std::fs::remove_dir_all(&data_dir);
 
-    let vector_store = Arc::new(
-        LanceVectorStore::new(
-            &data_dir,
-            karta_core::store::lance::DEFAULT_EMBEDDING_DIM,
-        )
-        .await
-        .unwrap(),
-    ) as Arc<dyn VectorStore>;
-
-    let graph_store = Arc::new(SqliteGraphStore::new(&data_dir).unwrap()) as Arc<dyn GraphStore>;
+    let vec_store = SqliteVectorStore::new(&data_dir, 1536).await.unwrap();
+    let shared_conn = vec_store.connection();
+    let vector_store = Arc::new(vec_store) as Arc<dyn VectorStore>;
+    let graph_store =
+        Arc::new(SqliteGraphStore::with_connection(shared_conn)) as Arc<dyn GraphStore>;
     let llm = Arc::new(MockLlmProvider::new()) as Arc<dyn LlmProvider>;
 
     let mut config = KartaConfig::default();
@@ -160,12 +155,11 @@ async fn fetch_memories_does_not_invoke_answer_llm() {
     let data_dir = "/tmp/karta-test-fetch-memories-counting".to_string();
     let _ = std::fs::remove_dir_all(&data_dir);
 
-    let vector_store = Arc::new(
-        LanceVectorStore::new(&data_dir, karta_core::store::lance::DEFAULT_EMBEDDING_DIM)
-            .await
-            .unwrap(),
-    ) as Arc<dyn VectorStore>;
-    let graph_store = Arc::new(SqliteGraphStore::new(&data_dir).unwrap()) as Arc<dyn GraphStore>;
+    let vec_store = SqliteVectorStore::new(&data_dir, 1536).await.unwrap();
+    let shared_conn = vec_store.connection();
+    let vector_store = Arc::new(vec_store) as Arc<dyn VectorStore>;
+    let graph_store =
+        Arc::new(SqliteGraphStore::with_connection(shared_conn)) as Arc<dyn GraphStore>;
 
     let chat_calls = Arc::new(AtomicU64::new(0));
     let llm = Arc::new(CountingLlm {
@@ -187,10 +181,17 @@ async fn fetch_memories_does_not_invoke_answer_llm() {
         .unwrap();
 
     // Snapshot the chat-call count after ingest. fetch_memories must not
-    // increment it — the retrieval path only touches embed() + graph +
-    // vector store, never chat().
+    // increment it for a non-temporal query — that path only touches
+    // embed() + graph + vector store. (Queries with temporal indicators
+    // like "when" may legitimately make ONE core-LLM call via the tier-2
+    // temporal resolver; that path is covered by resolver_tier2.rs. The
+    // invariant here is no ANSWER/synthesis call, so keep the query
+    // atemporal.)
     let before_fetch = chat_calls.load(Ordering::SeqCst);
-    let _ = karta.fetch_memories("When does Nimbus launch?", 5).await.unwrap();
+    let _ = karta
+        .fetch_memories("What is the status of Project Nimbus?", 5)
+        .await
+        .unwrap();
     let after_fetch = chat_calls.load(Ordering::SeqCst);
 
     assert_eq!(

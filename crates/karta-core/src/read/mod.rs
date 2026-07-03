@@ -446,7 +446,7 @@ impl ReadEngine {
     /// Two-phase approach for latency: first traverse the graph (SQLite,
     /// sub-millisecond per hop) to collect all reachable IDs + weights,
     /// then fetch the notes in one batched vector-store call instead of
-    /// N individual get() calls (which are expensive on Lance).
+    /// N individual get() calls.
     async fn multi_hop_traverse(
         &self,
         seed_id: &str,

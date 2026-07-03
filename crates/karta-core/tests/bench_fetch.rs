@@ -114,8 +114,8 @@ fn find_latest_data_dir(conv_id: &str) -> Option<String> {
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
             let created = meta.created().ok().or_else(|| meta.modified().ok())?;
-            let lance_path = e.path().join("lance/notes.lance/data");
-            if lance_path.exists() {
+            let sqlite_path = e.path().join("karta.db");
+            if sqlite_path.exists() {
                 Some((e.path().to_string_lossy().to_string(), created))
             } else {
                 None

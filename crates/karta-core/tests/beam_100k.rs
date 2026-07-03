@@ -415,12 +415,9 @@ fn find_latest_data_dir(conv_id: &str) -> Option<String> {
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
             let created = meta.created().ok().or_else(|| meta.modified().ok())?;
-            // Verify the dir has actual data — accept either backend
-            // (sqlite-vec default or the legacy Lance table).
+            // Verify the dir has actual data.
             let sqlite_path = e.path().join("karta.db");
-            let lance_path = e.path().join("lance/notes.lance/data");
-            let has_data = sqlite_path.exists() || lance_path.exists();
-            if has_data {
+            if sqlite_path.exists() {
                 Some((e.path().to_string_lossy().to_string(), created))
             } else {
                 None
