@@ -6,7 +6,7 @@
 > positioning material. Benchmark numbers are self-published unless noted
 > otherwise and should be treated as claims until independently reproduced.
 >
-> Last compiled: 2026-07-05.
+> Last compiled: 2026-07-06.
 
 ## Legend
 
@@ -66,6 +66,10 @@
 | **MemFail** *(arxiv 2605.26667, May 2026)* | Diagnostic benchmark stress-testing failure modes of LLM memory systems; isolates three core operations: summarization, storage, retrieval; 5 datasets across 4 tasks; tested 4 SOTA systems to reveal per-operation tradeoffs | — (diagnostic, not ranking) | [arxiv 2605.26667](https://arxiv.org/abs/2605.26667) |
 | **MemPro** *(arxiv 2606.00619, May 30, 2026)* | Treats entire memory construction-retrieval pipeline as an evolvable program (version tree); Evolving Agent diagnoses recurring failures and generates improved implementations via failure-mode-guided refinement | Consistently outperforms static and prompt-level evolving baselines on LongMemEval, LoCoMo, HotpotQA, NarrativeQA | [arxiv 2606.00619](https://arxiv.org/abs/2606.00619) |
 | **MIRIX** *(arxiv 2507.07957, Jul 2025)* | Multi-agent memory system with 6 types (Core, Episodic, Semantic, Procedural, Resource Memory, Knowledge Vault); multimodal (text + screenshots); real-time screen monitoring + local storage for privacy | LoCoMo: 85.4% SOTA; ScreenshotVQA: +35% vs RAG baseline at 99.9% storage reduction | [arxiv 2507.07957](https://arxiv.org/abs/2507.07957) |
+| **T-Mem: Memory That Anticipates, Not Archives** *(arxiv 2606.15405, Jun 2026)* | Long-term conversational memory with write-time rehearsal triggers; dual trigger families — descriptive (surface-similarity) and associative (latent semantic arc) — ensuring every memory is reachable from both query types; addresses failure case where query and memory share no surface features | SOTA on LoCoMo and LoCoMo-Plus (self-reported; specific numbers not in abstract) | [arxiv 2606.15405](https://arxiv.org/abs/2606.15405) |
+| **MemRefine: LLM-Guided Compression for Long-Term Agent Memory** *(arxiv 2606.13177, Jun 2026)* | Memory compression within fixed storage budgets; LLM judges which entries to delete, merge, or preserve; similarity matching surfaces candidate pairs; iterates until budget is met | Consistently meets target budgets while preserving or exceeding downstream accuracy vs rule-based baselines under tight budgets | [arxiv 2606.13177](https://arxiv.org/abs/2606.13177) |
+| **Cross-Scenario Generality of Agentic Memory Systems + AutoMEM** *(arxiv 2606.04315, Jun 2026)* | Evaluates 8 memory systems across 5 diverse scenarios (single-turn QA, multi-session chat, agentic-trajectory QA, stress tests, long-horizon tasks); introduces AutoMEM — an agentic harness that lets agents self-manage storage/retrieval via tool calls | AutoMEM achieves best cross-scenario ranking; passive fixed-pipeline systems lack scenario-adaptive behavior | [arxiv 2606.04315](https://arxiv.org/abs/2606.04315) |
+| **Metis: Bridging Text and Code Memory for Self-Evolving Agents** *(arxiv 2606.24151, Jun 2026)* | Dual memory: textual knowledge (experiences, facts) + code memory (executable functions, procedures); bridge mechanism converts insights to reusable code and vice versa; enables compounding skill acquisition across tasks | — | [arxiv 2606.24151](https://arxiv.org/abs/2606.24151) |
 
 ## Notable New / Emerging Systems
 
@@ -156,6 +160,9 @@
 | 2026-07-05 | **BAI-LAB MemoryOS**: 5× faster via parallelization optimizations; MemoryOS-MCP open-sourced (Jun 2026) for agent client integration. | [github.com/BAI-LAB/MemoryOS](https://github.com/BAI-LAB/MemoryOS) |
 | 2026-07-05 | **Added MIRIX to notable systems**: 6-type multi-agent memory (Jul 2025 paper, not previously tracked); LoCoMo 85.4%; multimodal with real-time screen monitoring; 99.9% storage reduction vs RAG on ScreenshotVQA. | [arxiv 2507.07957](https://arxiv.org/abs/2507.07957) |
 | 2026-07-05 | **Added 5 new papers**: MemIR (arxiv 2605.25869, typed provenance memory), RecMem (arxiv 2605.16045, ACL 2026, 87% token reduction), MemFail (arxiv 2605.26667, failure-mode diagnostics), MemPro (arxiv 2606.00619, evolvable pipelines), MIRIX (arxiv 2507.07957, multimodal multi-agent). | arxiv |
+| 2026-07-06 | **Honcho v3.0.10 RC (Jun 15) and v3.0.11 RC (Jun 24, 2026)**: CloudEvents + Langfuse tracing projections over captured LLM stream, OpenRouter header attribution, deriver batch flushing improvements, surprisal tree parameter fixes, JWT scope fixes. | [github.com/plastic-labs/honcho](https://github.com/plastic-labs/honcho) |
+| 2026-07-06 | **Hindsight Eve v0.2.0 (Jul 3, 2026)**: New auto-memory mode that requires no model tool-calling; enables passive memory retention for models without function-calling support. | [github.com/vectorize-io/hindsight](https://github.com/vectorize-io/hindsight) |
+| 2026-07-06 | **Added 4 new papers (Jun 2026)**: T-Mem (arxiv 2606.15405 — write-time rehearsal triggers, LoCoMo SOTA claimed), MemRefine (arxiv 2606.13177 — LLM-guided compression within fixed storage budgets), AutoMEM/Cross-Scenario (arxiv 2606.04315 — agentic harness outperforms passive pipelines across 5 scenarios), Metis (arxiv 2606.24151 — dual text+code memory for self-evolving agents). | arxiv |
 
 ---
 
