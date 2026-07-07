@@ -126,6 +126,10 @@ impl SqliteVectorStore {
                 id text primary key,
                 embedding float[{dim}]
             );
+            CREATE TABLE IF NOT EXISTS kv_counters (
+                name  TEXT PRIMARY KEY NOT NULL,
+                value INTEGER NOT NULL
+            );
             "
         );
 
@@ -294,6 +298,18 @@ impl crate::store::VectorStore for SqliteVectorStore {
         let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))?;
         Ok(count as usize)
+    }
+
+    async fn next_seq(&self) -> Result<u64> {
+        let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+        let val: i64 = conn.query_row(
+            "INSERT INTO kv_counters (name, value) VALUES ('global_seq', 1)
+             ON CONFLICT(name) DO UPDATE SET value = value + 1
+             RETURNING value",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(val as u64)
     }
 
     async fn upsert(&self, note: &MemoryNote) -> Result<()> {
