@@ -333,7 +333,7 @@ impl WriteEngine {
             match embed_result {
                 Ok(fact_embeddings) => {
                     for (i, (extraction, embedding)) in attrs_atomic_facts.iter()
-                        .take(5)
+                        .take(self.config.max_facts_per_note)
                         .zip(fact_embeddings)
                         .enumerate()
                     {
