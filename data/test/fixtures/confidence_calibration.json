@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "notes": "Hand-labeled fixture for F7-T15. Each entry is a (message_content, reference_time, expected_facts) triple. The expected_facts list carries each fact's hand-labeled confidence band. Add entries over time; 20+ per band is the minimum bar before F7-T15 runs.",
+  "entries": []
+}

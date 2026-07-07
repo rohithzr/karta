@@ -1,0 +1,40 @@
+//! Admission gate: reject ephemeral memory kinds before storage.
+
+use super::entity_type::EntityType;
+use super::facet::Facet;
+use super::memory_kind::MemoryKind;
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum AdmissionError {
+    #[error("ephemeral memory_kind {0:?} is not admitted to long-term storage")]
+    Ephemeral(MemoryKind),
+}
+
+/// Returns `Ok(())` if the kind is durable; `Err` if it's a speech act,
+/// echo, or request. Caller drops the fact on `Err`.
+pub fn validate_admission(kind: MemoryKind) -> Result<(), AdmissionError> {
+    if kind.is_durable() {
+        Ok(())
+    } else {
+        Err(AdmissionError::Ephemeral(kind))
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum SpecificityError {
+    #[error("both entity_type and facet are generic — fact is uninformative")]
+    BothGeneric,
+}
+
+/// Returns `Ok(())` unless BOTH `entity_type` and `facet` are `Unknown`.
+/// One generic dimension is fine if the other is typed.
+pub fn validate_specificity(
+    entity_type: EntityType,
+    facet: Facet,
+) -> Result<(), SpecificityError> {
+    if entity_type.is_generic() && facet.is_generic() {
+        Err(SpecificityError::BothGeneric)
+    } else {
+        Ok(())
+    }
+}

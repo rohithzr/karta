@@ -454,3 +454,53 @@ Tertiary: **p50 / p95 latency per 20-candidate rerank**. Cohere and Jina are net
 - If **Cohere beats Jina significantly**: consider migrating default. Cost drops 10× and we keep a hosted option for users who don't want to run TEI.
 - If **Jina clearly wins**: keep as-is, mark this experiment as "tested, no improvement found" in the memory/baseline file.
 - If **all three are within noise**: default to TEI anyway for the zero-external-dep OSS story.
+
+## STEP1.5 follow-ups (captured, not scheduled)
+
+### Provenance::Echo vs harness-level skip
+
+STEP1.5 currently has the BEAM harness skip `question_type: 'answer_ai_question'`
+turns outright. If we observe real cases where an echo turn carries genuine new
+info (e.g. "sure let's break it down, and also my budget is $800"), switch to a
+`Provenance::Echo` tag with a configurable retrieval-side downweight. Additive
+change; no migration needed.
+
+### Calibration fixture completion
+
+`data/test/fixtures/confidence_calibration.json` is scaffolded but unlabeled.
+Needs ≥100 entries (≥20 per band) hand-labeled from real BEAM conversations
+before F7-T15 is meaningful. See the fixture's README for format and rubric.
+
+### Backfill legacy facts
+
+Pre-1.5 facts have null `occurred_*`. They're excluded from temporal queries by
+design. Consider re-extraction if coverage gap is measured and judged material.
+
+### Tier 1 match-rate instrumentation
+
+Track the fraction of temporal queries handled by tier 1 vs punted to tier 2. A
+suspiciously high tier 1 match rate on ambiguous phrases suggests a regex false
+positive; a suspiciously high tier 2 rate suggests tier 1 coverage gaps worth
+closing.
+
+### Tier 2 resolver cache
+
+`(query_text, truncate(reference_time, day)) → (Interval, Confidence)`
+memoization inside a session. Low priority; add if tier 2 call rate becomes a
+measurable latency contributor.
+
+### Tier 2 session context plumbing
+
+`recent_user_turns_in_session` is stubbed but `search_wide` doesn't thread
+`session_id` today. For phrases that anchor on the reference time alone ("last
+spring", "yesterday"), empty session context is fine. For phrases that anchor
+on mid-conversation references ("when we discussed the budget"), plumb session
+context into the read path.
+
+### Lance store interval-overlap override
+
+`SqliteVectorStore` implements `find_similar_facts_in_interval`; `LanceVectorStore`
+uses the trait's default `unimplemented!()`. A Lance-backed deployment that issues
+a temporal query with STEP1.5 live will panic. Either mirror the SQL predicate in
+the Lance query layer or gate the temporal read path on a runtime store-capability
+check.

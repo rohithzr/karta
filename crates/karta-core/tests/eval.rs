@@ -1,12 +1,13 @@
 //! Integration eval tests — ports the 10 TypeScript PoC scenarios to Rust.
 //!
-//! Uses MockLlmProvider + real LanceDB + real SQLite.
+//! Uses MockLlmProvider + real sqlite-vec + real SQLite.
 //! Run: cargo test --test eval
+#![cfg(feature = "sqlite-vec")]
 
 use std::sync::Arc;
 use karta_core::config::KartaConfig;
 use karta_core::llm::MockLlmProvider;
-use karta_core::store::lance::LanceVectorStore;
+use karta_core::store::sqlite_vec::SqliteVectorStore;
 use karta_core::store::sqlite::SqliteGraphStore;
 use karta_core::store::{GraphStore, VectorStore};
 use karta_core::Karta;
@@ -256,18 +257,11 @@ async fn create_karta(scenario_name: &str) -> Karta {
     // Clean up from previous runs
     let _ = std::fs::remove_dir_all(&data_dir);
 
-    let vector_store = Arc::new(
-        LanceVectorStore::new(
-            &data_dir,
-            karta_core::store::lance::DEFAULT_EMBEDDING_DIM,
-        )
-        .await
-        .unwrap(),
-    ) as Arc<dyn VectorStore>;
-
-    let graph_store = Arc::new(
-        SqliteGraphStore::new(&data_dir).unwrap(),
-    ) as Arc<dyn GraphStore>;
+    let vec_store = SqliteVectorStore::new(&data_dir, 1536).await.unwrap();
+    let shared_conn = vec_store.connection();
+    let vector_store = Arc::new(vec_store) as Arc<dyn VectorStore>;
+    let graph_store =
+        Arc::new(SqliteGraphStore::with_connection(shared_conn)) as Arc<dyn GraphStore>;
 
     let llm = Arc::new(MockLlmProvider::new()) as Arc<dyn karta_core::llm::LlmProvider>;
 

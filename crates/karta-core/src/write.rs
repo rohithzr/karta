@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::clock::ClockContext;
 use crate::config::{EpisodeConfig, WriteConfig};
 use crate::error::Result;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
 use crate::note::{Episode, LinkDecision, MemoryNote, NoteAttributes, Provenance};
 use crate::store::{GraphStore, VectorStore};
+use crate::trace::{self, KnnCandidate, TraceEvent};
 
 /// Handles the write path: index, link, evolve.
 pub struct WriteEngine {
@@ -36,7 +38,54 @@ impl WriteEngine {
         }
     }
 
+    /// Live-default sugar over `add_note_with_clock`. Used by smoke tests
+    /// and quick scripts that don't need to express a session, turn index, or
+    /// reference time.
     pub async fn add_note(&self, content: &str) -> Result<MemoryNote> {
+        self.add_note_with_clock(content, None, None, ClockContext::now())
+            .await
+    }
+
+    /// Canonical write entrypoint. `session_id` carries through to episode
+    /// segmentation; `turn_index` lets the read path order chronologically;
+    /// `ctx.reference_time()` becomes the note's `source_timestamp` and the
+    /// anchor for foresight TTL math at this turn.
+    pub async fn add_note_with_clock(
+        &self,
+        content: &str,
+        session_id: Option<&str>,
+        turn_index: Option<u32>,
+        ctx: ClockContext,
+    ) -> Result<MemoryNote> {
+        let note = self.add_note_inner(content, session_id, turn_index, ctx).await?;
+        if session_id.is_some() {
+            self.maybe_extend_episode(session_id.unwrap(), &note, ctx).await?;
+        }
+        Ok(note)
+    }
+
+    async fn add_note_inner(
+        &self,
+        content: &str,
+        session_id: Option<&str>,
+        turn_index: Option<u32>,
+        ctx: ClockContext,
+    ) -> Result<MemoryNote> {
+        // Future-skew warning (codex #2). If the data's reference_time is
+        // more than `future_skew_threshold_days` ahead of the wall clock,
+        // log it but don't reject — production may have legitimate
+        // client/server clock skew. Recency math clamps the negative-age
+        // case at read time.
+        let skew_days =
+            (ctx.reference_time() - Utc::now()).num_seconds() as f64 / 86400.0;
+        if skew_days > self.config.future_skew_threshold_days {
+            warn!(
+                skew_days,
+                reference_time = %ctx.reference_time(),
+                "ingest received future-dated reference_time"
+            );
+        }
+
         let preview_end = {
             let max = 60;
             let mut end = content.len().min(max);
@@ -47,28 +96,57 @@ impl WriteEngine {
 
         // 1. Generate attributes + embed raw content in parallel
         let content_owned = content.to_string();
-        let embed_fut = async {
-            self.llm.embed(&[&content_owned]).await
-        };
-        let (attrs, raw_embeddings) = tokio::join!(
-            self.generate_attributes(content),
-            embed_fut
+        let attrs_fut = trace::stage(
+            "attrs",
+            self.generate_attributes(content, ctx.reference_time()),
         );
+        let embed_fut = trace::stage("embed_raw", async {
+            self.llm.embed(&[&content_owned]).await
+        });
+        let (attrs, raw_embeddings) = tokio::join!(attrs_fut, embed_fut);
         let attrs = attrs?;
         let raw_embedding = raw_embeddings?.into_iter().next().unwrap_or_default();
         debug!(context = %attrs.context, "Generated attributes");
 
-        // 2. Create the note
+        // 2. Create the note. source_timestamp = ctx.reference_time() —
+        // every note carries the data's "now" at ingest. Live mode passes
+        // ClockContext::now() so this matches Utc::now(); replay passes a
+        // parsed source-clock instant.
         let mut note = MemoryNote::new(content.to_string());
         note.context = attrs.context;
         note.keywords = attrs.keywords;
         note.tags = attrs.tags;
+        note.source_timestamp = ctx.reference_time();
+        note.turn_index = turn_index;
+        note.session_id = session_id.map(String::from);
 
         // 3. Use raw embedding for candidate search (fast path)
-        let candidates = self
-            .vector_store
-            .find_similar(&raw_embedding, self.config.top_k_candidates, &[&note.id])
-            .await?;
+        let candidates = trace::stage("knn", async {
+            let knn_start = std::time::Instant::now();
+            let cands = self
+                .vector_store
+                .find_similar(&raw_embedding, self.config.top_k_candidates, &[&note.id])
+                .await?;
+            let wall_ms = knn_start.elapsed().as_millis() as u64;
+            let heavy = trace::heavy();
+            trace::try_emit(TraceEvent::KnnCandidates {
+                ts: Utc::now(),
+                turn_idx: trace::current_turn(),
+                stage: trace::current_stage(),
+                wall_ms,
+                returned: cands.len(),
+                candidates: if heavy {
+                    Some(cands.iter().map(|(n, score)| KnnCandidate {
+                        note_id: n.id.clone(),
+                        score: *score,
+                        content_preview: Some(n.content.chars().take(160).collect()),
+                    }).collect())
+                } else {
+                    None
+                },
+            });
+            Ok::<_, crate::error::KartaError>(cands)
+        }).await?;
 
         // 4. Compute enriched embedding for storage (content + context + keywords)
         let embedding_text = format!(
@@ -77,7 +155,9 @@ impl WriteEngine {
             note.context,
             note.keywords.join(" ")
         );
-        let enriched_embeddings = self.llm.embed(&[&embedding_text]).await?;
+        let enriched_embeddings = trace::stage("embed_enriched", async {
+            self.llm.embed(&[&embedding_text]).await
+        }).await?;
         note.embedding = enriched_embeddings.into_iter().next().unwrap_or_default();
 
         let candidates: Vec<_> = candidates
@@ -89,7 +169,7 @@ impl WriteEngine {
 
         // 5. LLM decides which candidates to link
         let link_decisions = if !candidates.is_empty() {
-            self.decide_links(content, &note.context, &candidates).await?
+            trace::stage("link", self.decide_links(content, &note.context, &candidates)).await?
         } else {
             Vec::new()
         };
@@ -115,19 +195,27 @@ impl WriteEngine {
                         continue;
                     }
 
-                    let updated_context = self
-                        .evolve_context(
-                            &existing.content,
-                            &existing.context,
-                            content,
-                            &decision.reason,
-                        )
-                        .await?;
+                    let prev_ctx = existing.context.clone();
+                    let updated_context = trace::stage("evolve", self.evolve_context(
+                        &existing.content,
+                        &existing.context,
+                        content,
+                        &decision.reason,
+                    )).await?;
 
                     // Record evolution in graph store
                     self.graph_store
                         .record_evolution(&existing.id, &note.id, &existing.context)
                         .await?;
+
+                    let heavy = trace::heavy();
+                    trace::try_emit(TraceEvent::Evolution {
+                        ts: Utc::now(),
+                        turn_idx: trace::current_turn(),
+                        evolved_id: existing.id.clone(),
+                        previous_context: if heavy { Some(prev_ctx) } else { None },
+                        new_context: if heavy { Some(updated_context.clone()) } else { None },
+                    });
 
                     // Update the note's context in vector store
                     let mut evolved = existing;
@@ -141,22 +229,39 @@ impl WriteEngine {
         }
 
         // 7. Store the new note
-        self.vector_store.upsert(&note).await?;
+        trace::stage("note_upsert", async {
+            self.vector_store.upsert(&note).await
+        }).await?;
 
         // 8. Store links (bidirectional)
         for decision in &link_decisions {
             self.graph_store
                 .add_link(&note.id, &decision.note_id, &decision.reason)
                 .await?;
+            trace::try_emit(TraceEvent::LinkWritten {
+                ts: Utc::now(),
+                turn_idx: trace::current_turn(),
+                from_id: note.id.clone(),
+                to_id: decision.note_id.clone(),
+                reason: decision.reason.clone(),
+            });
         }
 
         note.links = link_decisions.iter().map(|d| d.note_id.clone()).collect();
 
-        // 9. Store foresight signals extracted during attribute generation
-        let default_ttl = chrono::Duration::days(self.config.foresight_default_ttl_days);
+        // 9. Store foresight signals extracted during attribute generation.
+        // Both default TTL and DOA filter anchor to ctx.reference_time(), not
+        // Utc::now() — a foresight extracted from a 2024 message must be
+        // judged against 2024's "now", not the wall clock at replay time.
+        let default_ttl = chrono::Duration::milliseconds(
+            (self.config.foresight_default_ttl_days * 86_400_000.0) as i64,
+        );
+        let doa_window = chrono::Duration::milliseconds(
+            (self.config.foresight_doa_threshold_days * 86_400_000.0) as i64,
+        );
+        let doa_horizon = ctx.reference_time() + doa_window;
         for signal in &attrs.foresight_signals {
             if !signal.content.is_empty() {
-                // Parse valid_until from LLM extraction, fall back to default TTL
                 let valid_until = signal
                     .valid_until
                     .as_deref()
@@ -166,7 +271,23 @@ impl WriteEngine {
                             .and_then(|d| d.and_hms_opt(23, 59, 59))
                             .map(|dt| dt.and_utc())
                     })
-                    .or_else(|| Some(Utc::now() + default_ttl));
+                    .or_else(|| Some(ctx.reference_time() + default_ttl));
+
+                // Foresight DOA filter (codex #2 partial): drop signals
+                // whose valid_until is already inside the DOA window from
+                // reference_time. Storing a foresight that's expired (or
+                // about to expire) wastes a row and pollutes the active set
+                // until the next dream cycle catches it.
+                if let Some(until) = valid_until {
+                    if until <= doa_horizon {
+                        warn!(
+                            valid_until = %until,
+                            reference_time = %ctx.reference_time(),
+                            "dropping DOA foresight"
+                        );
+                        continue;
+                    }
+                }
 
                 let fs = crate::note::ForesightSignal::new(
                     signal.content.clone(),
@@ -179,15 +300,39 @@ impl WriteEngine {
         }
 
         // 10. Store atomic facts (each with its own embedding for fine-grained retrieval)
-        if !attrs.atomic_facts.is_empty() {
-            let fact_texts: Vec<&str> = attrs.atomic_facts.iter()
+        // PRE-FILTER: admission gate runs first so dedup can't silently collapse a
+        // real fact under an ephemeral one, and so the embed batch only includes
+        // facts that have a chance of being persisted.
+        let admitted: Vec<crate::note::AtomicFactExtraction> = attrs
+            .atomic_facts
+            .into_iter()
+            .filter(|e| {
+                let durable = e.memory_kind.is_durable();
+                if !durable {
+                    tracing::debug!(
+                        note_id = %note.id,
+                        kind = ?e.memory_kind,
+                        "pre-filter dropped ephemeral fact before dedup/embed",
+                    );
+                }
+                durable
+            })
+            .collect();
+
+        let attrs_atomic_facts = crate::extract::dedup::dedup_extractions(admitted);
+        if !attrs_atomic_facts.is_empty() {
+            let fact_texts: Vec<&str> = attrs_atomic_facts.iter()
                 .take(self.config.max_facts_per_note)
                 .map(|f| f.content.as_str())
                 .collect();
 
-            match self.llm.embed(&fact_texts).await {
+            let embed_result = trace::stage("embed_facts", async {
+                self.llm.embed(&fact_texts).await
+            }).await;
+
+            match embed_result {
                 Ok(fact_embeddings) => {
-                    for (i, (extraction, embedding)) in attrs.atomic_facts.iter()
+                    for (i, (extraction, embedding)) in attrs_atomic_facts.iter()
                         .take(5)
                         .zip(fact_embeddings)
                         .enumerate()
@@ -197,14 +342,148 @@ impl WriteEngine {
                             note.id.clone(),
                             i as u32,
                         );
-                        fact.subject = extraction.subject.clone();
+
+                        // Grounding gate (FIRST): every fact must cite real source spans.
+                        // Runs before admission so telemetry attributes failures to the
+                        // actual filter that fired, and so we don't pay admission's
+                        // LLM-judgment cost on facts that are mechanically invalid.
+                        if let Err(e) = crate::extract::grounding::validate_supporting_spans(
+                            &extraction.supporting_spans,
+                            &note.content,
+                        ) {
+                            tracing::debug!(
+                                note_id = %note.id,
+                                fact_ordinal = i,
+                                spans = ?extraction.supporting_spans,
+                                error = %e,
+                                "dropping fact: grounding failed",
+                            );
+                            continue;
+                        }
+
+                        // Admission gate (defense-in-depth — the pre-filter in Task 9 catches the
+                        // bulk of ephemeral facts before they reach embed). This per-fact backstop
+                        // catches anything that snuck through the JSON-fallback parse path.
+                        if let Err(e) = crate::extract::admission::validate_admission(extraction.memory_kind) {
+                            tracing::debug!(
+                                note_id = %note.id,
+                                fact_ordinal = i,
+                                kind = ?extraction.memory_kind,
+                                error = %e,
+                                "dropping fact: admission failed",
+                            );
+                            continue;
+                        }
+
+                        // Specificity gate (THIRD): drop facts that are generic on both axes.
+                        if let Err(e) = crate::extract::admission::validate_specificity(
+                            extraction.entity_type,
+                            extraction.facet,
+                        ) {
+                            tracing::debug!(
+                                note_id = %note.id,
+                                fact_ordinal = i,
+                                entity_type = ?extraction.entity_type,
+                                facet = ?extraction.facet,
+                                error = %e,
+                                "dropping fact: specificity failed",
+                            );
+                            continue;
+                        }
+
+                        // Date-shaped facets MUST populate value_date. Real LLMs
+                        // (esp. smaller open models) bias to null under structured
+                        // output even when the prompt says otherwise — the validator
+                        // is the only thing that holds.
+                        match crate::extract::temporal_slots::validate_value_date_for_facet(
+                            extraction.facet,
+                            extraction.value_date,
+                        ) {
+                            crate::extract::temporal_slots::ValueDateOutcome::Keep => {}
+                            crate::extract::temporal_slots::ValueDateOutcome::StripFact => {
+                                tracing::debug!(
+                                    note_id = %note.id,
+                                    fact_ordinal = i,
+                                    facet = ?extraction.facet,
+                                    "dropping fact: date-shaped facet missing value_date",
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Strip occurred_* if no supporting_span carries a temporal
+                        // marker. Mirrors the temporal_evidence cite-and-validate
+                        // pattern from F7-v3.
+                        let mut occ_start = extraction.occurred_start;
+                        // Small models emit occurred_start but leave occurred_end
+                        // null; derive the end per the schema convention so the
+                        // fact survives validate_occurred's pairing invariant.
+                        let mut occ_end = crate::extract::temporal_slots::derive_occurred_end(
+                            extraction.occurred_start,
+                            extraction.occurred_end,
+                        );
+                        let mut occ_conf = extraction.occurred_confidence;
+                        match crate::extract::temporal_slots::validate_occurred_grounding(
+                            occ_start,
+                            occ_conf.as_f32(),
+                            &extraction.supporting_spans,
+                        ) {
+                            crate::extract::temporal_slots::OccurredOutcome::Keep => {}
+                            crate::extract::temporal_slots::OccurredOutcome::StripBounds => {
+                                tracing::debug!(
+                                    note_id = %note.id,
+                                    fact_ordinal = i,
+                                    "stripping occurred_*: no temporal marker in supporting_spans",
+                                );
+                                occ_start = None;
+                                occ_end = None;
+                                occ_conf = crate::read::temporal::ConfidenceBand::None;
+                            }
+                        }
+
+                        fact.memory_kind = extraction.memory_kind;
+                        fact.facet = extraction.facet;
+                        fact.entity_type = extraction.entity_type;
+                        fact.entity_text = extraction.entity_text.clone();
+                        fact.value_text = extraction.value_text.clone();
+                        fact.value_date = extraction.value_date;
+                        fact.supporting_spans = extraction.supporting_spans.clone();
                         fact.embedding = embedding;
                         fact.created_at = note.created_at;
+                        fact.source_timestamp = note.source_timestamp;
+                        fact.occurred_start = occ_start;
+                        fact.occurred_end = occ_end;
+                        fact.occurred_confidence = occ_conf;
 
+                        // Validate before writing. Reject if invariants broken
+                        // (unpaired bounds, end<=start, or confidence-bounds
+                        // mismatch). Malformed extractions are dropped with a
+                        // warn log rather than persisted.
+                        if let Err(e) = fact.validate_occurred() {
+                            tracing::warn!(
+                                note_id = %note.id,
+                                fact_ordinal = i,
+                                error = %e,
+                                "dropping malformed fact: occurred_* validation failed",
+                            );
+                            continue;
+                        }
+
+                        let fact_id = fact.id.clone();
+                        let fact_content = fact.content.clone();
                         let _ = self.vector_store.upsert_fact(&fact).await;
                         let _ = self.graph_store.record_fact(
-                            &fact.id, &note.id, i as u32, fact.subject.as_deref()
+                            &fact.id, &note.id, i as u32, fact.entity_text.as_deref()
                         ).await;
+                        let heavy = trace::heavy();
+                        trace::try_emit(TraceEvent::FactWritten {
+                            ts: Utc::now(),
+                            turn_idx: trace::current_turn(),
+                            fact_id,
+                            source_note_id: note.id.clone(),
+                            ordinal: i as u32,
+                            content: if heavy { Some(fact_content) } else { None },
+                        });
                     }
                     debug!(count = fact_texts.len(), note_id = %note.id, "Stored atomic facts");
                 }
@@ -214,46 +493,51 @@ impl WriteEngine {
             }
         }
 
+        trace::try_emit(TraceEvent::NoteWritten {
+            ts: Utc::now(),
+            turn_idx: trace::current_turn(),
+            note_id: note.id.clone(),
+            link_count: note.links.len(),
+        });
+
         info!(note_id = %note.id, links = note.links.len(), "Note stored");
 
         Ok(note)
     }
 
-    /// Add a note within a session context. Handles episode boundary detection
-    /// and narrative synthesis when episodes are enabled.
-    pub async fn add_note_with_session(
+    /// Episode segmentation step. Called by `add_note_with_clock` when a
+    /// session_id is supplied. Time-gap math anchors to `ctx.reference_time()`
+    /// so replay sessions split into episodes the same way live ones do —
+    /// without this, a 2024 message replayed in 2026 looks like a 2-year gap
+    /// from any pre-existing episode and force-splits every turn.
+    async fn maybe_extend_episode(
         &self,
-        content: &str,
         session_id: &str,
-    ) -> Result<MemoryNote> {
-        // First, add the note normally
-        let note = self.add_note(content).await?;
-
+        note: &MemoryNote,
+        ctx: ClockContext,
+    ) -> Result<()> {
         if !self.episode_config.enabled {
-            return Ok(note);
+            return Ok(());
         }
 
-        // Get existing episodes for this session
+        let content = note.content.as_str();
         let episodes = self
             .graph_store
             .get_episodes_for_session(session_id)
             .await?;
-
         let current_episode = episodes.last();
 
-        // Decide: extend current episode or create new one?
         let should_new_episode = match current_episode {
             None => true,
             Some(ep) => {
-                let time_gap = Utc::now()
+                let time_gap = ctx
+                    .reference_time()
                     .signed_duration_since(ep.end_time)
                     .num_seconds();
 
-                // Hard boundary: time gap exceeds threshold
                 if time_gap > self.episode_config.time_gap_threshold_secs {
                     true
                 } else {
-                    // Soft boundary: ask LLM about thematic shift
                     let last_note_content = if let Some(last_id) = ep.note_ids.last() {
                         self.vector_store
                             .get(last_id)
@@ -267,32 +551,31 @@ impl WriteEngine {
                     if last_note_content.is_empty() {
                         false
                     } else {
-                        self.detect_episode_boundary(
+                        trace::stage("episode_boundary", self.detect_episode_boundary(
                             &last_note_content,
                             content,
                             time_gap,
-                        )
-                        .await?
+                        )).await?
                     }
                 }
             }
         };
 
         if should_new_episode {
-            // Create new episode
             let mut episode = Episode::new(session_id.to_string());
             episode.note_ids.push(note.id.clone());
-            episode.end_time = Utc::now();
+            episode.start_time = ctx.reference_time();
+            episode.end_time = ctx.reference_time();
 
-            // Synthesize narrative for this first note
-            let (narrative, tags) = self.synthesize_narrative(&[content]).await?;
+            let (narrative, tags) = trace::stage("narrative_synth",
+                self.synthesize_narrative(&[content])).await?;
             episode.narrative = narrative.clone();
             episode.topic_tags = tags;
 
-            // Create narrative note
-            let narrative_note = self
-                .create_narrative_note(&narrative, &episode.id)
-                .await?;
+            // Narrative-note source_timestamp = max(input.source_timestamp).
+            // First note in episode → that's just this note's source_timestamp.
+            let narrative_note = trace::stage("narrative_note",
+                self.create_narrative_note(&narrative, &episode.id, note.source_timestamp)).await?;
             episode.narrative_note_id = Some(narrative_note.id.clone());
 
             self.graph_store.upsert_episode(&episode).await?;
@@ -302,12 +585,10 @@ impl WriteEngine {
 
             debug!(episode_id = %episode.id, session = session_id, "Created new episode");
         } else if let Some(ep) = current_episode {
-            // Extend existing episode
             self.graph_store
                 .add_note_to_episode(&note.id, &ep.id)
                 .await?;
 
-            // Re-synthesize narrative with all notes in the episode
             let all_note_ids = self
                 .graph_store
                 .get_notes_for_episode(&ep.id)
@@ -316,20 +597,30 @@ impl WriteEngine {
             let all_notes = self.vector_store.get_many(&all_refs).await?;
             let contents: Vec<&str> = all_notes.iter().map(|n| n.content.as_str()).collect();
 
-            let (narrative, tags) = self.synthesize_narrative(&contents).await?;
+            // max(input.source_timestamp) over the episode's notes — bounded
+            // claim for the narrative's effective freshness.
+            let max_source_ts = all_notes
+                .iter()
+                .map(|n| n.source_timestamp)
+                .max()
+                .unwrap_or_else(|| note.source_timestamp);
 
-            // Update episode
+            let (narrative, tags) = trace::stage("narrative_resynth",
+                self.synthesize_narrative(&contents)).await?;
+
             let mut updated = ep.clone();
-            updated.end_time = Utc::now();
+            updated.end_time = ctx.reference_time();
             updated.narrative = narrative.clone();
             updated.topic_tags = tags;
 
-            // Update or create narrative note
             if let Some(ref nar_id) = updated.narrative_note_id {
                 if let Some(mut nar_note) = self.vector_store.get(nar_id).await? {
                     nar_note.content = narrative;
                     nar_note.updated_at = Utc::now();
-                    let emb = self.llm.embed(&[&nar_note.content]).await?;
+                    nar_note.source_timestamp = max_source_ts;
+                    let emb = trace::stage("embed_narrative", async {
+                        self.llm.embed(&[&nar_note.content]).await
+                    }).await?;
                     nar_note.embedding = emb.into_iter().next().unwrap_or_default();
                     self.vector_store.upsert(&nar_note).await?;
                 }
@@ -339,7 +630,7 @@ impl WriteEngine {
             debug!(episode_id = %ep.id, notes = all_note_ids.len(), "Extended episode");
         }
 
-        Ok(note)
+        Ok(())
     }
 
     async fn detect_episode_boundary(
@@ -410,10 +701,18 @@ impl WriteEngine {
         &self,
         narrative: &str,
         episode_id: &str,
+        source_timestamp: chrono::DateTime<Utc>,
     ) -> Result<MemoryNote> {
-        let embeddings = self.llm.embed(&[narrative]).await?;
+        let embeddings = trace::stage("embed_narrative", async {
+            self.llm.embed(&[narrative]).await
+        }).await?;
         let embedding = embeddings.into_iter().next().unwrap_or_default();
 
+        // Narrative notes are inferences over a batch. source_timestamp =
+        // max(input.source_timestamp) is the bounded claim — same shape as
+        // dream notes (see dream/engine.rs persist_dream). Stamping with
+        // Utc::now() would create the time-travel-confidence bug for
+        // back-dated queries.
         let note = MemoryNote {
             id: Uuid::new_v4().to_string(),
             content: narrative.to_string(),
@@ -432,14 +731,19 @@ impl WriteEngine {
             status: crate::note::NoteStatus::Active,
             last_accessed_at: Utc::now(),
             turn_index: None,
-            source_timestamp: None,
+            source_timestamp,
+            session_id: None,
         };
 
         self.vector_store.upsert(&note).await?;
         Ok(note)
     }
 
-    async fn generate_attributes(&self, content: &str) -> Result<NoteAttributes> {
+    async fn generate_attributes(
+        &self,
+        content: &str,
+        reference_time: chrono::DateTime<Utc>,
+    ) -> Result<NoteAttributes> {
         let messages = vec![
             ChatMessage {
                 role: Role::System,
@@ -447,7 +751,7 @@ impl WriteEngine {
             },
             ChatMessage {
                 role: Role::User,
-                content: Prompts::note_attributes_user(content),
+                content: Prompts::note_attributes_user(content, reference_time),
             },
         ];
 
@@ -506,9 +810,41 @@ impl WriteEngine {
                 .map(|a| {
                     a.iter()
                         .filter_map(|v| {
+                            let occurred_start = v["occurred_start"]
+                                .as_str()
+                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                .map(|dt| dt.with_timezone(&chrono::Utc));
+                            let occurred_end = v["occurred_end"]
+                                .as_str()
+                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                .map(|dt| dt.with_timezone(&chrono::Utc));
+                            let occurred_confidence = v["occurred_confidence"]
+                                .as_f64()
+                                .and_then(|f| {
+                                    crate::read::temporal::ConfidenceBand::try_from_f32(f as f32).ok()
+                                })
+                                .unwrap_or(crate::read::temporal::ConfidenceBand::None);
                             Some(crate::note::AtomicFactExtraction {
                                 content: v["content"].as_str()?.to_string(),
-                                subject: v["subject"].as_str().map(String::from),
+                                memory_kind: serde_json::from_value(v["memory_kind"].clone())
+                                    .unwrap_or(crate::extract::memory_kind::MemoryKind::DurableFact),
+                                supporting_spans: v["supporting_spans"]
+                                    .as_array()
+                                    .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                                    .unwrap_or_default(),
+                                facet: serde_json::from_value(v["facet"].clone())
+                                    .unwrap_or(crate::extract::facet::Facet::Unknown),
+                                entity_type: serde_json::from_value(v["entity_type"].clone())
+                                    .unwrap_or(crate::extract::entity_type::EntityType::Unknown),
+                                entity_text: v["entity_text"].as_str().map(String::from),
+                                value_text: v["value_text"].as_str().map(String::from),
+                                value_date: v["value_date"]
+                                    .as_str()
+                                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                    .map(|dt| dt.with_timezone(&chrono::Utc)),
+                                occurred_start,
+                                occurred_end,
+                                occurred_confidence,
                             })
                         })
                         .collect()

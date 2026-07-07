@@ -33,13 +33,14 @@
 //! and adversarial. Dataset: https://github.com/snap-research/locomo
 //!
 //! Run: cargo test --test bench_beam -- --ignored --nocapture
+#![cfg(feature = "sqlite-vec")]
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use karta_core::config::KartaConfig;
 use karta_core::llm::MockLlmProvider;
-use karta_core::store::lance::LanceVectorStore;
+use karta_core::store::sqlite_vec::SqliteVectorStore;
 use karta_core::store::sqlite::SqliteGraphStore;
 use karta_core::store::{GraphStore, VectorStore};
 use karta_core::llm::LlmProvider;
@@ -204,8 +205,12 @@ async fn ingest_sessions(karta: &Karta, sessions: &[Session]) -> usize {
                 } else {
                     format!("[{}] {}", session.label, msg.content)
                 };
+                let ctx = match source_timestamp {
+                    Some(t) => karta_core::ClockContext::at(t),
+                    None => karta_core::ClockContext::now(),
+                };
                 let result = karta
-                    .add_note_with_metadata(&note, &session_id, Some(global_turn), source_timestamp)
+                    .add_note_with_clock(&note, Some(&session_id), Some(global_turn), ctx)
                     .await
                     .unwrap();
                 count += 1;
@@ -232,13 +237,11 @@ async fn create_karta_mock(scenario_name: &str) -> Karta {
     let dir = data_dir("beam-mock", scenario_name);
     let _ = std::fs::remove_dir_all(&dir);
 
-    let vector_store = Arc::new(
-        LanceVectorStore::new(&dir, karta_core::store::lance::DEFAULT_EMBEDDING_DIM)
-            .await
-            .unwrap(),
-    ) as Arc<dyn VectorStore>;
+    let vec_store = SqliteVectorStore::new(&dir, 1536).await.unwrap();
+    let shared_conn = vec_store.connection();
+    let vector_store = Arc::new(vec_store) as Arc<dyn VectorStore>;
     let graph_store =
-        Arc::new(SqliteGraphStore::new(&dir).unwrap()) as Arc<dyn GraphStore>;
+        Arc::new(SqliteGraphStore::with_connection(shared_conn)) as Arc<dyn GraphStore>;
     let llm = Arc::new(MockLlmProvider::new()) as Arc<dyn LlmProvider>;
 
     let mut config = KartaConfig::default();

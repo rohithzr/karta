@@ -257,14 +257,20 @@ impl LlmProvider for OpenAiProvider {
                 .and_then(|c| c.message.content.clone())
                 .unwrap_or_default();
 
-            let tokens_used = response
+            let (tokens_used, input_tokens, output_tokens) = response
                 .usage
-                .map(|u| u.total_tokens as u64)
-                .unwrap_or(0);
+                .map(|u| (
+                    u.total_tokens as u64,
+                    u.prompt_tokens as u64,
+                    u.completion_tokens as u64,
+                ))
+                .unwrap_or((0, 0, 0));
 
             Ok(ChatResponse {
                 content,
                 tokens_used,
+                input_tokens,
+                output_tokens,
             })
         })
         .await

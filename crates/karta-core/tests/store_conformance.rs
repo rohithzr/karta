@@ -22,7 +22,8 @@ fn make_test_note(id: &str, content: &str, dim: usize) -> MemoryNote {
         status: NoteStatus::Active,
         last_accessed_at: now,
         turn_index: Some(1),
-        source_timestamp: Some(now),
+        source_timestamp: now,
+        session_id: None,
     }
 }
 
@@ -98,13 +99,3 @@ async fn conformance_sqlite_vec() {
     conformance_suite(&store, 4).await;
 }
 
-#[tokio::test]
-#[cfg(feature = "lance")]
-async fn conformance_lance() {
-    use karta_core::store::lance::LanceVectorStore;
-    let dir = TempDir::new().unwrap();
-    let store = LanceVectorStore::new(dir.path().to_str().unwrap(), 4)
-        .await
-        .unwrap();
-    conformance_suite(&store, 4).await;
-}

@@ -67,6 +67,9 @@ impl SqliteVectorStore {
         let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
         let dim = self.embedding_dim;
 
+        // Schema is recreated from scratch on first run of the new code.
+        // No migration support — existing data dirs (`/tmp/karta-*`, etc.)
+        // must be deleted and re-ingested. We're experimental; this is fine.
         let ddl = format!(
             "
             CREATE TABLE IF NOT EXISTS notes (
@@ -82,7 +85,8 @@ impl SqliteVectorStore {
                 status_json TEXT NOT NULL DEFAULT '\"Active\"',
                 last_accessed_at TEXT NOT NULL,
                 turn_index INTEGER,
-                source_timestamp TEXT,
+                source_timestamp TEXT NOT NULL,
+                session_id TEXT,
                 embedding BLOB NOT NULL
             );
             CREATE TABLE IF NOT EXISTS atomic_facts (
@@ -90,11 +94,30 @@ impl SqliteVectorStore {
                 content TEXT NOT NULL,
                 source_note_id TEXT NOT NULL,
                 ordinal INTEGER NOT NULL DEFAULT 0,
-                subject TEXT,
+                memory_kind TEXT NOT NULL,
+                facet TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_text TEXT,
+                value_text TEXT,
+                value_date TEXT,
+                supporting_spans TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL,
+                source_timestamp TEXT NOT NULL,
+                occurred_start TEXT,
+                occurred_end TEXT,
+                occurred_confidence REAL NOT NULL DEFAULT 0.0,
                 embedding BLOB NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_facts_source ON atomic_facts(source_note_id);
+            CREATE INDEX IF NOT EXISTS idx_facts_entity
+                ON atomic_facts(entity_text)
+                WHERE entity_text IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_facts_facet ON atomic_facts(facet);
+            -- Partial index for interval-overlap queries; only indexes temporally-anchored
+            -- facts because null-bound facts are excluded from temporal queries by design.
+            CREATE INDEX IF NOT EXISTS idx_facts_occurred
+                ON atomic_facts(occurred_start, occurred_end)
+                WHERE occurred_start IS NOT NULL;
             CREATE VIRTUAL TABLE IF NOT EXISTS notes_vec USING vec0(
                 id text primary key,
                 embedding float[{dim}]
@@ -137,7 +160,8 @@ impl SqliteVectorStore {
         let status_json: String = row.get("status_json")?;
         let last_accessed_at: String = row.get("last_accessed_at")?;
         let turn_index: Option<u32> = row.get("turn_index")?;
-        let source_timestamp: Option<String> = row.get("source_timestamp")?;
+        let source_timestamp: String = row.get("source_timestamp")?;
+        let session_id: Option<String> = row.get("session_id")?;
         let embedding_blob: Vec<u8> = row.get("embedding")?;
 
         let keywords: Vec<String> =
@@ -159,8 +183,8 @@ impl SqliteVectorStore {
             .parse()
             .unwrap_or_else(|_| chrono::Utc::now());
         let source_timestamp = source_timestamp
-            .as_deref()
-            .and_then(|s| s.parse().ok());
+            .parse()
+            .unwrap_or_else(|_| chrono::Utc::now());
 
         Ok(MemoryNote {
             id,
@@ -179,6 +203,85 @@ impl SqliteVectorStore {
             last_accessed_at,
             turn_index,
             source_timestamp,
+            session_id,
+        })
+    }
+
+    /// Canonical row reader for `atomic_facts`. Every SELECT site routes
+    /// through here so future schema changes touch one function.
+    ///
+    /// Enum columns are stored as the snake_case discriminant string. We
+    /// quote and JSON-decode to reuse the `serde(rename_all = "snake_case")`
+    /// definition; on a corrupted value we log and fall back to the
+    /// type's default rather than failing the whole query.
+    fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<AtomicFact> {
+        fn parse_enum_or<T: serde::de::DeserializeOwned>(s: String, default: T) -> T {
+            match serde_json::from_str(&format!("\"{}\"", s)) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        value = %s,
+                        error = %e,
+                        "row_to_fact: enum decode failed, using default"
+                    );
+                    default
+                }
+            }
+        }
+
+        let memory_kind = parse_enum_or(
+            row.get("memory_kind")?,
+            crate::extract::memory_kind::MemoryKind::DurableFact,
+        );
+        let facet = parse_enum_or(
+            row.get("facet")?,
+            crate::extract::facet::Facet::Unknown,
+        );
+        let entity_type = parse_enum_or(
+            row.get("entity_type")?,
+            crate::extract::entity_type::EntityType::Unknown,
+        );
+        let supporting_spans_str: String = row.get("supporting_spans")?;
+        let supporting_spans: Vec<String> =
+            serde_json::from_str(&supporting_spans_str).unwrap_or_default();
+        let value_date_str: Option<String> = row.get("value_date")?;
+        let value_date = value_date_str
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let created_at_str: String = row.get("created_at")?;
+        let source_ts_str: String = row.get("source_timestamp")?;
+        let occ_start: Option<String> = row.get("occurred_start")?;
+        let occ_end: Option<String> = row.get("occurred_end")?;
+        let occ_conf_f32: f32 = row.get("occurred_confidence")?;
+        let embedding_blob: Vec<u8> = row.get("embedding")?;
+
+        Ok(AtomicFact {
+            id: row.get("id")?,
+            content: row.get("content")?,
+            source_note_id: row.get("source_note_id")?,
+            ordinal: row.get("ordinal")?,
+            memory_kind,
+            facet,
+            entity_type,
+            entity_text: row.get("entity_text")?,
+            value_text: row.get("value_text")?,
+            value_date,
+            supporting_spans,
+            embedding: Self::blob_to_embedding(&embedding_blob),
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            source_timestamp: chrono::DateTime::parse_from_rfc3339(&source_ts_str)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            occurred_start: occ_start
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc)),
+            occurred_end: occ_end
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc)),
+            occurred_confidence: crate::read::temporal::ConfidenceBand::try_from_f32(occ_conf_f32)
+                .unwrap_or(crate::read::temporal::ConfidenceBand::None),
         })
     }
 }
@@ -203,7 +306,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
         let created_at = note.created_at.to_rfc3339();
         let updated_at = note.updated_at.to_rfc3339();
         let last_accessed_at = note.last_accessed_at.to_rfc3339();
-        let source_timestamp = note.source_timestamp.map(|t| t.to_rfc3339());
+        let source_timestamp = note.source_timestamp.to_rfc3339();
         let embedding_blob = Self::embedding_to_blob(&note.embedding);
 
         let tx = conn.unchecked_transaction()?;
@@ -212,14 +315,14 @@ impl crate::store::VectorStore for SqliteVectorStore {
             "INSERT OR REPLACE INTO notes
              (id, content, context, keywords_json, tags_json, provenance_json,
               confidence, created_at, updated_at, status_json, last_accessed_at,
-              turn_index, source_timestamp, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              turn_index, source_timestamp, session_id, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 note.id, note.content, note.context,
                 keywords_json, tags_json, provenance_json,
                 note.confidence, created_at, updated_at,
                 status_json, last_accessed_at,
-                note.turn_index, source_timestamp,
+                note.turn_index, source_timestamp, note.session_id,
                 embedding_blob,
             ],
         )?;
@@ -291,7 +394,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
             .prepare_cached(
                 "SELECT id, content, context, keywords_json, tags_json, provenance_json,
                         confidence, created_at, updated_at, status_json, last_accessed_at,
-                        turn_index, source_timestamp, embedding
+                        turn_index, source_timestamp, session_id, embedding
                  FROM notes WHERE id = ?1",
             )?
             .query_row([id], Self::row_to_note)
@@ -311,7 +414,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
         let sql = format!(
             "SELECT id, content, context, keywords_json, tags_json, provenance_json,
                     confidence, created_at, updated_at, status_json, last_accessed_at,
-                    turn_index, source_timestamp, embedding
+                    turn_index, source_timestamp, session_id, embedding
              FROM notes WHERE id IN ({})",
             placeholders
         );
@@ -331,7 +434,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
         let mut stmt = conn.prepare(
             "SELECT id, content, context, keywords_json, tags_json, provenance_json,
                     confidence, created_at, updated_at, status_json, last_accessed_at,
-                    turn_index, source_timestamp, embedding
+                    turn_index, source_timestamp, session_id, embedding
              FROM notes",
         )?;
         let rows = stmt.query_map([], Self::row_to_note)?;
@@ -351,16 +454,63 @@ impl crate::store::VectorStore for SqliteVectorStore {
 
     async fn upsert_fact(&self, fact: &AtomicFact) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+
+        // Enums serialize as JSON strings (with quotes); strip the quotes to
+        // store the bare snake_case discriminant. `row_to_fact` reverses this.
+        let memory_kind = serde_json::to_string(&fact.memory_kind)
+            .map_err(|e| KartaError::VectorStore(format!("memory_kind serde: {}", e)))?;
+        let memory_kind = memory_kind.trim_matches('"').to_string();
+        let facet = serde_json::to_string(&fact.facet)
+            .map_err(|e| KartaError::VectorStore(format!("facet serde: {}", e)))?;
+        let facet = facet.trim_matches('"').to_string();
+        let entity_type = serde_json::to_string(&fact.entity_type)
+            .map_err(|e| KartaError::VectorStore(format!("entity_type serde: {}", e)))?;
+        let entity_type = entity_type.trim_matches('"').to_string();
+        let supporting_spans = serde_json::to_string(&fact.supporting_spans)
+            .map_err(|e| KartaError::VectorStore(format!("supporting_spans serde: {}", e)))?;
+        let value_date = fact.value_date.map(|t| t.to_rfc3339());
+
         let created_at = fact.created_at.to_rfc3339();
+        let source_timestamp = fact.source_timestamp.to_rfc3339();
+        let occurred_start = fact.occurred_start.map(|t| t.to_rfc3339());
+        let occurred_end = fact.occurred_end.map(|t| t.to_rfc3339());
+        let occurred_confidence = fact.occurred_confidence.as_f32();
         let embedding_blob = Self::embedding_to_blob(&fact.embedding);
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO atomic_facts
-             (id, content, source_note_id, ordinal, subject, created_at, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO atomic_facts (
+                 id, content, source_note_id, ordinal,
+                 memory_kind, facet, entity_type, entity_text, value_text, value_date,
+                 supporting_spans,
+                 created_at, source_timestamp,
+                 occurred_start, occurred_end, occurred_confidence,
+                 embedding
+             ) VALUES (
+                 ?1, ?2, ?3, ?4,
+                 ?5, ?6, ?7, ?8, ?9, ?10,
+                 ?11,
+                 ?12, ?13,
+                 ?14, ?15, ?16,
+                 ?17
+             )",
             rusqlite::params![
-                fact.id, fact.content, fact.source_note_id,
-                fact.ordinal, fact.subject, created_at, embedding_blob,
+                fact.id,
+                fact.content,
+                fact.source_note_id,
+                fact.ordinal,
+                memory_kind,
+                facet,
+                entity_type,
+                fact.entity_text,
+                fact.value_text,
+                value_date,
+                supporting_spans,
+                created_at,
+                source_timestamp,
+                occurred_start,
+                occurred_end,
+                occurred_confidence,
+                embedding_blob,
             ],
         )?;
         tx.execute("DELETE FROM facts_vec WHERE id = ?1", [&fact.id])?;
@@ -370,6 +520,96 @@ impl crate::store::VectorStore for SqliteVectorStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    async fn find_similar_facts_in_interval(
+        &self,
+        embedding: &[f32],
+        top_k: usize,
+        interval_start: chrono::DateTime<chrono::Utc>,
+        interval_end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<(AtomicFact, f32)>> {
+        // Interval-overlap retrieval: same kNN + batch-fetch shape as
+        // `find_similar_facts`, but filters to facts whose [occurred_start,
+        // occurred_end) overlaps [interval_start, interval_end). Two windows
+        // overlap iff NOT (a.end <= b.start OR a.start >= b.end). The
+        // `occurred_start IS NOT NULL` predicate also lets SQLite use the
+        // partial index `idx_facts_occurred`.
+        let query_blob = Self::embedding_to_blob(embedding);
+        // Oversample: interval filter may reject many kNN hits, so widen the
+        // kNN pull to keep a reasonable chance of filling top_k.
+        let limit = (top_k * 5).max(50) as i64;
+
+        let interval_start_str = interval_start.to_rfc3339();
+        let interval_end_str = interval_end.to_rfc3339();
+
+        let result: Vec<(AtomicFact, f32)> = {
+            let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+
+            let mut stmt = conn.prepare(
+                "SELECT id, distance FROM facts_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+            )?;
+            let knn_rows: Vec<(String, f64)> = stmt
+                .query_map(rusqlite::params![query_blob, limit], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(stmt);
+
+            if knn_rows.is_empty() {
+                Vec::new()
+            } else {
+                let distance_map: std::collections::HashMap<String, f64> = knn_rows
+                    .iter()
+                    .map(|(id, d)| (id.clone(), *d))
+                    .collect();
+                let placeholders: String = (1..=knn_rows.len())
+                    .map(|i| format!("?{}", i))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                // Bind ids first, then interval_start (?N+1) and interval_end (?N+2).
+                let start_param_idx = knn_rows.len() + 1;
+                let end_param_idx = knn_rows.len() + 2;
+                let sql = format!(
+                    "SELECT id, content, source_note_id, ordinal,
+                            memory_kind, facet, entity_type, entity_text, value_text, value_date,
+                            supporting_spans,
+                            created_at, source_timestamp,
+                            occurred_start, occurred_end, occurred_confidence,
+                            embedding
+                     FROM atomic_facts
+                     WHERE id IN ({})
+                       AND occurred_start IS NOT NULL
+                       AND NOT (occurred_end <= ?{} OR occurred_start >= ?{})",
+                    placeholders, start_param_idx, end_param_idx
+                );
+                let mut stmt2 = conn.prepare(&sql)?;
+                let ids: Vec<&str> = knn_rows.iter().map(|(id, _)| id.as_str()).collect();
+                let mut params: Vec<&dyn rusqlite::types::ToSql> =
+                    ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+                params.push(&interval_start_str);
+                params.push(&interval_end_str);
+
+                let facts: Vec<AtomicFact> = stmt2
+                    .query_map(params.as_slice(), |row| Self::row_to_fact(row))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                let mut scored: Vec<(AtomicFact, f32)> = facts
+                    .into_iter()
+                    .filter_map(|fact| {
+                        let distance = distance_map.get(&fact.id).copied().unwrap_or(0.0);
+                        Some((fact, 1.0 / (1.0 + distance as f32)))
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                scored.truncate(top_k);
+                scored
+            }
+        };
+
+        Ok(result)
     }
 
     async fn find_similar_facts(
@@ -410,7 +650,12 @@ impl crate::store::VectorStore for SqliteVectorStore {
                     .collect::<Vec<_>>()
                     .join(",");
                 let sql = format!(
-                    "SELECT id, content, source_note_id, ordinal, subject, created_at, embedding
+                    "SELECT id, content, source_note_id, ordinal,
+                            memory_kind, facet, entity_type, entity_text, value_text, value_date,
+                            supporting_spans,
+                            created_at, source_timestamp,
+                            occurred_start, occurred_end, occurred_confidence,
+                            embedding
                      FROM atomic_facts WHERE id IN ({})",
                     placeholders
                 );
@@ -420,21 +665,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
                     ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
 
                 let facts: Vec<AtomicFact> = stmt2
-                    .query_map(params.as_slice(), |row| {
-                        let embedding_blob: Vec<u8> = row.get("embedding")?;
-                        let created_str: String = row.get("created_at")?;
-                        Ok(AtomicFact {
-                            id: row.get("id")?,
-                            content: row.get("content")?,
-                            source_note_id: row.get("source_note_id")?,
-                            ordinal: row.get("ordinal")?,
-                            subject: row.get("subject")?,
-                            embedding: Self::blob_to_embedding(&embedding_blob),
-                            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                                .unwrap_or_default()
-                                .with_timezone(&chrono::Utc),
-                        })
-                    })?
+                    .query_map(params.as_slice(), |row| Self::row_to_fact(row))?
                     .filter_map(|r| r.ok())
                     .collect();
 
@@ -459,25 +690,16 @@ impl crate::store::VectorStore for SqliteVectorStore {
     async fn get_facts_for_note(&self, note_id: &str) -> Result<Vec<AtomicFact>> {
         let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
         let mut stmt = conn.prepare(
-            "SELECT id, content, source_note_id, ordinal, subject, created_at, embedding
+            "SELECT id, content, source_note_id, ordinal,
+                    memory_kind, facet, entity_type, entity_text, value_text, value_date,
+                    supporting_spans,
+                    created_at, source_timestamp,
+                    occurred_start, occurred_end, occurred_confidence,
+                    embedding
              FROM atomic_facts WHERE source_note_id = ?1 ORDER BY ordinal",
         )?;
         let facts = stmt
-            .query_map([note_id], |row| {
-                let embedding_blob: Vec<u8> = row.get("embedding")?;
-                let created_str: String = row.get("created_at")?;
-                Ok(AtomicFact {
-                    id: row.get("id")?,
-                    content: row.get("content")?,
-                    source_note_id: row.get("source_note_id")?,
-                    ordinal: row.get("ordinal")?,
-                    subject: row.get("subject")?,
-                    embedding: Self::blob_to_embedding(&embedding_blob),
-                    created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                        .unwrap_or_default()
-                        .with_timezone(&chrono::Utc),
-                })
-            })?
+            .query_map([note_id], |row| Self::row_to_fact(row))?
             .filter_map(|r| r.ok())
             .collect();
         Ok(facts)

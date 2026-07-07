@@ -76,16 +76,81 @@ pub fn note_attributes_schema() -> JsonSchema {
                 },
                 "atomic_facts": {
                     "type": "array",
+                    "minItems": 0,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "content": { "type": "string", "description": "A single atomic, independently verifiable statement." },
-                            "subject": { "type": ["string", "null"], "description": "Primary entity or topic this fact is about. null if general." }
+                            "content": {
+                                "type": "string",
+                                "description": "Single sentence stating one durable claim. Use ordinary-world language. Do not store benchmark or conversation jargon (e.g. 'time anchor', 'assistant', 'memory')."
+                            },
+                            "memory_kind": {
+                                "type": "string",
+                                "enum": [
+                                    "durable_fact", "future_commitment", "preference",
+                                    "decision", "constraint",
+                                    "ephemeral_request", "speech_act", "echo"
+                                ],
+                                "description": "Admission classification. Use ephemeral_request for help-seeking turns, speech_act for greetings/acks, echo for restating the assistant. The validator drops these three."
+                            },
+                            "supporting_spans": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "minItems": 1,
+                                "maxItems": 3,
+                                "description": "1-3 verbatim substrings copied from the source MESSAGE that justify this fact. Each must be ≥4 characters. The validator rejects spans that aren't real substrings of the source message — do not paraphrase."
+                            },
+                            "facet": {
+                                "type": "string",
+                                "enum": [
+                                    "deadline", "target_date", "preference", "tech_stack",
+                                    "location", "ownership", "constraint", "event", "unknown"
+                                ],
+                                "description": "What aspect of the entity this fact describes. Use 'unknown' only when none apply."
+                            },
+                            "entity_type": {
+                                "type": "string",
+                                "enum": ["user", "project", "person", "org", "task", "unknown"],
+                                "description": "Coarse type of the entity being described."
+                            },
+                            "entity_text": {
+                                "type": ["string", "null"],
+                                "description": "Surface form of the entity. Prefer the most specific name available in the message ('Coco', 'budget tracker'). Use 'project'/'user' only when no specific name appears."
+                            },
+                            "value_text": {
+                                "type": ["string", "null"],
+                                "description": "String value slot for the facet ('Flask 2.3.1', 'vegetarian')."
+                            },
+                            "value_date": {
+                                "type": ["string", "null"],
+                                "format": "date-time",
+                                "description": "Date value slot for date-shaped facets like deadline / target_date. Distinct from occurred_* (which describes when the fact's event occurred)."
+                            },
+                            "occurred_start": {
+                                "type": ["string", "null"],
+                                "format": "date-time",
+                                "description": "Inclusive lower bound of when the asserted event occurred. Most facts have null bounds. Use only when the fact text explicitly references a time."
+                            },
+                            "occurred_end": {
+                                "type": ["string", "null"],
+                                "format": "date-time",
+                                "description": "Exclusive upper bound. Use start + 1 nanosecond for instants, next day for date-only references."
+                            },
+                            "occurred_confidence": {
+                                "type": "number",
+                                "enum": [0.0, 0.5, 0.7, 0.8, 1.0],
+                                "description": "Discrete temporal-bound confidence. 0.0 paired with null bounds; 1.0 explicit ISO date; 0.8 NL absolute; 0.7 relative reference; 0.5 vague temporal word."
+                            }
                         },
-                        "required": ["content", "subject"],
+                        "required": [
+                            "content", "memory_kind", "supporting_spans",
+                            "facet", "entity_type", "entity_text",
+                            "value_text", "value_date",
+                            "occurred_start", "occurred_end", "occurred_confidence"
+                        ],
                         "additionalProperties": false
                     },
-                    "description": "1-5 atomic facts. Each is a standalone, verifiable statement with one specific claim."
+                    "description": "Zero or more atomic facts. Empty array is the correct output when the message is a question, greeting, or pure speech act with no durable claim."
                 }
             },
             "required": ["reasoning", "context", "keywords", "tags", "foresight_signals", "atomic_facts"],

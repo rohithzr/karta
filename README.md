@@ -25,7 +25,7 @@ system could find because they were never explicitly stored.
 - **Temporal awareness** — exponential decay scoring, foresight signals with validity windows
 - **Provenance tracking** — every note tagged as FACT or INFERRED with confidence scores
 - **Forgetting** — note lifecycle (Active → Deprecated → Superseded → Archived) with access-based decay
-- **Embedded by default** — LanceDB + SQLite, zero infrastructure. `cargo add karta` and go.
+- **Embedded by default** — SQLite + sqlite-vec, zero infrastructure. `cargo add karta` and go.
 
 ## Quick Start
 
@@ -86,7 +86,7 @@ Dream Path:  cluster notes → deduction/induction/abduction/consolidation/contr
 
 | Layer | Default | Production Options |
 |-------|---------|-------------------|
-| Vector + metadata | LanceDB (embedded) | pgvector, Qdrant |
+| Vector + metadata | sqlite-vec (embedded) | pgvector, Qdrant |
 | Graph + state | SQLite (WAL mode) | Postgres, Dolt |
 
 ### LLM Provider (trait-based)
@@ -211,7 +211,7 @@ karta/
 │   │   │   ├── read.rs      # Search, multi-hop traversal, synthesis
 │   │   │   ├── rerank.rs    # Cross-encoder reranking + abstention
 │   │   │   ├── dream/       # Dream engine (5 inference types)
-│   │   │   ├── store/       # LanceDB + SQLite implementations
+│   │   │   ├── store/       # sqlite-vec + SQLite implementations
 │   │   │   └── llm/         # Provider trait + OpenAI + structured output
 │   │   └── tests/           # Eval suites + BEAM/LOCOMO/LongMem harnesses
 │   └── karta-cli/           # CLI (planned)

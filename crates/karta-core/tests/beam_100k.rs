@@ -36,16 +36,37 @@ struct BeamConversation {
     id: String,
     category: String,
     title: String,
-    user_messages: Vec<BeamMessage>,
+    sessions: Vec<BeamSession>,
     total_turns: usize,
+    #[serde(default)]
+    total_user_turns: usize,
     questions: Vec<BeamQuestion>,
 }
 
-#[derive(serde::Deserialize)]
-struct BeamMessage {
+#[derive(serde::Deserialize, Clone)]
+#[allow(dead_code)]
+struct BeamSession {
+    session_index: usize,
+    #[serde(default)]
+    session_anchor: Option<String>,
+    turns: Vec<BeamTurn>,
+}
+
+#[derive(serde::Deserialize, Clone)]
+#[allow(dead_code)]
+struct BeamTurn {
+    #[serde(default)]
+    turn_index: u32,
     role: String,
     content: String,
-    time_anchor: String,
+    #[serde(default)]
+    time_anchor: Option<String>,
+    #[serde(default)]
+    effective_reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    question_type: Option<String>,
+    #[serde(default)]
+    raw_index: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -359,7 +380,7 @@ fn apply_config_env(config: &mut KartaConfig) {
     config.reranker.enabled = env_bool("K_RERANKER", true);
     config.reranker.abstention_threshold = env_f32("K_ABSTENTION_THRESH", 0.01);
     config.reranker.max_rerank = env_usize("K_MAX_RERANK", 20);
-    config.write.foresight_default_ttl_days = env_usize("K_FORESIGHT_TTL", 90) as i64;
+    config.write.foresight_default_ttl_days = env_usize("K_FORESIGHT_TTL", 90) as f64;
     config.write.extract_atomic_facts = env_bool("K_EXTRACT_FACTS", true);
     config.read.fact_retrieval_enabled = env_bool("K_FACT_RETRIEVAL", true);
     config.read.fact_match_boost = env_f32("K_FACT_BOOST", 0.1);
@@ -394,10 +415,9 @@ fn find_latest_data_dir(conv_id: &str) -> Option<String> {
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
             let created = meta.created().ok().or_else(|| meta.modified().ok())?;
-            // Verify the dir has actual data (lance table exists)
-            let lance_path = e.path().join("lance/notes.lance/data");
-            let has_data = lance_path.exists();
-            if has_data {
+            // Verify the dir has actual data.
+            let sqlite_path = e.path().join("karta.db");
+            if sqlite_path.exists() {
                 Some((e.path().to_string_lossy().to_string(), created))
             } else {
                 None
@@ -455,12 +475,28 @@ fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 async fn eval_conversation(
     conv: &BeamConversation,
 ) -> (usize, usize, usize, HashMap<String, (usize, usize)>) {
+    // Flatten sessions to user turns (post-STEP1 BEAM converter shape).
+    // Skip empty content + skip `answer_ai_question` echoes (HARNESS-LEVEL
+    // SKIP, F7-T9b). Session boundaries come directly from `session_index`
+    // — no more deriving them from time_anchor changes.
+    let user_turns: Vec<(usize, &BeamTurn)> = conv
+        .sessions
+        .iter()
+        .flat_map(|s| s.turns.iter().map(move |t| (s.session_index, t)))
+        .filter(|(_, t)| {
+            t.role == "user"
+                && !t.content.trim().is_empty()
+                && t.question_type.as_deref() != Some("answer_ai_question")
+        })
+        .collect();
+
     println!("\n{}", "=".repeat(70));
     println!(
-        "BEAM 100K — Conv {} [{}]: {} user msgs, {} questions",
+        "BEAM 100K — Conv {} [{}]: {} sessions / {} ingest-eligible user turns, {} questions",
         conv.id,
         conv.category,
-        conv.user_messages.len(),
+        conv.sessions.len(),
+        user_turns.len(),
         conv.questions.len()
     );
     println!("{}", "=".repeat(70));
@@ -476,40 +512,42 @@ async fn eval_conversation(
         let ingest_start = Instant::now();
         let mut ingested = 0;
         let mut ingest_errors = 0;
-        let mut current_session = 0usize;
-        let mut last_anchor = String::new();
+        let total_eligible = user_turns.len();
 
-        for (i, msg) in conv.user_messages.iter().enumerate() {
-            if msg.content.trim().is_empty() {
-                continue;
-            }
+        for (i, (session_index, turn)) in user_turns.iter().enumerate() {
+            let session_id = format!("session-{}", session_index);
 
-            // Derive session boundaries from time_anchor changes
-            if !msg.time_anchor.is_empty() && msg.time_anchor != last_anchor {
-                current_session += 1;
-                last_anchor = msg.time_anchor.clone();
-            }
-            let session_id = format!("session-{}", current_session);
-
-            // Parse time_anchor into structured timestamp instead of text prefix
-            let source_timestamp = if msg.time_anchor.is_empty() {
-                None
+            // Reference time: prefer the converter's pre-resolved
+            // effective_reference_time; fall back to parsing the text
+            // anchor; fall back to `now()` (lossy carry-forward, signals
+            // the source data had no anchor for this turn).
+            let ctx = if let Some(t) = turn.effective_reference_time {
+                karta_core::clock::ClockContext::at(t)
+            } else if let Some(anchor) = turn.time_anchor.as_deref() {
+                match parse_time_anchor(anchor) {
+                    Some(t) => karta_core::clock::ClockContext::at(t),
+                    None => karta_core::clock::ClockContext::now(),
+                }
             } else {
-                parse_time_anchor(&msg.time_anchor)
+                karta_core::clock::ClockContext::now()
             };
 
-            // Still include time_anchor as text prefix for LLM context
-            let content = if msg.time_anchor.is_empty() {
-                msg.content.clone()
-            } else {
-                format!("[{}] {}", msg.time_anchor, msg.content)
+            // Preserve the `[time_anchor]` text prefix for retrieval
+            // signal — P1 baselines used this. The structured ctx is the
+            // authoritative timestamp; the prefix is a side-channel for
+            // ANN over note text containing dates.
+            let content = match turn.time_anchor.as_deref() {
+                Some(anchor) if !anchor.is_empty() => {
+                    format!("[{}] {}", anchor, turn.content)
+                }
+                _ => turn.content.clone(),
             };
 
-            match karta.add_note_with_metadata(&content, &session_id, Some(i as u32), source_timestamp).await {
+            match karta.add_note_with_clock(&content, Some(&session_id), Some(i as u32), ctx).await {
                 Ok(note) => {
                     ingested += 1;
                     if (i + 1) % 20 == 0 || i == 0 {
-                        println!("  Ingested {}/{} notes ({} links)", i + 1, conv.user_messages.len(), note.links.len());
+                        println!("  Ingested {}/{} notes ({} links)", i + 1, total_eligible, note.links.len());
                     }
                 }
                 Err(e) => {
@@ -529,8 +567,18 @@ async fn eval_conversation(
             ingest_ms as f64 / 1000.0 / ingested.max(1) as f64,
             ingest_errors
         );
+    }
 
-        // --- Optional: run dreaming ---
+    // --- Optional: run dreaming (runs regardless of skip_ingest) ---
+    // Skip with BEAM_SKIP_DREAM=1 to benchmark retrieval-only (no
+    // dream-generated inferences / episode narratives). Useful for
+    // isolating dream's contribution to the final score.
+    // When BEAM_SKIP_INGEST=1 is also set, this dreams over the notes
+    // already in the DB from a prior run — lets us A/B "same ingest,
+    // +dream" without paying ingest cost twice.
+    if env_bool("BEAM_SKIP_DREAM", false) {
+        println!("  Dreaming: SKIPPED (BEAM_SKIP_DREAM=1)");
+    } else {
         let dream_start = Instant::now();
         match karta.run_dreaming("beam100k", &conv.id).await {
             Ok(run) => {
@@ -854,52 +902,34 @@ async fn beam_100k_full() {
     for chunk in dataset.conversations.chunks(concurrency) {
         let mut set = tokio::task::JoinSet::new();
         for conv in chunk {
-            // Clone data into owned types for 'static lifetime
+            // Clone data into owned types for 'static lifetime.
+            // The structs derive Clone post-STEP1.5 so we can hand the
+            // whole sessions/turns tree to the spawned task without
+            // hand-rolling tuple-conversions per field.
             let conv_id = conv.id.clone();
             let conv_category = conv.category.clone();
-            let msgs: Vec<(String, String, String)> = conv
-                .user_messages
-                .iter()
-                .map(|m| (m.role.clone(), m.content.clone(), m.time_anchor.clone()))
-                .collect();
-            let questions: Vec<(String, String, String, serde_json::Value)> = conv
+            let owned_sessions: Vec<BeamSession> = conv.sessions.clone();
+            let owned_qs: Vec<BeamQuestion> = conv
                 .questions
                 .iter()
-                .map(|q| {
-                    (
-                        q.ability.clone(),
-                        q.question.clone(),
-                        q.reference_answer.clone(),
-                        q.rubric.clone(),
-                    )
+                .map(|q| BeamQuestion {
+                    ability: q.ability.clone(),
+                    question: q.question.clone(),
+                    reference_answer: q.reference_answer.clone(),
+                    rubric: q.rubric.clone(),
                 })
                 .collect();
+            let owned_total_turns = conv.total_turns;
+            let owned_total_user_turns = conv.total_user_turns;
 
             set.spawn(async move {
-                // Reconstruct the conv reference types
-                let owned_msgs: Vec<BeamMessage> = msgs
-                    .iter()
-                    .map(|(r, c, t)| BeamMessage {
-                        role: r.clone(),
-                        content: c.clone(),
-                        time_anchor: t.clone(),
-                    })
-                    .collect();
-                let owned_qs: Vec<BeamQuestion> = questions
-                    .iter()
-                    .map(|(a, q, ra, rub)| BeamQuestion {
-                        ability: a.clone(),
-                        question: q.clone(),
-                        reference_answer: ra.clone(),
-                        rubric: rub.clone(),
-                    })
-                    .collect();
                 let owned_conv = BeamConversation {
                     id: conv_id,
                     category: conv_category,
                     title: String::new(),
-                    user_messages: owned_msgs,
-                    total_turns: 0,
+                    sessions: owned_sessions,
+                    total_turns: owned_total_turns,
+                    total_user_turns: owned_total_user_turns,
                     questions: owned_qs,
                 };
                 eval_conversation(&owned_conv).await

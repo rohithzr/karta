@@ -1,0 +1,76 @@
+[
+  {
+    "id": "iso_deadline",
+    "input": "I'm working on the budget tracker and the deadline is 2024-04-15.",
+    "ref_time_iso": "2024-04-01T00:00:00Z",
+    "expect_any_fact_with": {
+      "facet": "deadline",
+      "value_date_iso": "2024-04-15T00:00:00Z"
+    }
+  },
+  {
+    "id": "nl_absolute_with_year",
+    "input": "I'm working on a project with a deadline of March 15, 2024 and need to plan tasks accordingly.",
+    "ref_time_iso": "2024-03-10T00:00:00Z",
+    "expect_any_fact_with": {
+      "facet": "deadline",
+      "value_date_iso": "2024-03-15T00:00:00Z"
+    }
+  },
+  {
+    "id": "nl_absolute_year_implicit",
+    "input": "Sprint 2 is scheduled to deliver analytics by April 19.",
+    "ref_time_iso": "2024-03-29T00:00:00Z",
+    "expect_any_fact_with": {
+      "facet": "target_date",
+      "value_date_iso": "2024-04-19T00:00:00Z"
+    }
+  },
+  {
+    "id": "past_event_explicit_date",
+    "input": "Sprint 1 ended on March 29, covering user authentication and basic CRUD.",
+    "ref_time_iso": "2024-04-05T00:00:00Z",
+    "expect_any_fact_with": {
+      "facet": "event",
+      "occurred_start_iso": "2024-03-29T00:00:00Z",
+      "occurred_confidence": 0.8
+    }
+  },
+  {
+    "id": "past_event_relative",
+    "input": "Yesterday I closed the auth ticket and started on the analytics work.",
+    "ref_time_iso": "2024-04-22T00:00:00Z",
+    "expect_any_fact_with": {
+      "facet": "event",
+      "occurred_start_iso": "2024-04-21T00:00:00Z",
+      "occurred_confidence": 0.7
+    }
+  },
+  {
+    "id": "no_date_control",
+    "input": "I'm using Flask 2.3.1 and SQLAlchemy 2.0.19 for the API layer.",
+    "ref_time_iso": "2024-04-01T00:00:00Z",
+    "expect_any_fact_with": {
+      "facet": "tech_stack",
+      "value_text_substring": "Flask"
+    }
+  },
+  {
+    "id": "jargon_prefix_only",
+    "input": "[March-15-2024] I want help configuring Chart.js 4.3.0 for tooltips and 60fps animation.",
+    "ref_time_iso": "2024-03-15T00:00:00Z",
+    "expect_any_fact_with": {
+      "facet": "tech_stack",
+      "value_text_substring": "Chart.js"
+    }
+  },
+  {
+    "id": "two_facts_one_date",
+    "input": "Meet the April 15 deadline. The MVP includes user login.",
+    "ref_time_iso": "2024-04-01T00:00:00Z",
+    "expect_any_fact_with": {
+      "facet": "deadline",
+      "value_date_iso": "2024-04-15T00:00:00Z"
+    }
+  }
+]
