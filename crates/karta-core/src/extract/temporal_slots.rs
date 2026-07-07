@@ -80,6 +80,21 @@ fn nl_month_day_re() -> &'static Regex {
     })
 }
 
+fn year_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b(19|20)\d{2}\b").unwrap())
+}
+
+fn bare_month_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(january|february|march|april|may|june|july|august|september|october|november|december)\b",
+        )
+        .unwrap()
+    })
+}
+
 const TEMPORAL_MARKERS: &[&str] = &[
     "yesterday",
     "today",
@@ -97,6 +112,18 @@ const TEMPORAL_MARKERS: &[&str] = &[
     "this afternoon",
     "this evening",
     "tonight",
+    // W9 parity additions:
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "weekend",
+    "last weekend",
+    "over the weekend",
+    "this weekend",
 ];
 
 fn has_temporal_marker(span: &str) -> bool {
@@ -108,6 +135,12 @@ fn has_temporal_marker(span: &str) -> bool {
         return true;
     }
     if nl_month_day_re().is_match(&lower) {
+        return true;
+    }
+    if year_re().is_match(&lower) {
+        return true;
+    }
+    if bare_month_re().is_match(&lower) {
         return true;
     }
     false
@@ -319,5 +352,15 @@ mod tests {
         // validate_occurred to reject rather than inventing a start.
         let end = Utc.with_ymd_and_hms(2024, 4, 2, 0, 0, 0).unwrap();
         assert_eq!(derive_occurred_end(None, Some(end)), Some(end));
+    }
+
+    #[test]
+    fn marker_parity_with_read_side() {
+        assert!(has_temporal_marker("I deployed last Friday"));
+        assert!(has_temporal_marker("we shipped over the weekend"));
+        assert!(has_temporal_marker("the review is in March"));
+        assert!(has_temporal_marker("this happened in 2024"));
+        // negative control: no temporal cue
+        assert!(!has_temporal_marker("the function returns a vector"));
     }
 }
