@@ -290,10 +290,12 @@ to fill the array.
     }
 
     pub fn evolve_system() -> &'static str {
-        "A new related memory has been added. Update the existing memory's context to reflect \
-         what this new connection reveals.\n\
-         The updated context should be richer — capturing implications that only become clear \
-         when both pieces of information are known together.\n\
+        "A new related memory has been linked to an existing memory. You refine ONLY the \
+         relational context between the two notes — describe their relationship and how \
+         they connect.\n\
+         Do NOT restate, copy, or import the new note's values, dates, or facts into the \
+         existing note. The existing note keeps its own values and its original date; you are \
+         annotating the link, not updating the record.\n\
          Keep it to 1-2 sentences.\n\
          Respond with JSON: { \"updatedContext\": \"...\" }"
     }
@@ -607,5 +609,20 @@ to fill the array.
              }}",
             notes_text
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Prompts;
+
+    #[test]
+    fn evolve_prompt_is_relational_only() {
+        let sys = Prompts::evolve_system();
+        let low = sys.to_lowercase();
+        // must instruct relational-only framing
+        assert!(low.contains("relationship") || low.contains("how they connect"));
+        // must explicitly forbid copying the new note's values backward
+        assert!(low.contains("do not") && low.contains("value"));
     }
 }
