@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use tracing::{debug, info, warn};
@@ -19,6 +19,8 @@ pub struct WriteEngine {
     llm: Arc<dyn LlmProvider>,
     config: WriteConfig,
     episode_config: EpisodeConfig,
+    slot_ledger: Option<Arc<crate::store::slot_ledger::SlotLedger>>,
+    entity_aliases: Arc<Mutex<crate::extract::entity_key::EntityAliases>>,
 }
 
 impl WriteEngine {
@@ -35,7 +37,23 @@ impl WriteEngine {
             llm,
             config,
             episode_config,
+            slot_ledger: None,
+            entity_aliases: Arc::new(Mutex::new(crate::extract::entity_key::EntityAliases::new())),
         }
+    }
+
+    /// Attach a slot ledger so `add_note_inner` populates mutable-slot rows
+    /// from templated extraction at write time. Left unset by default —
+    /// `Karta::with_defaults` wires it in after construction.
+    pub(crate) fn attach_slot_ledger(&mut self, ledger: Arc<crate::store::slot_ledger::SlotLedger>) {
+        self.slot_ledger = Some(ledger);
+    }
+
+    /// Shared handle to this engine's entity-alias resolver, so `Karta` can
+    /// expose entity-key canonicalization consistent with write-time
+    /// resolution (same alias table, same threshold).
+    pub(crate) fn entity_aliases_handle(&self) -> Arc<Mutex<crate::extract::entity_key::EntityAliases>> {
+        Arc::clone(&self.entity_aliases)
     }
 
     /// Live-default sugar over `add_note_with_clock`. Used by smoke tests
@@ -492,6 +510,31 @@ impl WriteEngine {
                 Err(e) => {
                     debug!(error = %e, "Failed to embed atomic facts, skipping");
                 }
+            }
+        }
+
+        if let Some(ledger) = &self.slot_ledger {
+            let tuples = crate::extract::slots::vote_slots(
+                self.llm.as_ref(),
+                content,
+                ctx.reference_time(),
+                self.config.slot_voting,
+            )
+            .await;
+            for t in &tuples {
+                let norm = crate::extract::entity_key::normalize_entity(&t.entity_text);
+                let emb = self
+                    .llm
+                    .embed(&[norm.as_str()])
+                    .await
+                    .ok()
+                    .and_then(|v| v.into_iter().next());
+                let entity_key = match self.entity_aliases.lock() {
+                    Ok(mut aliases) => aliases.resolve(&norm, emb.as_deref(), 0.90),
+                    Err(_) => norm.clone(), // poisoned mutex: fall back to normalized form, never panic
+                };
+                let vnorm = crate::extract::slots::value_norm(&t.value);
+                let _ = ledger.apply(&entity_key, t, &vnorm, note.seq, ctx.reference_time(), &note.id);
             }
         }
 

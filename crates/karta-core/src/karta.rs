@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::clock::ClockContext;
 use crate::config::KartaConfig;
@@ -19,6 +19,8 @@ pub struct Karta {
     graph_store: Arc<dyn GraphStore>,
     llm: Arc<dyn LlmProvider>,
     config: KartaConfig,
+    slot_ledger: Option<Arc<crate::store::slot_ledger::SlotLedger>>,
+    entity_aliases: Arc<Mutex<crate::extract::entity_key::EntityAliases>>,
 }
 
 impl Karta {
@@ -76,6 +78,8 @@ impl Karta {
             config.reranker.clone(),
         );
 
+        let entity_aliases = write_engine.entity_aliases_handle();
+
         Ok(Self {
             write_engine,
             read_engine,
@@ -83,7 +87,17 @@ impl Karta {
             graph_store,
             llm,
             config,
+            slot_ledger: None,
+            entity_aliases,
         })
+    }
+
+    /// Attach a slot ledger for mutable-slot tracking. Wires the same
+    /// `Arc` into the write engine (so ingest populates it) and keeps a
+    /// copy here (so reads can query it via `slot_ledger_current`).
+    pub(crate) fn attach_slot_ledger(&mut self, ledger: Arc<crate::store::slot_ledger::SlotLedger>) {
+        self.write_engine.attach_slot_ledger(Arc::clone(&ledger));
+        self.slot_ledger = Some(ledger);
     }
 
     /// Create with default embedded stores (sqlite-vec + SQLite) and OpenAI-compatible LLM.
@@ -235,9 +249,12 @@ impl Karta {
             SqliteVectorStore::new(&config.storage.data_dir, embedding_dim).await?;
         let shared_conn = sqlite_vec_store.connection();
         let vector_store = Arc::new(sqlite_vec_store) as Arc<dyn VectorStore>;
-        let graph_store = Arc::new(SqliteGraphStore::with_connection(shared_conn)) as Arc<dyn GraphStore>;
+        let graph_store = Arc::new(SqliteGraphStore::with_connection(shared_conn.clone())) as Arc<dyn GraphStore>;
 
-        Self::new_with_synthesis(vector_store, graph_store, llm, synthesis_llm, config).await
+        let mut karta = Self::new_with_synthesis(vector_store, graph_store, llm, synthesis_llm, config).await?;
+        let ledger = Arc::new(crate::store::slot_ledger::SlotLedger::new(shared_conn)?);
+        karta.attach_slot_ledger(ledger);
+        Ok(karta)
     }
 
 
@@ -267,6 +284,21 @@ impl Karta {
     }
 
     // --- Read ---
+
+    /// Current open ledger rows for a mutable slot. Canonicalizes `entity`
+    /// via the same write-time normalization, then reads the slot_ledger.
+    /// Empty when no ledger is attached (e.g. non-`with_defaults` construction).
+    pub async fn slot_ledger_current(
+        &self,
+        entity: &str,
+        predicate: &str,
+    ) -> Result<Vec<crate::store::slot_ledger::LedgerRow>> {
+        let Some(ledger) = &self.slot_ledger else {
+            return Ok(Vec::new());
+        };
+        let norm = crate::extract::entity_key::normalize_entity(entity);
+        ledger.current(&norm, predicate)
+    }
 
     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         self.search_with_clock(query, top_k, ClockContext::now()).await
