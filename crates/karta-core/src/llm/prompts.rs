@@ -317,30 +317,80 @@ RULES
    supports the fact — copy it character-for-character, do not paraphrase.
 4. If the message contains no facts matching the 12 predicates, return
    `{"slots": []}`. An empty array is a valid and often correct answer.
+5. Extract the current value whenever a message ASSERTS one of the 12
+   predicates — this includes PLAIN present-tense statements of current
+   state ("I work at Acme", "We use Redis", "Alice owns the pipeline",
+   "I prefer dark mode"), NOT only explicit changes. Do NOT wait for a
+   change word like "now", "moved", "switched", or "promoted": a first
+   assertion and a later update are BOTH extracted. When several predicates
+   appear in one message, emit one row for EACH, with its own entity.
+6. Map change phrasings to the predicate of the thing that changed:
+   "promoted to X" / "I'm now X" → role_title; "joined X" / "left … and
+   joined X" / "moved to X company" → employer; "switched … to X" /
+   "using X" → tech_choice; "ownership … transferred to X" / "X owns …" →
+   ownership; "prefer X" / "now prefer X" → preference. On a change, `value`
+   is the NEW current value (e.g. "left Acme and joined Globex" → "Globex").
 
 ============================================================
 EXAMPLES
 ============================================================
 
 Example 1 — grounded event_time:
-  reference_time: 2024-03-20T00:00:00Z
-  Message: "The first sprint deadline moved to April 5."
+  reference_time: 2024-06-10T00:00:00Z
+  Message: "The audit report deadline moved to June 20."
   Output:
   {"slots": [
-    {"entity": "first sprint", "predicate": "deadline", "value": "April 5",
-     "event_time": "2024-04-05", "source_span": "deadline moved to April 5"}
+    {"entity": "audit report", "predicate": "deadline", "value": "June 20",
+     "event_time": "2024-06-20", "source_span": "deadline moved to June 20"}
   ]}
 
 Example 2 — ungrounded date, so event_time is null:
   reference_time: 2024-03-20T00:00:00Z
-  Message: "I'm now the lead engineer on the payments team."
+  Message: "I'm now the tech lead for the platform team."
   Output:
   {"slots": [
-    {"entity": "user", "predicate": "role_title", "value": "lead engineer",
-     "event_time": null, "source_span": "I'm now the lead engineer"}
+    {"entity": "user", "predicate": "role_title", "value": "tech lead",
+     "event_time": null, "source_span": "I'm now the tech lead"}
   ]}
   (No explicit or resolvable date appears in the message, so event_time
   is null rather than guessed from reference_time.)
+
+Example 3 — PLAIN statements of current state (no change word — still extract;
+one row per predicate, each with its own entity, event_time null when no date):
+  reference_time: 2024-02-10T00:00:00Z
+  Message: "I work at Initrode, we run Kafka for the event bus, and I prefer tabs over spaces."
+  Output:
+  {"slots": [
+    {"entity": "user", "predicate": "employer", "value": "Initrode",
+     "event_time": null, "source_span": "I work at Initrode"},
+    {"entity": "event bus", "predicate": "tech_choice", "value": "Kafka",
+     "event_time": null, "source_span": "run Kafka for the event bus"},
+    {"entity": "user", "predicate": "preference", "value": "tabs",
+     "event_time": null, "source_span": "I prefer tabs over spaces"}
+  ]}
+  ("I work at X" IS an employer assertion — do not skip it for lacking a
+  change word; "I work at X now" is the same, event_time still null.)
+
+Example 4 — an update stated as a change, with a grounded date (value = NEW value):
+  reference_time: 2024-05-30T00:00:00Z
+  Message: "On June 3, 2024 I left Hooli and joined Pied Piper."
+  Output:
+  {"slots": [
+    {"entity": "user", "predicate": "employer", "value": "Pied Piper",
+     "event_time": "2024-06-03", "source_span": "joined Pied Piper"}
+  ]}
+  (Current employer after the change is Pied Piper; emit the new value, not Hooli.)
+
+Example 5 — ownership transfer and promotion map to ownership / role_title:
+  reference_time: 2024-04-15T00:00:00Z
+  Message: "On April 15, 2024 ownership of the billing service moved to Carol, and I was promoted to staff engineer."
+  Output:
+  {"slots": [
+    {"entity": "billing service", "predicate": "ownership", "value": "Carol",
+     "event_time": "2024-04-15", "source_span": "ownership of the billing service moved to Carol"},
+    {"entity": "user", "predicate": "role_title", "value": "staff engineer",
+     "event_time": "2024-04-15", "source_span": "promoted to staff engineer"}
+  ]}
 "#
     }
 
