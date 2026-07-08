@@ -87,6 +87,7 @@ impl SqliteVectorStore {
                 turn_index INTEGER,
                 source_timestamp TEXT NOT NULL,
                 session_id TEXT,
+                seq INTEGER NOT NULL DEFAULT 0,
                 embedding BLOB NOT NULL
             );
             CREATE TABLE IF NOT EXISTS atomic_facts (
@@ -106,6 +107,7 @@ impl SqliteVectorStore {
                 occurred_start TEXT,
                 occurred_end TEXT,
                 occurred_confidence REAL NOT NULL DEFAULT 0.0,
+                seq INTEGER NOT NULL DEFAULT 0,
                 embedding BLOB NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_facts_source ON atomic_facts(source_note_id);
@@ -125,6 +127,10 @@ impl SqliteVectorStore {
             CREATE VIRTUAL TABLE IF NOT EXISTS facts_vec USING vec0(
                 id text primary key,
                 embedding float[{dim}]
+            );
+            CREATE TABLE IF NOT EXISTS kv_counters (
+                name  TEXT PRIMARY KEY NOT NULL,
+                value INTEGER NOT NULL
             );
             "
         );
@@ -162,6 +168,7 @@ impl SqliteVectorStore {
         let turn_index: Option<u32> = row.get("turn_index")?;
         let source_timestamp: String = row.get("source_timestamp")?;
         let session_id: Option<String> = row.get("session_id")?;
+        let seq: i64 = row.get("seq").unwrap_or(0);
         let embedding_blob: Vec<u8> = row.get("embedding")?;
 
         let keywords: Vec<String> =
@@ -204,6 +211,7 @@ impl SqliteVectorStore {
             turn_index,
             source_timestamp,
             session_id,
+            seq: seq as u64,
         })
     }
 
@@ -253,6 +261,7 @@ impl SqliteVectorStore {
         let occ_start: Option<String> = row.get("occurred_start")?;
         let occ_end: Option<String> = row.get("occurred_end")?;
         let occ_conf_f32: f32 = row.get("occurred_confidence")?;
+        let seq: i64 = row.get("seq").unwrap_or(0);
         let embedding_blob: Vec<u8> = row.get("embedding")?;
 
         Ok(AtomicFact {
@@ -282,6 +291,7 @@ impl SqliteVectorStore {
                 .map(|d| d.with_timezone(&chrono::Utc)),
             occurred_confidence: crate::read::temporal::ConfidenceBand::try_from_f32(occ_conf_f32)
                 .unwrap_or(crate::read::temporal::ConfidenceBand::None),
+            seq: seq as u64,
         })
     }
 }
@@ -294,6 +304,18 @@ impl crate::store::VectorStore for SqliteVectorStore {
         let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))?;
         Ok(count as usize)
+    }
+
+    async fn next_seq(&self) -> Result<u64> {
+        let conn = self.conn.lock().map_err(|e| KartaError::VectorStore(e.to_string()))?;
+        let val: i64 = conn.query_row(
+            "INSERT INTO kv_counters (name, value) VALUES ('global_seq', 1)
+             ON CONFLICT(name) DO UPDATE SET value = value + 1
+             RETURNING value",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(val as u64)
     }
 
     async fn upsert(&self, note: &MemoryNote) -> Result<()> {
@@ -315,14 +337,15 @@ impl crate::store::VectorStore for SqliteVectorStore {
             "INSERT OR REPLACE INTO notes
              (id, content, context, keywords_json, tags_json, provenance_json,
               confidence, created_at, updated_at, status_json, last_accessed_at,
-              turn_index, source_timestamp, session_id, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              turn_index, source_timestamp, session_id, seq, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             rusqlite::params![
                 note.id, note.content, note.context,
                 keywords_json, tags_json, provenance_json,
                 note.confidence, created_at, updated_at,
                 status_json, last_accessed_at,
                 note.turn_index, source_timestamp, note.session_id,
+                note.seq as i64,
                 embedding_blob,
             ],
         )?;
@@ -394,7 +417,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
             .prepare_cached(
                 "SELECT id, content, context, keywords_json, tags_json, provenance_json,
                         confidence, created_at, updated_at, status_json, last_accessed_at,
-                        turn_index, source_timestamp, session_id, embedding
+                        turn_index, source_timestamp, session_id, seq, embedding
                  FROM notes WHERE id = ?1",
             )?
             .query_row([id], Self::row_to_note)
@@ -414,7 +437,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
         let sql = format!(
             "SELECT id, content, context, keywords_json, tags_json, provenance_json,
                     confidence, created_at, updated_at, status_json, last_accessed_at,
-                    turn_index, source_timestamp, session_id, embedding
+                    turn_index, source_timestamp, session_id, seq, embedding
              FROM notes WHERE id IN ({})",
             placeholders
         );
@@ -434,7 +457,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
         let mut stmt = conn.prepare(
             "SELECT id, content, context, keywords_json, tags_json, provenance_json,
                     confidence, created_at, updated_at, status_json, last_accessed_at,
-                    turn_index, source_timestamp, session_id, embedding
+                    turn_index, source_timestamp, session_id, seq, embedding
              FROM notes",
         )?;
         let rows = stmt.query_map([], Self::row_to_note)?;
@@ -484,6 +507,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
                  supporting_spans,
                  created_at, source_timestamp,
                  occurred_start, occurred_end, occurred_confidence,
+                 seq,
                  embedding
              ) VALUES (
                  ?1, ?2, ?3, ?4,
@@ -491,7 +515,8 @@ impl crate::store::VectorStore for SqliteVectorStore {
                  ?11,
                  ?12, ?13,
                  ?14, ?15, ?16,
-                 ?17
+                 ?17,
+                 ?18
              )",
             rusqlite::params![
                 fact.id,
@@ -510,6 +535,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
                 occurred_start,
                 occurred_end,
                 occurred_confidence,
+                fact.seq as i64,
                 embedding_blob,
             ],
         )?;
@@ -577,6 +603,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
                             supporting_spans,
                             created_at, source_timestamp,
                             occurred_start, occurred_end, occurred_confidence,
+                            seq,
                             embedding
                      FROM atomic_facts
                      WHERE id IN ({})
@@ -655,6 +682,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
                             supporting_spans,
                             created_at, source_timestamp,
                             occurred_start, occurred_end, occurred_confidence,
+                            seq,
                             embedding
                      FROM atomic_facts WHERE id IN ({})",
                     placeholders
@@ -695,6 +723,7 @@ impl crate::store::VectorStore for SqliteVectorStore {
                     supporting_spans,
                     created_at, source_timestamp,
                     occurred_start, occurred_end, occurred_confidence,
+                    seq,
                     embedding
              FROM atomic_facts WHERE source_note_id = ?1 ORDER BY ordinal",
         )?;

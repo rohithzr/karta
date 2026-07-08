@@ -42,6 +42,7 @@ async fn round_trip_occurred_fields() {
         occurred_start: Some(start),
         occurred_end: Some(end),
         occurred_confidence: ConfidenceBand::Explicit,
+        seq: 0,
     };
 
     store.upsert_fact(&fact).await.unwrap();
@@ -79,6 +80,7 @@ async fn round_trip_null_bounds() {
         occurred_start: None,
         occurred_end: None,
         occurred_confidence: ConfidenceBand::None,
+        seq: 0,
     };
     store.upsert_fact(&fact).await.unwrap();
     let fetched = store.get_facts_for_note("note-1").await.unwrap();

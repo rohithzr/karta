@@ -17,12 +17,26 @@ use crate::error::Result;
 /// words have higher cosine similarity.
 pub struct MockLlmProvider {
     call_count: AtomicU64,
+    /// When set, `handle_attributes` emits exactly this many distinct
+    /// durable atomic facts instead of running the keyword heuristics.
+    /// Used to test config-driven fact caps without a real LLM.
+    fact_count: Option<usize>,
 }
 
 impl MockLlmProvider {
     pub fn new() -> Self {
         Self {
             call_count: AtomicU64::new(0),
+            fact_count: None,
+        }
+    }
+
+    /// Build a mock that always emits `n` distinct durable atomic facts on
+    /// attribute-generation calls, each grounded in the input note content.
+    pub fn with_fact_count(n: usize) -> Self {
+        Self {
+            call_count: AtomicU64::new(0),
+            fact_count: Some(n),
         }
     }
 
@@ -186,6 +200,47 @@ impl MockLlmProvider {
         None
     }
 
+    /// Build a `note_attributes`-shaped JSON payload with exactly `n`
+    /// distinct durable atomic facts, each grounded in `content` (the
+    /// note text). Used by `with_fact_count` to test config-driven caps
+    /// deterministically and offline.
+    ///
+    /// Each fact gets a distinct `entity_text` so the slot-level dedup
+    /// pass (`(entity_text, facet, value_key)`) never collapses two of
+    /// them into one, a typed `facet`/`entity_type` so the specificity
+    /// gate passes, `memory_kind: "durable_fact"` so the admission gate
+    /// passes, and `supporting_spans: [content]` so the grounding gate
+    /// (a real substring of the source note) passes.
+    fn scripted_facts_response(content: &str, n: usize) -> String {
+        let facts: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "content": format!("Scripted fact #{}: {}", i, content),
+                    "memory_kind": "durable_fact",
+                    "supporting_spans": [content],
+                    "facet": "tech_stack",
+                    "entity_type": "project",
+                    "entity_text": format!("scripted-entity-{}", i),
+                    "value_text": format!("scripted-value-{}", i),
+                    "value_date": null,
+                    "occurred_start": null,
+                    "occurred_end": null,
+                    "occurred_confidence": 0.0,
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "reasoning": "mock scripted fact-count extraction",
+            "context": format!("{} - scripted context for fact-count testing.", content),
+            "keywords": [],
+            "tags": ["pattern"],
+            "foresight_signals": [],
+            "atomic_facts": facts,
+        })
+        .to_string()
+    }
+
     fn handle_attributes(&self, user_msg: &str) -> String {
         use chrono::Datelike;
         let content: &str = user_msg
@@ -193,6 +248,10 @@ impl MockLlmProvider {
             .nth(1)
             .map(|s| s.trim_start_matches(|c: char| c == '\n' || c == ' '))
             .unwrap_or(user_msg);
+
+        if let Some(n) = self.fact_count {
+            return Self::scripted_facts_response(content, n);
+        }
 
         let lower = content.to_lowercase();
         let mut facts: Vec<serde_json::Value> = Vec::new();

@@ -176,6 +176,11 @@ pub struct WriteConfig {
     /// this many days ahead of `ctx.reference_time()`. Default 1.0.
     #[serde(default = "default_future_skew_threshold_days")]
     pub future_skew_threshold_days: f64,
+    /// Adaptive 2×-with-tiebreak voting for mutable-slot extraction: run the
+    /// templated extraction prompt twice and accept the agreeing tuples; on
+    /// disagreement, run a third time and keep the majority. Default true.
+    #[serde(default = "default_slot_voting")]
+    pub slot_voting: bool,
 }
 
 fn default_foresight_doa_threshold_days() -> f64 {
@@ -184,6 +189,10 @@ fn default_foresight_doa_threshold_days() -> f64 {
 
 fn default_future_skew_threshold_days() -> f64 {
     1.0
+}
+
+fn default_slot_voting() -> bool {
+    true
 }
 
 impl Default for WriteConfig {
@@ -198,6 +207,7 @@ impl Default for WriteConfig {
             max_facts_per_note: 5,
             foresight_doa_threshold_days: 1.0,
             future_skew_threshold_days: 1.0,
+            slot_voting: true,
         }
     }
 }

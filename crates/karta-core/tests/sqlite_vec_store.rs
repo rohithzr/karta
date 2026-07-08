@@ -25,6 +25,7 @@ fn make_test_note(id: &str, content: &str, dim: usize) -> MemoryNote {
         turn_index: Some(1),
         source_timestamp: now,
         session_id: None,
+        seq: 0,
     }
 }
 
@@ -182,6 +183,7 @@ fn make_test_fact(id: &str, content: &str, source_note_id: &str, ordinal: u32, d
         occurred_start: None,
         occurred_end: None,
         occurred_confidence: karta_core::read::temporal::ConfidenceBand::None,
+        seq: 0,
     }
 }
 
@@ -277,6 +279,7 @@ async fn test_fact_typed_slots_round_trip() {
         occurred_start: Some(occurred_start),
         occurred_end: Some(occurred_end),
         occurred_confidence: ConfidenceBand::Explicit,
+        seq: 0,
     };
     store.upsert_fact(&original).await.unwrap();
 

@@ -11,3 +11,5 @@ pub mod admission;
 pub mod grounding;
 pub mod dedup;
 pub mod temporal_slots;
+pub mod slots;
+pub mod entity_key;

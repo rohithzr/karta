@@ -382,14 +382,15 @@ fn apply_config_env(config: &mut KartaConfig) {
     config.reranker.max_rerank = env_usize("K_MAX_RERANK", 20);
     config.write.foresight_default_ttl_days = env_usize("K_FORESIGHT_TTL", 90) as f64;
     config.write.extract_atomic_facts = env_bool("K_EXTRACT_FACTS", true);
+    config.write.slot_voting = env_bool("K_SLOT_VOTING", true);
     config.read.fact_retrieval_enabled = env_bool("K_FACT_RETRIEVAL", true);
     config.read.fact_match_boost = env_f32("K_FACT_BOOST", 0.1);
 
     let exp = std::env::var("K_EXPERIMENT").unwrap_or_else(|_| "default".to_string());
-    println!("  Config [{}]: episode={}, ep_retrieval={}, graph={}, foresight={}, reranker={}, abstention_thresh={}",
+    println!("  Config [{}]: episode={}, ep_retrieval={}, graph={}, foresight={}, reranker={}, abstention_thresh={}, slot_voting={}",
         exp, config.episode.enabled, config.read.episode_retrieval_enabled,
         config.read.graph_weight, config.read.foresight_boost,
-        config.reranker.enabled, config.reranker.abstention_threshold);
+        config.reranker.enabled, config.reranker.abstention_threshold, config.write.slot_voting);
 }
 
 /// Find a data directory for a conversation ID.

@@ -32,6 +32,10 @@ pub trait VectorStore: Send + Sync {
     /// Total note count.
     async fn count(&self) -> Result<usize>;
 
+    /// Return the next value of a persistent, monotonic global sequence counter.
+    /// Default (non-persistent stores) returns 0.
+    async fn next_seq(&self) -> Result<u64> { Ok(0) }
+
     // --- Atomic Facts (Phase Next) ---
 
     /// Insert or update an atomic fact with its embedding.
