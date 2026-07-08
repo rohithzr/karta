@@ -1,7 +1,11 @@
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Predicate {
     RoleTitle, Employer, Location, Status, Deadline, ScheduledDate,
@@ -84,6 +88,124 @@ pub fn parse_slot_tuples(v: &serde_json::Value) -> Vec<SlotTuple> {
             event_time,
             source_span: source_span.to_string(),
         });
+    }
+    out
+}
+
+/// Normalize a slot value for agreement comparison across voting runs.
+/// Shared with the ledger wiring (Task 12), which uses the same
+/// normalization when writing rows.
+pub fn value_norm(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+/// Run the mutable-slot extraction prompt once at the given temperature.
+/// Any failure (LLM error or malformed JSON) yields an empty result rather
+/// than panicking — callers treat "no evidence this run" as a valid vote.
+async fn extract_once(
+    llm: &dyn LlmProvider,
+    content: &str,
+    reference_time: DateTime<Utc>,
+    temperature: f32,
+) -> Vec<SlotTuple> {
+    let messages = [
+        ChatMessage {
+            role: Role::System,
+            content: Prompts::mutable_slots_system().to_string(),
+        },
+        ChatMessage {
+            role: Role::User,
+            content: Prompts::mutable_slots_user(content, reference_time),
+        },
+    ];
+    let cfg = GenConfig {
+        json_schema: Some(crate::llm::schemas::mutable_slots_schema()),
+        temperature,
+        ..Default::default()
+    };
+    let Ok(resp) = llm.chat(&messages, &cfg).await else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp.content) else {
+        return Vec::new();
+    };
+    parse_slot_tuples(&v)
+}
+
+/// Agreement key for comparing slot tuples across voting runs.
+type SlotKey = (String, Predicate, String);
+
+fn slot_key(t: &SlotTuple) -> SlotKey {
+    (
+        crate::extract::entity_key::normalize_entity(&t.entity_text),
+        t.predicate,
+        value_norm(&t.value),
+    )
+}
+
+/// Adaptive 2×-with-tiebreak voting wrapper around mutable-slot extraction.
+///
+/// When `enabled` is false, performs a single deterministic (temperature 0)
+/// extraction call. When enabled, runs the extraction twice at a non-zero
+/// temperature; if both runs fully agree (same set of `(entity, predicate,
+/// value)` keys), the agreeing tuples are returned (2 calls total). If the
+/// two runs disagree, a third run is performed and every tuple whose key
+/// appears in at least 2 of the 3 runs is kept (majority vote).
+pub async fn vote_slots(
+    llm: &dyn LlmProvider,
+    content: &str,
+    reference_time: DateTime<Utc>,
+    enabled: bool,
+) -> Vec<SlotTuple> {
+    const VOTE_TEMPERATURE: f32 = 0.4;
+
+    if !enabled {
+        return extract_once(llm, content, reference_time, 0.0).await;
+    }
+
+    let run1 = extract_once(llm, content, reference_time, VOTE_TEMPERATURE).await;
+    let run2 = extract_once(llm, content, reference_time, VOTE_TEMPERATURE).await;
+
+    let keys1: HashSet<SlotKey> = run1.iter().map(slot_key).collect();
+    let keys2: HashSet<SlotKey> = run2.iter().map(slot_key).collect();
+
+    if keys1 == keys2 {
+        return dedup_by_key(run1.into_iter().chain(run2), &keys1);
+    }
+
+    let run3 = extract_once(llm, content, reference_time, VOTE_TEMPERATURE).await;
+    let keys3: HashSet<SlotKey> = run3.iter().map(slot_key).collect();
+
+    let mut vote_count: HashMap<SlotKey, usize> = HashMap::new();
+    for k in keys1.into_iter().chain(keys2).chain(keys3) {
+        *vote_count.entry(k).or_insert(0) += 1;
+    }
+
+    let majority_keys: HashSet<SlotKey> = vote_count
+        .into_iter()
+        .filter(|(_, count)| *count >= 2)
+        .map(|(k, _)| k)
+        .collect();
+
+    dedup_by_key(
+        run1.into_iter().chain(run2).chain(run3),
+        &majority_keys,
+    )
+}
+
+/// Keep the first tuple seen for each key in `keep`, preserving first-seen
+/// order across the chained runs.
+fn dedup_by_key(tuples: impl Iterator<Item = SlotTuple>, keep: &HashSet<SlotKey>) -> Vec<SlotTuple> {
+    let mut seen: HashSet<SlotKey> = HashSet::new();
+    let mut out = Vec::new();
+    for t in tuples {
+        let k = slot_key(&t);
+        if !keep.contains(&k) {
+            continue;
+        }
+        if seen.insert(k) {
+            out.push(t);
+        }
     }
     out
 }
