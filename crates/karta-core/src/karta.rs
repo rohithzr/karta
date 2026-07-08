@@ -308,6 +308,28 @@ impl Karta {
         ledger.current(&key, predicate)
     }
 
+    /// Full ledger history (open + superseded rows) for a mutable slot.
+    /// Canonicalizes `entity` via the same write-time normalization, then
+    /// reads the slot_ledger. Empty when no ledger is attached (e.g.
+    /// non-`with_defaults` construction).
+    pub async fn slot_ledger_history(
+        &self,
+        entity: &str,
+        predicate: &str,
+    ) -> Result<Vec<crate::store::slot_ledger::LedgerRow>> {
+        let Some(ledger) = &self.slot_ledger else {
+            return Ok(Vec::new());
+        };
+        let norm = crate::extract::entity_key::normalize_entity(entity);
+        let key = self
+            .entity_aliases
+            .lock()
+            .ok()
+            .and_then(|a| a.lookup_exact(&norm))
+            .unwrap_or(norm);
+        ledger.history(&key, predicate)
+    }
+
     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         self.search_with_clock(query, top_k, ClockContext::now()).await
     }
