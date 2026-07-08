@@ -1,9 +1,11 @@
+use std::cmp::min;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, Row};
 
 use crate::error::{KartaError, Result};
+use crate::extract::slots::SlotTuple;
 
 /// Append-only ledger of mutable-slot values (entity_key/predicate/value)
 /// with deterministic supersession over time.
@@ -231,6 +233,81 @@ impl SlotLedger {
         }
         Ok(())
     }
+
+    /// Deterministically apply a newly extracted slot tuple against the ledger,
+    /// deciding whether it is a fresh insert, a corroboration of an existing
+    /// open value, a supersession (update), or a same-time conflict.
+    pub fn apply(
+        &self,
+        entity_key: &str,
+        tuple: &SlotTuple,
+        value_norm: &str,
+        seq: u64,
+        mention_time: DateTime<Utc>,
+        note_id: &str,
+    ) -> Result<LedgerOutcome> {
+        let predicate = tuple.predicate.as_str();
+        let open_rows = self.current(entity_key, predicate)?;
+
+        let new_row = NewLedgerRow {
+            entity_key: entity_key.to_string(),
+            predicate: predicate.to_string(),
+            value: tuple.value.clone(),
+            value_norm: value_norm.to_string(),
+            seq,
+            valid_from: tuple.event_time,
+            mention_time,
+            note_id: note_id.to_string(),
+            source_span: tuple.source_span.clone(),
+        };
+
+        if open_rows.is_empty() {
+            let new_id = self.insert_open(&new_row)?;
+            return Ok(LedgerOutcome::Inserted(new_id));
+        }
+
+        if let Some(existing) = open_rows.iter().find(|r| r.value_norm == value_norm) {
+            return Ok(LedgerOutcome::Corroborated(existing.id));
+        }
+
+        let r = open_rows
+            .iter()
+            .max_by_key(|r| r.seq)
+            .expect("open_rows is non-empty");
+
+        let is_conflict = match (r.valid_from, tuple.event_time) {
+            (Some(existing_time), Some(new_time)) => existing_time == new_time,
+            _ => false,
+        };
+
+        if is_conflict {
+            let new_id = self.insert_open(&new_row)?;
+            let group = min(r.id, new_id);
+            self.set_conflict_group(&[r.id, new_id], group)?;
+            Ok(LedgerOutcome::Conflict {
+                existing: r.id,
+                opened: new_id,
+                group,
+            })
+        } else {
+            let new_id = self.insert_open(&new_row)?;
+            let valid_to = tuple.event_time.unwrap_or(mention_time);
+            self.close(r.id, valid_to, new_id)?;
+            Ok(LedgerOutcome::Updated {
+                closed: r.id,
+                opened: new_id,
+            })
+        }
+    }
+}
+
+/// Outcome of applying a slot tuple to the ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerOutcome {
+    Inserted(i64),
+    Corroborated(i64),
+    Updated { closed: i64, opened: i64 },
+    Conflict { existing: i64, opened: i64, group: i64 },
 }
 
 #[allow(clippy::type_complexity)]
