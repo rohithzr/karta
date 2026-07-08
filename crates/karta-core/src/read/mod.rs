@@ -16,6 +16,28 @@ use crate::note::{AskResult, FetchedMemories, MemoryNote, Provenance, SearchResu
 use crate::rerank::{Reranker, RerankerConfig};
 use crate::store::{GraphStore, VectorStore};
 
+/// Chronological ordering comparator for notes: seq (true global order) takes
+/// precedence over the legacy turn_index/source_timestamp heuristic. Notes
+/// with `seq == 0` (legacy/unsequenced) fall back to the original
+/// turn_index > source_timestamp ordering exactly, so existing behavior for
+/// pre-substrate data is unchanged.
+pub(crate) fn note_order_cmp(a: &MemoryNote, b: &MemoryNote) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.seq, b.seq) {
+        // Both unsequenced (legacy/synthetic notes): preserve the prior
+        // turn_index > source_timestamp ordering exactly.
+        (0, 0) => match (a.turn_index, b.turn_index) {
+            (Some(ai), Some(bi)) => ai.cmp(&bi),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => a.source_timestamp.cmp(&b.source_timestamp),
+        },
+        // At least one is sequenced: global seq is the true total order.
+        // Tie-break equal seq by source_timestamp for determinism.
+        _ => a.seq.cmp(&b.seq).then_with(|| a.source_timestamp.cmp(&b.source_timestamp)),
+    }
+}
+
 /// Query classification for mode-specific retrieval behavior.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QueryMode {
@@ -426,15 +448,8 @@ impl ReadEngine {
             .filter(|n| n.is_active())
             .collect();
 
-        // Chronological order: prefer turn_index > source_timestamp > created_at
-        notes.sort_by(|a, b| {
-            match (a.turn_index, b.turn_index) {
-                (Some(ai), Some(bi)) => ai.cmp(&bi),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.source_timestamp.cmp(&b.source_timestamp),
-            }
-        });
+        // Chronological order: seq (true order) > turn_index > source_timestamp
+        notes.sort_by(note_order_cmp);
         notes.truncate(self.config.max_notes_per_episode);
         Ok(notes)
     }
@@ -1066,13 +1081,8 @@ impl ReadEngine {
             });
         }
 
-        // Sort chronologically (turn_index > source_timestamp > created_at)
-        all_notes.sort_by(|a, b| match (a.turn_index, b.turn_index) {
-            (Some(ai), Some(bi)) => ai.cmp(&bi),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.source_timestamp.cmp(&b.source_timestamp),
-        });
+        // Sort chronologically: seq (true order) > turn_index > source_timestamp
+        all_notes.sort_by(note_order_cmp);
 
         // Contradiction force-retrieval
         let mut contradiction_inject_ids: HashSet<String> = HashSet::new();
@@ -1350,16 +1360,9 @@ impl ReadEngine {
             });
         }
 
-        // Sort notes by conversation order (turn_index > source_timestamp > created_at).
+        // Sort notes by conversation order: seq (true order) > turn_index > source_timestamp.
         // LLMs perform better when notes arrive in chronological sequence, not relevance order.
-        all_notes.sort_by(|a, b| {
-            match (a.turn_index, b.turn_index) {
-                (Some(ai), Some(bi)) => ai.cmp(&bi),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.source_timestamp.cmp(&b.source_timestamp),
-            }
-        });
+        all_notes.sort_by(|a, b| note_order_cmp(a, b));
 
         // --- Contradiction force-retrieval ---
         // When a contradiction dream is among results (or a result note is linked to one),
@@ -1576,15 +1579,8 @@ impl ReadEngine {
                     }
                 }
 
-                // Sort chronologically
-                retry_notes.sort_by(|a, b| {
-                    match (a.turn_index, b.turn_index) {
-                        (Some(ai), Some(bi)) => ai.cmp(&bi),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => a.source_timestamp.cmp(&b.source_timestamp),
-                    }
-                });
+                // Sort chronologically: seq (true order) > turn_index > source_timestamp
+                retry_notes.sort_by(|a, b| note_order_cmp(a, b));
 
                 let joined_retry: String = retry_notes.iter().enumerate()
                     .map(|(i, note)| format_note(i, note, false))
@@ -1757,5 +1753,41 @@ impl ReadEngine {
             || lower.contains("not in the notes")
             || lower.contains("not provided in")
             || lower.contains("i don't see any note")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orders_by_seq_over_timestamp() {
+        use chrono::{TimeZone, Utc};
+        let mk = |seq: u64, ts_day: u32| {
+            let mut n = crate::note::MemoryNote::new("x".to_string());
+            n.seq = seq;
+            n.source_timestamp = Utc.with_ymd_and_hms(2024, 1, ts_day, 0, 0, 0).unwrap();
+            n.turn_index = None;
+            n
+        };
+        // seq increasing but timestamps DECREASING — seq must win.
+        let mut v = vec![mk(3, 1), mk(1, 3), mk(2, 2)];
+        v.sort_by(note_order_cmp);
+        let seqs: Vec<u64> = v.iter().map(|n| n.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn legacy_zero_seq_falls_back_to_turn_index() {
+        let mk = |ti: Option<u32>| {
+            let mut n = crate::note::MemoryNote::new("x".to_string());
+            n.seq = 0;
+            n.turn_index = ti;
+            n
+        };
+        let mut v = vec![mk(Some(2)), mk(Some(0)), mk(Some(1))];
+        v.sort_by(note_order_cmp);
+        let tis: Vec<Option<u32>> = v.iter().map(|n| n.turn_index).collect();
+        assert_eq!(tis, vec![Some(0), Some(1), Some(2)]);
     }
 }
