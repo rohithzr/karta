@@ -29,6 +29,7 @@ mod tests {
             turn_index: Some(7),
             source_timestamp: now,
             session_id: session_id.map(String::from),
+            seq: 0,
         }
     }
 

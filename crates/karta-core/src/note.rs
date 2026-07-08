@@ -48,6 +48,10 @@ pub struct MemoryNote {
     /// by episode segmentation and any caller that wants to scope a query.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Global monotonic sequence number assigned at ingest time. Used to
+    /// order notes/facts written within the same timestamp.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 impl MemoryNote {
@@ -71,6 +75,7 @@ impl MemoryNote {
             turn_index: None,
             source_timestamp: now,
             session_id: None,
+            seq: 0,
         }
     }
 
@@ -389,6 +394,9 @@ pub struct AtomicFact {
     /// Discrete confidence band. `None` iff both bounds are None (invariant #4).
     #[serde(default = "default_confidence_band")]
     pub occurred_confidence: crate::read::temporal::ConfidenceBand,
+    /// Global monotonic sequence number, inherited from the parent note.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 fn default_confidence_band() -> crate::read::temporal::ConfidenceBand {
@@ -425,6 +433,7 @@ impl AtomicFact {
             occurred_start: None,
             occurred_end: None,
             occurred_confidence: crate::read::temporal::ConfidenceBand::None,
+            seq: 0,
         }
     }
 

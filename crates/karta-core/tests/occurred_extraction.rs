@@ -134,6 +134,7 @@ async fn f7_t4_instant_encoded_as_1ns_interval() {
         occurred_start: Some(t),
         occurred_end: Some(t + chrono::Duration::nanoseconds(1)),
         occurred_confidence: ConfidenceBand::Explicit,
+        seq: 0,
     };
     assert!(fact.validate_occurred().is_ok());
     assert_eq!(

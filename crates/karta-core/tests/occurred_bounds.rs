@@ -25,6 +25,7 @@ fn sample(
         occurred_start: start,
         occurred_end: end,
         occurred_confidence: conf,
+        seq: 0,
     }
 }
 

@@ -593,6 +593,7 @@ impl DreamEngine {
             turn_index: None,
             source_timestamp: Utc::now(),
             session_id: None,
+            seq: 0,
         };
 
         self.vector_store.upsert(&note).await?;
@@ -737,6 +738,7 @@ impl DreamEngine {
             // bounded claim: this inference is as fresh as its newest evidence.
             source_timestamp,
             session_id: None,
+            seq: 0,
         };
 
         self.vector_store.upsert(&note).await?;
@@ -871,6 +873,7 @@ impl DreamEngine {
                 // bounded claim: digest freshness == newest evidence.
                 source_timestamp,
                 session_id: None,
+                seq: 0,
             };
 
             digest_note_id = Some(note.id.clone());

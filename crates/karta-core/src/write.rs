@@ -119,6 +119,7 @@ impl WriteEngine {
         note.source_timestamp = ctx.reference_time();
         note.turn_index = turn_index;
         note.session_id = session_id.map(String::from);
+        note.seq = self.vector_store.next_seq().await.unwrap_or(0);
 
         // 3. Use raw embedding for candidate search (fast path)
         let candidates = trace::stage("knn", async {
@@ -454,6 +455,7 @@ impl WriteEngine {
                         fact.occurred_start = occ_start;
                         fact.occurred_end = occ_end;
                         fact.occurred_confidence = occ_conf;
+                        fact.seq = note.seq;
 
                         // Validate before writing. Reject if invariants broken
                         // (unpaired bounds, end<=start, or confidence-bounds
@@ -733,6 +735,7 @@ impl WriteEngine {
             turn_index: None,
             source_timestamp,
             session_id: None,
+            seq: 0,
         };
 
         self.vector_store.upsert(&note).await?;
