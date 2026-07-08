@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +38,56 @@ pub struct SlotTuple {
     pub source_span: String,
 }
 
+/// Parse an `event_time` field that may be an RFC3339 timestamp, a bare
+/// `YYYY-MM-DD` date, absent, or JSON null. Any parse failure defaults to
+/// `None` rather than dropping the row.
+fn parse_event_time(v: &serde_json::Value) -> Option<DateTime<Utc>> {
+    let s = v.as_str()?;
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    }
+    None
+}
+
+/// Parse the `{"slots": [...]}` payload emitted by the mutable-slot
+/// extraction prompt into `SlotTuple`s. Rows with an unknown/missing
+/// predicate, or missing required string fields, are silently dropped.
+pub fn parse_slot_tuples(v: &serde_json::Value) -> Vec<SlotTuple> {
+    let mut out = Vec::new();
+    let Some(slots) = v["slots"].as_array() else {
+        return out;
+    };
+    for obj in slots {
+        let Some(predicate_str) = obj["predicate"].as_str() else {
+            continue;
+        };
+        let Some(predicate) = Predicate::from_str(predicate_str) else {
+            continue;
+        };
+        let Some(entity) = obj["entity"].as_str() else {
+            continue;
+        };
+        let Some(value) = obj["value"].as_str() else {
+            continue;
+        };
+        let Some(source_span) = obj["source_span"].as_str() else {
+            continue;
+        };
+        let event_time = parse_event_time(&obj["event_time"]);
+        out.push(SlotTuple {
+            entity_text: entity.to_string(),
+            predicate,
+            value: value.to_string(),
+            event_time,
+            source_span: source_span.to_string(),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +100,16 @@ mod tests {
     #[test]
     fn there_are_twelve_predicates() {
         assert_eq!(Predicate::all().len(), 12);
+    }
+    #[test]
+    fn parses_valid_slots_and_drops_unknown_predicate() {
+        let v = serde_json::json!({"slots": [
+            {"entity":"first sprint","predicate":"deadline","value":"April 5","event_time":null,"source_span":"deadline April 5"},
+            {"entity":"x","predicate":"not_real","value":"y","source_span":"z"}
+        ]});
+        let out = parse_slot_tuples(&v);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].predicate, Predicate::Deadline);
+        assert_eq!(out[0].value, "April 5");
     }
 }

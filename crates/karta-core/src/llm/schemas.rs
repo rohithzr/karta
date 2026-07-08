@@ -159,6 +159,59 @@ pub fn note_attributes_schema() -> JsonSchema {
     }
 }
 
+/// Schema for mutable-slot extraction — templated facts that get
+/// superseded over time (role_title, employer, location, status,
+/// deadline, scheduled_date, count, amount, tech_choice, preference,
+/// ownership, metric_value).
+pub fn mutable_slots_schema() -> JsonSchema {
+    JsonSchema {
+        name: "mutable_slots".to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "slots": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "entity": {
+                                "type": "string",
+                                "description": "Surface form of the entity this fact is about, exactly as it appears in the message."
+                            },
+                            "predicate": {
+                                "type": "string",
+                                "enum": [
+                                    "role_title", "employer", "location", "status",
+                                    "deadline", "scheduled_date", "count", "amount",
+                                    "tech_choice", "preference", "ownership", "metric_value"
+                                ],
+                                "description": "Which of the 12 mutable-fact predicates this row states. Never invent a predicate outside this list."
+                            },
+                            "value": {
+                                "type": "string",
+                                "description": "The current value only, verbatim or lightly normalized from the message."
+                            },
+                            "event_time": {
+                                "type": ["string", "null"],
+                                "description": "ISO 8601 date (YYYY-MM-DD) ONLY if the date is explicitly grounded in the message text (an explicit date, or a relative expression like 'next Friday' resolvable against reference_time). null if not grounded. Never fabricate a date."
+                            },
+                            "source_span": {
+                                "type": "string",
+                                "description": "Exact verbatim substring of the message that supports this fact."
+                            }
+                        },
+                        "required": ["entity", "predicate", "value", "event_time", "source_span"],
+                        "additionalProperties": false
+                    },
+                    "description": "Zero or more mutable facts. Empty array is correct when the message contains none of the 12 predicates."
+                }
+            },
+            "required": ["slots"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 /// Schema for link decisions.
 pub fn link_decision_schema() -> JsonSchema {
     JsonSchema {

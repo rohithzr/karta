@@ -274,6 +274,84 @@ to fill the array.
         )
     }
 
+    pub fn mutable_slots_system() -> &'static str {
+        r#"You are a templated-fact extraction system. Read one user message and
+extract ONLY mutable facts — facts whose value can change over time and
+later supersede an earlier value. Output JSON only, matching the provided
+schema exactly.
+
+============================================================
+THE 12 PREDICATES
+============================================================
+
+Extract a row ONLY when the message states one of these exactly:
+
+  role_title      — a person's job title/role
+  employer        — who a person works for
+  location        — where a person/entity currently is
+  status          — current state of a task/project/entity
+  deadline        — a due date for something
+  scheduled_date  — a planned/booked date for an event
+  count           — a current count of something
+  amount          — a current quantity/monetary amount
+  tech_choice     — the tool/technology currently chosen
+  preference      — a current stated preference
+  ownership       — who currently owns/holds something
+  metric_value    — a current measured value (e.g. accuracy, latency)
+
+If a claim does not match one of these 12 predicates exactly, SKIP it —
+do NOT invent a new predicate and do NOT force-fit it into a close one.
+
+============================================================
+RULES
+============================================================
+
+1. `value` is the CURRENT value only — not history, not the delta.
+2. `event_time` is an ISO 8601 date (YYYY-MM-DD) ONLY if a date is
+   explicitly grounded in the message text: either an explicit date, or a
+   relative expression (e.g. "next Friday", "in two weeks") that is
+   resolvable against `reference_time`. If the message states the fact
+   with no groundable date, `event_time` MUST be `null`. NEVER fabricate
+   or infer a date that is not grounded in the text.
+3. `source_span` MUST be the exact verbatim substring of the message that
+   supports the fact — copy it character-for-character, do not paraphrase.
+4. If the message contains no facts matching the 12 predicates, return
+   `{"slots": []}`. An empty array is a valid and often correct answer.
+
+============================================================
+EXAMPLES
+============================================================
+
+Example 1 — grounded event_time:
+  reference_time: 2024-03-20T00:00:00Z
+  Message: "The first sprint deadline moved to April 5."
+  Output:
+  {"slots": [
+    {"entity": "first sprint", "predicate": "deadline", "value": "April 5",
+     "event_time": "2024-04-05", "source_span": "deadline moved to April 5"}
+  ]}
+
+Example 2 — ungrounded date, so event_time is null:
+  reference_time: 2024-03-20T00:00:00Z
+  Message: "I'm now the lead engineer on the payments team."
+  Output:
+  {"slots": [
+    {"entity": "user", "predicate": "role_title", "value": "lead engineer",
+     "event_time": null, "source_span": "I'm now the lead engineer"}
+  ]}
+  (No explicit or resolvable date appears in the message, so event_time
+  is null rather than guessed from reference_time.)
+"#
+    }
+
+    pub fn mutable_slots_user(content: &str, reference_time: chrono::DateTime<chrono::Utc>) -> String {
+        format!(
+            "reference_time: {ref_time}\n\nMessage:\n{content}",
+            ref_time = reference_time.to_rfc3339(),
+            content = content,
+        )
+    }
+
     pub fn linking_system() -> &'static str {
         "You decide which existing memories should be linked to a new memory.\n\
          Link only when there is a MEANINGFUL relationship: same entity, causal connection, \
