@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use tracing::{debug, info};
@@ -11,9 +11,11 @@ pub mod resolve_llm;
 use crate::clock::ClockContext;
 use crate::config::ReadConfig;
 use crate::error::Result;
+use crate::extract::slots::Predicate;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
 use crate::note::{AskResult, FetchedMemories, MemoryNote, Provenance, SearchResult};
 use crate::rerank::{Reranker, RerankerConfig};
+use crate::store::slot_ledger::{LedgerRow, SlotLedger};
 use crate::store::{GraphStore, VectorStore};
 
 /// Chronological ordering comparator for notes: seq (true global order) takes
@@ -300,6 +302,122 @@ pub fn classify_query(query: &str) -> QueryClassification {
     }
 }
 
+/// Map a free-text query to a mutable-slot [`Predicate`] via keyword
+/// matching, ordered so more-specific phrases are checked before more
+/// general ones. Returns `None` if nothing matches — the caller should
+/// then skip ledger injection entirely.
+fn query_predicate(query: &str) -> Option<Predicate> {
+    let q = query.to_lowercase();
+
+    if q.contains("deadline") || q.contains("due") {
+        return Some(Predicate::Deadline);
+    }
+    if q.contains("how many") || q.contains("count") || q.contains("number of") {
+        return Some(Predicate::Count);
+    }
+    if q.contains("role") || q.contains("title") || q.contains("job") {
+        return Some(Predicate::RoleTitle);
+    }
+    if q.contains("employer") || q.contains("work for") || q.contains("company") {
+        return Some(Predicate::Employer);
+    }
+    if q.contains("where") || q.contains("location") || q.contains("located") {
+        return Some(Predicate::Location);
+    }
+    if q.contains("status") {
+        return Some(Predicate::Status);
+    }
+    if q.contains("scheduled") || q.contains("when is") {
+        return Some(Predicate::ScheduledDate);
+    }
+    if q.contains("amount") || q.contains("salary") || q.contains("cost") || q.contains("price") {
+        return Some(Predicate::Amount);
+    }
+    if q.contains("using") || q.contains("tech") || q.contains("tool") || q.contains("stack") {
+        return Some(Predicate::TechChoice);
+    }
+    if q.contains("prefer") || q.contains("preference") || q.contains("favorite") {
+        return Some(Predicate::Preference);
+    }
+    if q.contains("own") || q.contains("owner") {
+        return Some(Predicate::Ownership);
+    }
+    if q.contains("metric") || q.contains("accuracy") || q.contains("latency") || q.contains("score") {
+        return Some(Predicate::MetricValue);
+    }
+    None
+}
+
+/// Render a Spike-4 style context block for mutable-slot ledger rows: one
+/// `[CURRENT] entity predicate = value (as of date)` line per row, or a
+/// `[CONFLICT] entity predicate: both "a" and "b" stated` line when 2+ rows
+/// share the same `conflict_group`. Pure and side-effect free.
+pub(crate) fn build_ledger_block(rows: &[LedgerRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    // Group rows by conflict_group (if any) while preserving encounter order.
+    let mut conflict_order: Vec<i64> = Vec::new();
+    let mut conflict_groups: std::collections::HashMap<i64, Vec<&LedgerRow>> =
+        std::collections::HashMap::new();
+    let mut singles: Vec<&LedgerRow> = Vec::new();
+
+    for row in rows {
+        match row.conflict_group {
+            Some(cg) => {
+                let entry = conflict_groups.entry(cg).or_insert_with(|| {
+                    conflict_order.push(cg);
+                    Vec::new()
+                });
+                entry.push(row);
+            }
+            None => singles.push(row),
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+
+    for cg in &conflict_order {
+        let group = &conflict_groups[cg];
+        if group.len() < 2 {
+            // Not actually a conflict (only one row tagged) — treat as CURRENT.
+            for row in group {
+                lines.push(render_current_line(row));
+            }
+            continue;
+        }
+        let first = group[0];
+        let values: Vec<String> = group.iter().map(|r| format!("\"{}\"", r.value)).collect();
+        let joined = if values.len() == 2 {
+            format!("{} and {}", values[0], values[1])
+        } else {
+            values.join(", ")
+        };
+        lines.push(format!(
+            "[CONFLICT] {} {}: both {} stated",
+            first.entity_key, first.predicate, joined
+        ));
+    }
+
+    for row in &singles {
+        lines.push(render_current_line(row));
+    }
+
+    lines.join("\n")
+}
+
+fn render_current_line(row: &LedgerRow) -> String {
+    let date = row
+        .valid_from
+        .unwrap_or(row.mention_time)
+        .format("%Y-%m-%d");
+    format!(
+        "[CURRENT] {} {} = {} (as of {})",
+        row.entity_key, row.predicate, row.value, date
+    )
+}
+
 /// Handles the read path: search, graph traversal, reranking, synthesis.
 pub struct ReadEngine {
     vector_store: Arc<dyn VectorStore>,
@@ -310,6 +428,8 @@ pub struct ReadEngine {
     config: ReadConfig,
     reranker_config: RerankerConfig,
     classifier: tokio::sync::OnceCell<QueryClassifier>,
+    slot_ledger: Option<Arc<SlotLedger>>,
+    entity_aliases: Option<Arc<Mutex<crate::extract::entity_key::EntityAliases>>>,
 }
 
 impl ReadEngine {
@@ -331,7 +451,24 @@ impl ReadEngine {
             config,
             reranker_config,
             classifier: tokio::sync::OnceCell::new(),
+            slot_ledger: None,
+            entity_aliases: None,
         }
+    }
+
+    /// Attach the shared mutable-slot ledger so synthesis can inject
+    /// [CURRENT]/[CONFLICT] context for queries about mutable facts.
+    pub(crate) fn attach_slot_ledger(&mut self, ledger: Arc<SlotLedger>) {
+        self.slot_ledger = Some(ledger);
+    }
+
+    /// Attach the shared write-time entity-alias table (read-only lookups
+    /// only — the read path never inserts new aliases).
+    pub(crate) fn set_entity_aliases(
+        &mut self,
+        aliases: Arc<Mutex<crate::extract::entity_key::EntityAliases>>,
+    ) {
+        self.entity_aliases = Some(aliases);
     }
 
     /// LLM used for the final answer-synthesis call. Defaults to `self.llm`
@@ -1479,12 +1616,18 @@ impl ReadEngine {
         // digests. Dates in the digest are LLM-extracted from note content,
         // which is much more reliable than expecting the synthesis model to
         // pick dates out of scattered note excerpts at query time.
+        let ledger_block = self.build_ledger_context(query).await;
         let events_block = self.build_events_block(mode).await;
-        let notes_text = if events_block.is_empty() {
-            joined_notes
-        } else {
-            format!("{}\n\n{}", events_block, joined_notes)
-        };
+        let mut prefix = String::new();
+        if !ledger_block.is_empty() {
+            prefix.push_str(&ledger_block);
+            prefix.push_str("\n\n");
+        }
+        if !events_block.is_empty() {
+            prefix.push_str(&events_block);
+            prefix.push_str("\n\n");
+        }
+        let notes_text = format!("{}{}", prefix, joined_notes);
 
         let messages = vec![
             ChatMessage {
@@ -1587,11 +1730,16 @@ impl ReadEngine {
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 let retry_events_block = self.build_events_block(mode).await;
-                let retry_notes_text = if retry_events_block.is_empty() {
-                    joined_retry
-                } else {
-                    format!("{}\n\n{}", retry_events_block, joined_retry)
-                };
+                let mut retry_prefix = String::new();
+                if !ledger_block.is_empty() {
+                    retry_prefix.push_str(&ledger_block);
+                    retry_prefix.push_str("\n\n");
+                }
+                if !retry_events_block.is_empty() {
+                    retry_prefix.push_str(&retry_events_block);
+                    retry_prefix.push_str("\n\n");
+                }
+                let retry_notes_text = format!("{}{}", retry_prefix, joined_retry);
 
                 let retry_messages = vec![
                     ChatMessage {
@@ -1652,6 +1800,36 @@ impl ReadEngine {
             has_contradiction,
             reranker_best_score: reranker_best,
         })
+    }
+
+    /// Build a [CURRENT]/[CONFLICT] context block for mutable-slot queries by
+    /// resolving the query to a known entity + predicate and reading the
+    /// current ledger rows for that pair. Returns empty string unless a
+    /// ledger and alias table are attached and both an entity and predicate
+    /// can be resolved from the query — additive and side-effect free
+    /// (never mutates the shared alias table).
+    async fn build_ledger_context(&self, query: &str) -> String {
+        let Some(ledger) = &self.slot_ledger else { return String::new(); };
+        let Some(aliases) = &self.entity_aliases else { return String::new(); };
+        let Some(predicate) = query_predicate(query) else { return String::new(); };
+
+        let entity_key = {
+            let guard = match aliases.lock() {
+                Ok(g) => g,
+                Err(_) => return String::new(),
+            };
+            let nq = crate::extract::entity_key::normalize_entity(query);
+            guard
+                .keys()
+                .into_iter()
+                .find(|k| k.split_whitespace().all(|w| nq.contains(w)))
+        };
+        let Some(entity_key) = entity_key else { return String::new(); };
+
+        match ledger.current(&entity_key, predicate.as_str()) {
+            Ok(rows) if !rows.is_empty() => build_ledger_block(&rows),
+            _ => String::new(),
+        }
     }
 
     /// Build a structured EVENTS block from stored episode digests and the
@@ -1759,6 +1937,30 @@ impl ReadEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ledger_block_renders_current_and_conflict() {
+        use crate::store::slot_ledger::LedgerRow;
+        use chrono::{TimeZone, Utc};
+        let base = |value: &str, cg: Option<i64>| LedgerRow {
+            id: 1, entity_key: "first sprint".into(), predicate: "deadline".into(),
+            value: value.into(), value_norm: value.to_lowercase(), seq: 1,
+            valid_from: Some(Utc.with_ymd_and_hms(2024, 4, 5, 0, 0, 0).unwrap()),
+            mention_time: Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap(),
+            valid_to: None, superseded_by: None, conflict_group: cg,
+            note_id: "n1".into(), source_span: "s".into(),
+        };
+        // CURRENT
+        let cur = build_ledger_block(&[base("April 5", None)]);
+        assert_eq!(cur, "[CURRENT] first sprint deadline = April 5 (as of 2024-04-05)");
+        // CONFLICT (two rows, same conflict_group)
+        let mut r1 = base("April 5", Some(7));
+        let mut r2 = base("April 6", Some(7));
+        r2.id = 2;
+        let conf = build_ledger_block(&[r1.clone(), r2.clone()]);
+        assert_eq!(conf, "[CONFLICT] first sprint deadline: both \"April 5\" and \"April 6\" stated");
+        let _ = (&mut r1, &mut r2);
+    }
 
     #[test]
     fn orders_by_seq_over_timestamp() {

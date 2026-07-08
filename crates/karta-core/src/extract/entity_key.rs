@@ -82,6 +82,20 @@ impl EntityAliases {
         self.canon.push((norm.to_string(), stored_vec));
         norm.to_string()
     }
+
+    /// Look up a canonical entity key by exact normalized-string match,
+    /// without inserting a new entry when absent.
+    pub fn lookup_exact(&self, norm: &str) -> Option<String> {
+        self.canon
+            .iter()
+            .find(|(c, _)| c == norm)
+            .map(|(c, _)| c.clone())
+    }
+
+    /// All known canonical entity keys.
+    pub fn keys(&self) -> Vec<String> {
+        self.canon.iter().map(|(c, _)| c.clone()).collect()
+    }
 }
 
 #[cfg(test)]
@@ -104,5 +118,15 @@ mod tests {
         // orthogonal embeddings, high threshold → no over-merge
         assert_eq!(a.resolve("dashboard api", Some(&[1.0, 0.0]), 0.9), "dashboard api");
         assert_eq!(a.resolve("grocery budget", Some(&[0.0, 1.0]), 0.9), "grocery budget");
+    }
+    #[test]
+    fn lookup_exact_finds_without_inserting() {
+        let mut a = EntityAliases::new();
+        assert_eq!(a.lookup_exact("first sprint"), None);
+        a.resolve("first sprint", None, 0.9);
+        assert_eq!(a.lookup_exact("first sprint"), Some("first sprint".to_string()));
+        // still absent, still not inserted
+        assert_eq!(a.lookup_exact("second sprint"), None);
+        assert_eq!(a.keys(), vec!["first sprint".to_string()]);
     }
 }

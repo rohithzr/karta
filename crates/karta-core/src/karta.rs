@@ -68,7 +68,7 @@ impl Karta {
             Arc::new(NoopReranker)
         };
 
-        let read_engine = ReadEngine::new(
+        let mut read_engine = ReadEngine::new(
             Arc::clone(&vector_store),
             Arc::clone(&graph_store),
             Arc::clone(&llm),
@@ -79,6 +79,7 @@ impl Karta {
         );
 
         let entity_aliases = write_engine.entity_aliases_handle();
+        read_engine.set_entity_aliases(Arc::clone(&entity_aliases));
 
         Ok(Self {
             write_engine,
@@ -97,6 +98,7 @@ impl Karta {
     /// copy here (so reads can query it via `slot_ledger_current`).
     pub(crate) fn attach_slot_ledger(&mut self, ledger: Arc<crate::store::slot_ledger::SlotLedger>) {
         self.write_engine.attach_slot_ledger(Arc::clone(&ledger));
+        self.read_engine.attach_slot_ledger(Arc::clone(&ledger));
         self.slot_ledger = Some(ledger);
     }
 
@@ -297,7 +299,13 @@ impl Karta {
             return Ok(Vec::new());
         };
         let norm = crate::extract::entity_key::normalize_entity(entity);
-        ledger.current(&norm, predicate)
+        let key = self
+            .entity_aliases
+            .lock()
+            .ok()
+            .and_then(|a| a.lookup_exact(&norm))
+            .unwrap_or(norm);
+        ledger.current(&key, predicate)
     }
 
     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
