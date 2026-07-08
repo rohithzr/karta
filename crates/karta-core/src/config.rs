@@ -178,7 +178,9 @@ pub struct WriteConfig {
     pub future_skew_threshold_days: f64,
     /// Adaptive 2×-with-tiebreak voting for mutable-slot extraction: run the
     /// templated extraction prompt twice and accept the agreeing tuples; on
-    /// disagreement, run a third time and keep the majority. Default true.
+    /// disagreement, run a third time and keep the majority. Default false —
+    /// the 3-conv BEAM A/B (2026-07-08) showed voting is within noise on every
+    /// ability (worse on temporal) at +8% ingest cost, so it is opt-in only.
     #[serde(default = "default_slot_voting")]
     pub slot_voting: bool,
 }
@@ -192,7 +194,7 @@ fn default_future_skew_threshold_days() -> f64 {
 }
 
 fn default_slot_voting() -> bool {
-    true
+    false
 }
 
 impl Default for WriteConfig {
@@ -207,7 +209,7 @@ impl Default for WriteConfig {
             max_facts_per_note: 5,
             foresight_doa_threshold_days: 1.0,
             future_skew_threshold_days: 1.0,
-            slot_voting: true,
+            slot_voting: false,
         }
     }
 }

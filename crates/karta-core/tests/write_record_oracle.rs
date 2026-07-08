@@ -11,22 +11,21 @@
 //! Skipped unless `KARTA_REAL_LLM_TESTS=1`. Requires the configured LLM
 //! provider (Azure per `.env` in this worktree) to be reachable.
 //!
-//! Tier-2 baseline (2026-07-08, Azure gpt-5.4-mini core): overall 9/18
-//! (50.0%); per-check current_value 66.7%, event_time_null 61.1%,
-//! history 55.6%, chain_closed 100.0%. chain_closed=100% confirms the
-//! deterministic supersession machinery is correct; the current_value/
-//! history/event_time_null misses are LLM extraction-recall gaps (the
-//! model extracts the first mention but often misses the update, and
-//! misses employer/some predicates entirely — especially in ungrounded
-//! phrasings), NOT supersession-rule bugs. Floor left at 0.5; tighten
-//! once extraction recall improves in a follow-up prompt/predicate pass.
-//!
-//! Post-measurement fix: the `count_changed` case's `event_time_null`
-//! expectation was corrected to `true` after this run (a dateless count
-//! is correctly ungrounded — its rows supersede cleanly with valid_from
-//! =None). This flip only relaxes one already-ingested case's expected
-//! bool, so it can only nudge event_time_null up by ~1 case; the numbers
-//! above are the pre-fix measured baseline and were not re-run.
+//! Tier-2 baseline (2026-07-08, Azure gpt-5.4-mini core), voting OFF:
+//!   * PRE-recall-fix: overall 9/18 (50.0%); current_value 66.7%,
+//!     event_time_null 61.1%, history 55.6%, chain_closed 100.0%. The
+//!     current_value/history/event_time_null misses were LLM extraction-
+//!     recall gaps — the model extracted the first mention but missed the
+//!     update, and skipped employer/some predicates entirely (especially
+//!     plain, undated phrasings), NOT supersession-rule bugs.
+//!   * POST-recall-fix (mutable_slots prompt: "plain assertions count, not
+//!     only changes" rule + phrasing→predicate map + disjoint examples):
+//!     overall 17/18 (94.4%); current_value 100%, event_time_null 100%,
+//!     history 94.4%, chain_closed 100%. Verified with example content
+//!     DISJOINT from the golden set (no teaching-to-the-test), so this is
+//!     genuine generalization. The lone miss is `metric_value_changed`
+//!     history (first "%" not recorded; current_value still correct).
+//! Floor asserted at 0.85 to guard the recall fix against regression.
 //!
 //! Run:
 //!   KARTA_REAL_LLM_TESTS=1 RUSTC_WRAPPER="" cargo test --release \
@@ -245,9 +244,10 @@ async fn write_record_oracle_matches_golden_set() {
 
     let overall_rate = tally.overall as f64 / n as f64;
     assert!(
-        overall_rate >= 0.5,
-        "write-record oracle overall pass rate {:.1}% is below the conservative 50% floor \
-         (started lenient per the plan; see failing cases above)",
+        overall_rate >= 0.85,
+        "write-record oracle overall pass rate {:.1}% is below the 85% floor \
+         (post-recall-fix baseline is 94.4%; a drop here means extraction recall \
+         regressed — see failing cases above)",
         overall_rate * 100.0
     );
 }
