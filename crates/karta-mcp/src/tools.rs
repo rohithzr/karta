@@ -12,6 +12,7 @@ use crate::session;
 
 /// Parameter struct for `karta_add_note`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AddNoteParams {
     pub content: String,
     pub session_id: Option<String>,
@@ -20,6 +21,7 @@ pub struct AddNoteParams {
 
 /// Parameter struct for `karta_fetch_memories`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FetchMemoriesParams {
     pub query: String,
     pub top_k: Option<usize>,
@@ -27,6 +29,7 @@ pub struct FetchMemoriesParams {
 
 /// Parameter struct for `karta_run_dreaming`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RunDreamingParams {
     pub scope_type: Option<String>,
     pub scope_id: Option<String>,
@@ -34,6 +37,7 @@ pub struct RunDreamingParams {
 
 /// Parameter struct for `karta_session_start`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionStartParams {
     pub agent: String,
     pub project: Option<String>,
@@ -41,6 +45,7 @@ pub struct SessionStartParams {
 
 /// Parameter struct for `karta_session_end`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionEndParams {
     pub session_id: String,
     pub summary: Option<String>,
@@ -48,6 +53,7 @@ pub struct SessionEndParams {
 
 /// Parameter struct for `karta_consolidate`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ConsolidateParams {
     pub session_id: Option<String>,
 }

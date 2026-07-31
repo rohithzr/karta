@@ -214,7 +214,10 @@ async fn crash_recovery_replays_queued_in_flight_and_failed_rows() {
 
     send_sigterm(&child);
     let status = wait_for_exit(&mut child).await.expect("wait for exit");
-    assert!(status.success(), "serve should exit cleanly after SIGTERM");
+    assert!(
+        status.success(),
+        "serve should exit cleanly after SIGTERM, got status {status:?}"
+    );
 
     let conn = Connection::open(&db_path).expect("open db after recovery");
     assert_eq!(count_statuses(&conn, &["queued", "in_flight"]), 0);
@@ -257,7 +260,10 @@ async fn sigterm_drains_in_flight_and_queued_rows() {
     send_sigterm(&child);
 
     let status = wait_for_exit(&mut child).await.expect("wait for exit");
-    assert!(status.success(), "serve should exit cleanly after SIGTERM");
+    assert!(
+        status.success(),
+        "serve should exit cleanly after SIGTERM, got status {status:?}"
+    );
 
     let conn = Connection::open(&db_path).expect("open db after SIGTERM");
     assert_eq!(count_statuses(&conn, &["queued", "in_flight"]), 0);

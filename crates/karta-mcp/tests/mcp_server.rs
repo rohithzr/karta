@@ -6,12 +6,25 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+/// Port range for spawned `serve` processes in these tests.
+///
+/// Each test gets a distinct loopback port so the tests can run in parallel
+/// without colliding on the HTTP capture endpoint. The range starts well above
+/// the default `3137` and the `31500` range used by the queue durability
+/// integration tests.
+static NEXT_PORT: AtomicU16 = AtomicU16::new(31700);
+
+fn allocate_test_port() -> u16 {
+    NEXT_PORT.fetch_add(1, Ordering::SeqCst)
+}
 
 fn bin_path() -> PathBuf {
     std::env::var("CARGO_BIN_EXE_karta-mcp")
@@ -36,6 +49,7 @@ fn bin_path() -> PathBuf {
 
 async fn spawn_serve(
     temp_dir: &TempDir,
+    port: u16,
 ) -> (
     Child,
     ChildStdin,
@@ -46,7 +60,7 @@ async fn spawn_serve(
         .arg("serve")
         .arg("--mock")
         .env("KARTA_STORE_DIR", temp_dir.path().to_str().unwrap())
-        .env("KARTA_CAPTURE_PORT", "3137")
+        .env("KARTA_CAPTURE_PORT", port.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -107,7 +121,8 @@ async fn read_message_timeout(reader: &mut BufReader<ChildStdout>, label: &str) 
 #[tokio::test]
 async fn server_initializes_and_lists_tools() {
     let temp_dir = TempDir::new().unwrap();
-    let (mut child, mut stdin, mut reader, stderr_handle) = spawn_serve(&temp_dir).await;
+    let port = allocate_test_port();
+    let (mut child, mut stdin, mut reader, stderr_handle) = spawn_serve(&temp_dir, port).await;
 
     // Initialize handshake.
     write_request(
@@ -164,6 +179,76 @@ async fn server_initializes_and_lists_tools() {
         assert!(names.contains(&name.to_string()), "missing tool {name}");
     }
     assert_eq!(names.len(), 7, "expected exactly 7 tools, got {names:?}");
+
+    let _ = child.kill().await;
+    let _ = stderr_handle.await;
+}
+
+#[tokio::test]
+async fn rejects_tool_call_with_unknown_field() {
+    let temp_dir = TempDir::new().unwrap();
+    let port = allocate_test_port();
+    let (mut child, mut stdin, mut reader, stderr_handle) = spawn_serve(&temp_dir, port).await;
+
+    // Initialize handshake.
+    write_request(
+        &mut stdin,
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "0.0.1" },
+        }),
+    )
+    .await;
+
+    let init = read_message_timeout(&mut reader, "initialize response").await;
+    assert!(
+        init.get("result").is_some(),
+        "initialize should return a result: {init}"
+    );
+    assert!(
+        init.get("error").is_none(),
+        "initialize should not return an error: {init}"
+    );
+
+    // Initialized notification.
+    let notify = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    let msg = format!("{}\n", serde_json::to_string(&notify).unwrap());
+    stdin.write_all(msg.as_bytes()).await.unwrap();
+    stdin.flush().await.unwrap();
+
+    // Call karta_add_note with an unsupported extra parameter.
+    write_request(
+        &mut stdin,
+        2,
+        "tools/call",
+        json!({
+            "name": "karta_add_note",
+            "arguments": {
+                "content": "hello world",
+                "extra_field": "not supported"
+            }
+        }),
+    )
+    .await;
+
+    let response = read_message_timeout(&mut reader, "tools/call response").await;
+    let result = response
+        .get("result")
+        .expect("tools/call should return a result object");
+    assert!(
+        result["isError"].as_bool().unwrap_or(false),
+        "expected tool result to report an error for unknown field, got: {response}"
+    );
+    let content_text = result["content"][0]["text"]
+        .as_str()
+        .expect("error content should contain text");
+    assert!(
+        content_text.contains("unknown field"),
+        "expected unknown field deserialization error, got: {content_text}"
+    );
 
     let _ = child.kill().await;
     let _ = stderr_handle.await;

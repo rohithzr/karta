@@ -152,14 +152,23 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     // HTTP capture endpoint task.
     let capture_router = capture::router(handle.karta.clone(), queue.clone());
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", config.capture_port))
-        .await
-        .with_context(|| {
-            format!(
-                "failed to bind HTTP capture endpoint to 127.0.0.1:{}",
-                config.capture_port
-            )
-        })?;
+    let socket = tokio::net::TcpSocket::new_v4()
+        .with_context(|| "failed to create TCP socket for HTTP capture endpoint")?;
+    socket
+        .set_reuseaddr(true)
+        .with_context(|| "failed to set SO_REUSEADDR on HTTP capture socket")?;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", config.capture_port)
+        .parse()
+        .expect("127.0.0.1 with a valid port is a valid socket address");
+    socket.bind(addr).with_context(|| {
+        format!(
+            "failed to bind HTTP capture endpoint to 127.0.0.1:{}",
+            config.capture_port
+        )
+    })?;
+    let listener = socket
+        .listen(128)
+        .with_context(|| "failed to listen on HTTP capture socket")?;
     let capture_addr = listener.local_addr()?;
     let capture_cancel = cancel.clone();
     join_set.spawn(async move {
