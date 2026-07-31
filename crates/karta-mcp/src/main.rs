@@ -14,12 +14,13 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 mod config;
 mod queue;
+mod server;
+mod session;
+mod tools;
 
 use config::Config;
 
@@ -124,68 +125,76 @@ async fn serve(args: ServeArgs) -> Result<()> {
     }
 
     let cancel = CancellationToken::new();
-
-    // Register signal flags before spawning the worker so a SIGTERM/SIGINT
-    // delivered while the queue is busy is still observed and can trigger a
-    // graceful drain.
-    let term_flag = Arc::new(AtomicBool::new(false));
-    let int_flag = Arc::new(AtomicBool::new(false));
-    #[cfg(unix)]
-    {
-        use signal_hook::consts::{SIGINT, SIGTERM};
-        signal_hook::flag::register(SIGTERM, Arc::clone(&term_flag))
-            .expect("register SIGTERM handler");
-        signal_hook::flag::register(SIGINT, Arc::clone(&int_flag))
-            .expect("register SIGINT handler");
-    }
-    #[cfg(not(unix))]
-    {
-        // On non-Unix platforms there is no SIGTERM; rely on Ctrl-C only.
-        int_flag.store(true, Ordering::Relaxed);
-    }
-
     let mut join_set = tokio::task::JoinSet::new();
 
+    // stdio MCP server task. It is intentionally spawned outside the join set:
+    // MCP clients keep the stdio transport open, and on SIGTERM we want to drain
+    // the queue and exit without waiting for the transport to close gracefully.
+    let server = server::KartaMcpServer::new(karta.clone(), queue.clone(), &config);
+    let server_cancel = cancel.clone();
+    tokio::spawn(async move {
+        if let Err(e) = server::run_stdio_server(server, server_cancel).await {
+            tracing::error!(error = %e, "MCP server exited early");
+        }
+    });
+
     // Queue worker task.
-    join_set.spawn(queue::run_worker(
-        queue.clone(),
-        karta.clone(),
-        cancel.clone(),
-    ));
+    let worker_queue = queue.clone();
+    let worker_karta = karta.clone();
+    let worker_cancel = cancel.clone();
+    join_set.spawn(async move {
+        queue::run_worker(worker_queue, worker_karta, worker_cancel).await;
+        Ok::<(), anyhow::Error>(())
+    });
 
     // Shutdown signal handler.
-    join_set.spawn(wait_for_shutdown(cancel, term_flag, int_flag));
+    join_set.spawn(async move {
+        wait_for_shutdown(cancel).await;
+        Ok::<(), anyhow::Error>(())
+    });
 
     // Wait for all tasks to finish. The worker exits only after it has drained
     // any remaining queue rows, so a SIGTERM/SIGINT first cancels the token and
     // then waits for the graceful drain to complete.
     while let Some(res) = join_set.join_next().await {
-        res?;
+        res??;
     }
 
     tracing::info!("karta-mcp serve exiting");
     Ok(())
 }
 
-/// Poll the SIGTERM/SIGINT flags and cancel the token when either fires.
-async fn wait_for_shutdown(
-    cancel: CancellationToken,
-    term_flag: Arc<AtomicBool>,
-    int_flag: Arc<AtomicBool>,
-) {
-    loop {
-        if term_flag.load(Ordering::Relaxed) {
-            tracing::info!("received SIGTERM");
-            cancel.cancel();
-            return;
+/// Wait for SIGTERM or SIGINT and cancel the token when either fires.
+///
+/// Uses `signal-hook` instead of `tokio::signal` because the MCP server task
+/// holds a background stdin reader; on some platforms (macOS) `tokio::signal`
+/// leaves the default signal action enabled while async handlers are pending,
+/// which causes the process to be killed with the signal code before it can
+/// exit cleanly. `signal-hook` registers a real signal handler that prevents
+/// the default action.
+async fn wait_for_shutdown(cancel: CancellationToken) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<i32>();
+    std::thread::spawn(move || {
+        let mut signals = match signal_hook::iterator::Signals::new([
+            signal_hook::consts::SIGTERM,
+            signal_hook::consts::SIGINT,
+        ]) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to register signal handlers");
+                return;
+            }
+        };
+        if let Some(sig) = signals.wait().next() {
+            let _ = tx.send(sig);
         }
-        if int_flag.load(Ordering::Relaxed) {
-            tracing::info!("received SIGINT");
-            cancel.cancel();
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    match rx.await {
+        Ok(sig) => tracing::info!(signal = sig, "received shutdown signal"),
+        Err(_) => tracing::warn!("signal handler thread dropped without sending signal"),
     }
+    cancel.cancel();
 }
 
 async fn status() -> Result<()> {
