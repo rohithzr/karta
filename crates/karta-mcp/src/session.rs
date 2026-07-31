@@ -6,10 +6,13 @@
 //! directly through the vector store so that it stays deterministic and never
 //! calls an LLM or the dream engine.
 
+use std::path::Path;
+
 use anyhow::Result;
 use chrono::Utc;
 
 use crate::karta_handle::KartaHandle;
+use crate::transcript;
 
 pub const SESSION_END_TAG: &str = "karta:session_end";
 pub const PRECOMPACT_TAG: &str = "karta:pre_compact";
@@ -57,9 +60,26 @@ pub async fn session_end_with_transcript(
 ) -> Result<String> {
     let summary_text = summary.unwrap_or("no summary provided");
     let mut content = format!("[{SESSION_END_TAG}] session: {session_id} summary: {summary_text}");
+
     if let Some(path) = transcript_path {
-        content.push_str(&format!(" transcript_path: {path}"));
+        if Path::new(path).exists() {
+            match transcript::sweep_transcript(path, session_id, handle).await {
+                Ok(count) => {
+                    content.push_str(&format!(
+                        " transcript_sweep: recovered {count} events from {path}"
+                    ));
+                }
+                Err(e) => {
+                    content.push_str(&format!(
+                        " transcript_path: {path} transcript_sweep_error: {e}"
+                    ));
+                }
+            }
+        } else {
+            content.push_str(&format!(" transcript_path: {path}"));
+        }
     }
+
     let note = handle
         .karta
         .add_note_with_clock(

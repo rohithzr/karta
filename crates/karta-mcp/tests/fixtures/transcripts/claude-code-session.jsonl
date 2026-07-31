@@ -1,0 +1,6 @@
+{"hook_event_name":"SessionStart","session_id":"claude-session-001","transcript_path":"/tmp/claude-session-001.jsonl","cwd":"/Users/aj/workspace/karta","timestamp":"2026-07-31T07:20:00.000Z"}
+{"hook_event_name":"UserPromptSubmit","session_id":"claude-session-001","prompt":"Add a transcript parser to karta-mcp.","timestamp":"2026-07-31T07:21:00.000Z"}
+{"hook_event_name":"PostToolUse","session_id":"claude-session-001","tool_name":"Execute","tool_input":{"summary":"Create fixture directory","command":"mkdir -p /Users/aj/workspace/karta/crates/karta-mcp/tests/fixtures/transcripts","risk_level":"low"},"tool_response":"{\"success\":true}","timestamp":"2026-07-31T07:21:06.000Z"}
+{"hook_event_name":"Stop","session_id":"claude-session-001","last_assistant_message":"Directory created. Next I will write the golden fixtures.","elapsed_time_ms":120000,"timestamp":"2026-07-31T07:21:10.000Z"}
+{"hook_event_name":"SubagentStop","session_id":"claude-session-001","task_name":"transcript-design-review","task_result":"parser design approved","task_error":null,"timestamp":"2026-07-31T07:22:00.000Z"}
+{"hook_event_name":"SessionEnd","session_id":"claude-session-001","reason":"completed","session_duration_ms":240000,"message_count":6,"timestamp":"2026-07-31T07:24:00.000Z"}
