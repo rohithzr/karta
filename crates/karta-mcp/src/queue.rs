@@ -777,6 +777,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), worker).await;
     }
 
+    // VAL-SES-013, VAL-SES-030
     #[tokio::test]
     async fn queue_session_end_writes_marker_and_consolidates() {
         let (dir, queue) = setup_queue().await;
@@ -813,6 +814,7 @@ mod tests {
         assert_eq!(handle.karta.note_count().await.unwrap(), 4);
     }
 
+    // VAL-SES-014, VAL-SES-016
     #[tokio::test]
     async fn queue_pre_compact_enabled_writes_marker_and_consolidates() {
         let (dir, queue) = setup_queue().await;
@@ -846,6 +848,7 @@ mod tests {
         assert_eq!(handle.karta.note_count().await.unwrap(), 3);
     }
 
+    // VAL-SES-015
     #[tokio::test]
     async fn queue_pre_compact_disabled_does_nothing() {
         let (dir, queue) = setup_queue().await;
@@ -875,6 +878,7 @@ mod tests {
         assert_eq!(handle.karta.note_count().await.unwrap(), 1);
     }
 
+    // VAL-SES-017
     #[tokio::test]
     async fn queue_pre_compact_and_session_end_no_double_consolidate() {
         let (dir, queue) = setup_queue().await;
