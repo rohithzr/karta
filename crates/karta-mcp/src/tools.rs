@@ -6,6 +6,7 @@ use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::karta_handle::KartaHandle;
 use crate::queue::CaptureQueue;
 use crate::session;
 
@@ -124,7 +125,7 @@ pub async fn handle_run_dreaming(
 }
 
 pub async fn handle_session_start(
-    karta: &karta_core::Karta,
+    handle: &KartaHandle,
     params: SessionStartParams,
 ) -> Result<String, rmcp::ErrorData> {
     if params.agent.trim().is_empty() {
@@ -134,7 +135,7 @@ pub async fn handle_session_start(
         ));
     }
     let (session_id, orientation_context) =
-        session::session_start(&params.agent, params.project.as_deref(), karta)
+        session::session_start(&params.agent, params.project.as_deref(), handle)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
     let response = json!({
@@ -146,7 +147,7 @@ pub async fn handle_session_start(
 }
 
 pub async fn handle_session_end(
-    karta: &karta_core::Karta,
+    handle: &KartaHandle,
     params: SessionEndParams,
 ) -> Result<String, rmcp::ErrorData> {
     if params.session_id.trim().is_empty() {
@@ -156,7 +157,7 @@ pub async fn handle_session_end(
         ));
     }
     let written_note_id =
-        session::session_end(&params.session_id, params.summary.as_deref(), karta)
+        session::session_end(&params.session_id, params.summary.as_deref(), handle)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
     let response = json!({"written_note_id": written_note_id});
@@ -165,10 +166,10 @@ pub async fn handle_session_end(
 }
 
 pub async fn handle_consolidate(
-    karta: &karta_core::Karta,
+    handle: &KartaHandle,
     params: ConsolidateParams,
 ) -> Result<String, rmcp::ErrorData> {
-    let promoted_count = session::consolidate(params.session_id.as_deref(), karta)
+    let promoted_count = session::consolidate(params.session_id.as_deref(), handle)
         .await
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
     let response = json!({"promoted_count": promoted_count});
@@ -206,12 +207,6 @@ pub async fn handle_status(
 mod tests {
     use std::sync::Arc;
 
-    use karta_core::Karta;
-    use karta_core::llm::LlmProvider;
-    use karta_core::llm::MockLlmProvider;
-    use karta_core::store::sqlite::SqliteGraphStore;
-    use karta_core::store::sqlite_vec::SqliteVectorStore;
-    use karta_core::store::{GraphStore, VectorStore};
     use serde_json::Value;
     use tempfile::TempDir;
 
@@ -219,22 +214,11 @@ mod tests {
 
     const EMBEDDING_DIM: usize = 1536;
 
-    async fn setup_karta() -> (TempDir, Karta) {
+    async fn setup_karta() -> (TempDir, KartaHandle) {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().to_str().unwrap();
-        let vector_store = SqliteVectorStore::new(data_dir, EMBEDDING_DIM)
-            .await
-            .unwrap();
-        let shared_conn = vector_store.connection();
-        let vector_store: Arc<dyn VectorStore> = Arc::new(vector_store);
-        let graph_store: Arc<dyn GraphStore> =
-            Arc::new(SqliteGraphStore::with_connection(shared_conn));
-        let llm: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::new());
-        let config = karta_core::config::KartaConfig::default();
-        let karta = Karta::new(vector_store, graph_store, llm, config)
-            .await
-            .unwrap();
-        (dir, karta)
+        let handle = KartaHandle::open_mock(data_dir).await.unwrap();
+        (dir, handle)
     }
 
     async fn setup_queue(data_dir: &str) -> Arc<CaptureQueue> {
@@ -247,42 +231,42 @@ mod tests {
 
     #[tokio::test]
     async fn add_note_creates_note_and_returns_id() {
-        let (_dir, karta) = setup_karta().await;
+        let (_dir, handle) = setup_karta().await;
         let params = AddNoteParams {
             content: "hello world".to_string(),
             session_id: Some("s1".to_string()),
             turn_index: Some(3),
         };
-        let response = handle_add_note(&karta, params).await.unwrap();
+        let response = handle_add_note(&handle.karta, params).await.unwrap();
         let value = parse_json(&response);
         assert_eq!(value["status"], "ok");
         assert!(
             value["note_id"].as_str().unwrap().len() > 0,
             "note_id should be non-empty"
         );
-        assert_eq!(karta.note_count().await.unwrap(), 1);
+        assert_eq!(handle.karta.note_count().await.unwrap(), 1);
     }
 
     #[tokio::test]
     async fn add_note_rejects_empty_content() {
-        let (_dir, karta) = setup_karta().await;
+        let (_dir, handle) = setup_karta().await;
         let params = AddNoteParams {
             content: "   ".to_string(),
             session_id: None,
             turn_index: None,
         };
-        let err = handle_add_note(&karta, params).await.unwrap_err();
+        let err = handle_add_note(&handle.karta, params).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
 
     #[tokio::test]
     async fn fetch_memories_returns_empty_shape() {
-        let (_dir, karta) = setup_karta().await;
+        let (_dir, handle) = setup_karta().await;
         let params = FetchMemoriesParams {
             query: "karta".to_string(),
             top_k: None,
         };
-        let response = handle_fetch_memories(&karta, params).await.unwrap();
+        let response = handle_fetch_memories(&handle.karta, params).await.unwrap();
         let value = parse_json(&response);
         assert!(value["context"].is_string());
         assert!(value["note_ids"].is_array());
@@ -292,13 +276,13 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_memories_returns_just_added_note() {
-        let (_dir, karta) = setup_karta().await;
+        let (_dir, handle) = setup_karta().await;
         let add_params = AddNoteParams {
             content: "the quick brown fox jumps over the lazy dog".to_string(),
             session_id: None,
             turn_index: None,
         };
-        let response = handle_add_note(&karta, add_params).await.unwrap();
+        let response = handle_add_note(&handle.karta, add_params).await.unwrap();
         let note_id = parse_json(&response)["note_id"]
             .as_str()
             .unwrap()
@@ -308,7 +292,7 @@ mod tests {
             query: "fox".to_string(),
             top_k: Some(5),
         };
-        let response = handle_fetch_memories(&karta, params).await.unwrap();
+        let response = handle_fetch_memories(&handle.karta, params).await.unwrap();
         let value = parse_json(&response);
         let note_ids: Vec<String> = value["note_ids"]
             .as_array()
@@ -324,12 +308,12 @@ mod tests {
 
     #[tokio::test]
     async fn run_dreaming_returns_documented_shape() {
-        let (_dir, karta) = setup_karta().await;
+        let (_dir, handle) = setup_karta().await;
         let params = RunDreamingParams {
             scope_type: None,
             scope_id: None,
         };
-        let response = handle_run_dreaming(&karta, params).await.unwrap();
+        let response = handle_run_dreaming(&handle.karta, params).await.unwrap();
         let value = parse_json(&response);
         assert!(value["dreams_attempted"].is_number());
         assert!(value["dreams_written"].is_number());
@@ -339,12 +323,12 @@ mod tests {
 
     #[tokio::test]
     async fn session_start_returns_session_and_orientation() {
-        let (_dir, karta) = setup_karta().await;
+        let (_dir, handle) = setup_karta().await;
         let params = SessionStartParams {
             agent: "droid".to_string(),
             project: Some("karta-mcp".to_string()),
         };
-        let response = handle_session_start(&karta, params).await.unwrap();
+        let response = handle_session_start(&handle, params).await.unwrap();
         let value = parse_json(&response);
         assert!(
             value["session_id"].as_str().unwrap().len() > 0,
@@ -355,23 +339,23 @@ mod tests {
 
     #[tokio::test]
     async fn session_start_rejects_empty_agent() {
-        let (_dir, karta) = setup_karta().await;
+        let (_dir, handle) = setup_karta().await;
         let params = SessionStartParams {
             agent: "   ".to_string(),
             project: None,
         };
-        let err = handle_session_start(&karta, params).await.unwrap_err();
+        let err = handle_session_start(&handle, params).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
 
     #[tokio::test]
     async fn session_end_writes_marker_and_returns_id() {
-        let (_dir, karta) = setup_karta().await;
+        let (_dir, handle) = setup_karta().await;
         let start_params = SessionStartParams {
             agent: "droid".to_string(),
             project: None,
         };
-        let start_response = handle_session_start(&karta, start_params).await.unwrap();
+        let start_response = handle_session_start(&handle, start_params).await.unwrap();
         let session_id = parse_json(&start_response)["session_id"]
             .as_str()
             .unwrap()
@@ -381,41 +365,52 @@ mod tests {
             session_id: session_id.clone(),
             summary: Some("wrapped up".to_string()),
         };
-        let response = handle_session_end(&karta, end_params).await.unwrap();
+        let response = handle_session_end(&handle, end_params).await.unwrap();
         let value = parse_json(&response);
         let written_note_id = value["written_note_id"].as_str().unwrap().to_string();
         assert!(!written_note_id.is_empty());
 
-        let note = karta.get_note(&written_note_id).await.unwrap().unwrap();
+        let note = handle
+            .karta
+            .get_note(&written_note_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(note.content.contains("wrapped up"));
         assert_eq!(note.session_id, Some(session_id));
     }
 
     #[tokio::test]
     async fn consolidate_counts_high_confidence_notes() {
-        let (_dir, karta) = setup_karta().await;
+        let (_dir, handle) = setup_karta().await;
         let add_params = AddNoteParams {
             content: "a very confident observation".to_string(),
             session_id: Some("session-a".to_string()),
             turn_index: None,
         };
-        handle_add_note(&karta, add_params).await.unwrap();
+        handle_add_note(&handle.karta, add_params).await.unwrap();
 
         let params = ConsolidateParams {
             session_id: Some("session-a".to_string()),
         };
-        let response = handle_consolidate(&karta, params).await.unwrap();
+        let response = handle_consolidate(&handle, params).await.unwrap();
         let value = parse_json(&response);
         assert!(value["promoted_count"].as_u64().unwrap() >= 1);
     }
 
     #[tokio::test]
     async fn status_returns_all_fields() {
-        let (dir, karta) = setup_karta().await;
+        let (dir, handle) = setup_karta().await;
         let queue = setup_queue(dir.path().to_str().unwrap()).await;
-        let response = handle_status(&karta, queue, dir.path().to_str().unwrap(), "mock", 3137)
-            .await
-            .unwrap();
+        let response = handle_status(
+            &handle.karta,
+            queue,
+            dir.path().to_str().unwrap(),
+            "mock",
+            3137,
+        )
+        .await
+        .unwrap();
         let value = parse_json(&response);
         assert!(value["note_count"].is_number());
         assert!(value["store_dir"].is_string());

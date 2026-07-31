@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-use karta_mcp::{capture, config, queue, server};
+use karta_mcp::{capture, config, karta_handle::KartaHandle, queue, server};
 
 use config::Config;
 
@@ -106,13 +106,14 @@ async fn serve(args: ServeArgs) -> Result<()> {
         "starting karta-mcp serve"
     );
 
-    let karta = if args.mock {
+    let handle = if args.mock {
         tracing::info!("using mock LLM provider");
-        open_mock_karta(&config).await?
+        KartaHandle::open_mock(&data_dir).await?
     } else {
-        karta_core::Karta::with_defaults(config.core.clone()).await?
+        let karta = Arc::new(karta_core::Karta::with_defaults(config.core.clone()).await?);
+        let (vector_store, graph_store) = KartaHandle::open_stores_for_data_dir(&data_dir).await?;
+        KartaHandle::new(karta, vector_store, graph_store)
     };
-    let karta = Arc::new(karta);
 
     let queue = Arc::new(queue::CaptureQueue::new(&data_dir).await?);
     let replayed = queue.replay_incomplete().await?;
@@ -126,7 +127,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // stdio MCP server task. It is intentionally spawned outside the join set:
     // MCP clients keep the stdio transport open, and on SIGTERM we want to drain
     // the queue and exit without waiting for the transport to close gracefully.
-    let server = server::KartaMcpServer::new(karta.clone(), queue.clone(), &config);
+    let server = server::KartaMcpServer::new(handle.clone(), queue.clone(), &config);
     let server_cancel = cancel.clone();
     tokio::spawn(async move {
         if let Err(e) = server::run_stdio_server(server, server_cancel).await {
@@ -136,15 +137,21 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     // Queue worker task.
     let worker_queue = queue.clone();
-    let worker_karta = karta.clone();
+    let worker_handle = handle.clone();
     let worker_cancel = cancel.clone();
     join_set.spawn(async move {
-        queue::run_worker(worker_queue, worker_karta, worker_cancel).await;
+        queue::run_worker(
+            worker_queue,
+            worker_handle,
+            worker_cancel,
+            config.precompact,
+        )
+        .await;
         Ok::<(), anyhow::Error>(())
     });
 
     // HTTP capture endpoint task.
-    let capture_router = capture::router(karta.clone(), queue.clone());
+    let capture_router = capture::router(handle.karta.clone(), queue.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", config.capture_port))
         .await
         .with_context(|| {

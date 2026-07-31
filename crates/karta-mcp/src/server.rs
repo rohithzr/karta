@@ -6,12 +6,13 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 
 use crate::config::Config;
+use crate::karta_handle::KartaHandle;
 use crate::queue::CaptureQueue;
 use crate::tools;
 
 /// The Karta MCP server state.
 pub struct KartaMcpServer {
-    karta: Arc<karta_core::Karta>,
+    handle: KartaHandle,
     queue: Arc<CaptureQueue>,
     store_dir: String,
     embedding_model: String,
@@ -20,12 +21,12 @@ pub struct KartaMcpServer {
 }
 
 impl KartaMcpServer {
-    /// Build a new MCP server around a shared `Karta` and queue.
-    pub fn new(karta: Arc<karta_core::Karta>, queue: Arc<CaptureQueue>, config: &Config) -> Self {
+    /// Build a new MCP server around a shared `KartaHandle` and queue.
+    pub fn new(handle: KartaHandle, queue: Arc<CaptureQueue>, config: &Config) -> Self {
         let embedding_model = std::env::var("KARTA_EMBEDDING_MODEL")
             .unwrap_or_else(|_| config.core.llm.default.model.clone());
         Self {
-            karta,
+            handle,
             queue,
             store_dir: config.store_dir().to_string(),
             embedding_model,
@@ -42,7 +43,7 @@ impl KartaMcpServer {
         &self,
         params: rmcp::handler::server::wrapper::Parameters<tools::AddNoteParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        tools::handle_add_note(&self.karta, params.0).await
+        tools::handle_add_note(&self.handle.karta, params.0).await
     }
 
     #[tool(description = "Retrieve relevant memories for a query")]
@@ -50,7 +51,7 @@ impl KartaMcpServer {
         &self,
         params: rmcp::handler::server::wrapper::Parameters<tools::FetchMemoriesParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        tools::handle_fetch_memories(&self.karta, params.0).await
+        tools::handle_fetch_memories(&self.handle.karta, params.0).await
     }
 
     #[tool(description = "Run the Karta dream engine over a scope")]
@@ -58,7 +59,7 @@ impl KartaMcpServer {
         &self,
         params: rmcp::handler::server::wrapper::Parameters<tools::RunDreamingParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        tools::handle_run_dreaming(&self.karta, params.0).await
+        tools::handle_run_dreaming(&self.handle.karta, params.0).await
     }
 
     #[tool(description = "Start a new session and return orientation context")]
@@ -66,7 +67,7 @@ impl KartaMcpServer {
         &self,
         params: rmcp::handler::server::wrapper::Parameters<tools::SessionStartParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        tools::handle_session_start(&self.karta, params.0).await
+        tools::handle_session_start(&self.handle, params.0).await
     }
 
     #[tool(description = "End a session with an optional summary")]
@@ -74,7 +75,7 @@ impl KartaMcpServer {
         &self,
         params: rmcp::handler::server::wrapper::Parameters<tools::SessionEndParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        tools::handle_session_end(&self.karta, params.0).await
+        tools::handle_session_end(&self.handle, params.0).await
     }
 
     #[tool(description = "Run rule-based consolidation (no LLM)")]
@@ -82,13 +83,13 @@ impl KartaMcpServer {
         &self,
         params: rmcp::handler::server::wrapper::Parameters<tools::ConsolidateParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        tools::handle_consolidate(&self.karta, params.0).await
+        tools::handle_consolidate(&self.handle, params.0).await
     }
 
     #[tool(description = "Return current store and queue status")]
     async fn karta_status(&self) -> Result<String, rmcp::ErrorData> {
         tools::handle_status(
-            &self.karta,
+            &self.handle.karta,
             self.queue.clone(),
             &self.store_dir,
             &self.embedding_model,

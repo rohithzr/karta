@@ -20,6 +20,9 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::karta_handle::KartaHandle;
+use crate::session;
+
 const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 
 /// One row from the `capture_queue` table.
@@ -268,8 +271,9 @@ impl CaptureQueue {
 /// This function is meant to be spawned as a `tokio::task`.
 pub async fn run_worker(
     queue: Arc<CaptureQueue>,
-    karta: Arc<karta_core::Karta>,
+    handle: KartaHandle,
     cancel: CancellationToken,
+    precompact_enabled: bool,
 ) {
     loop {
         match queue.claim_next().await {
@@ -280,7 +284,7 @@ pub async fn run_worker(
                     session_id = ?row.session_id,
                     "processing queue row"
                 );
-                match process_row(&karta, &row).await {
+                match process_row(&handle, &row, precompact_enabled).await {
                     Ok(_) => {
                         if let Err(e) = queue.mark_done(row.id).await {
                             tracing::error!(
@@ -327,13 +331,40 @@ pub async fn run_worker(
 }
 
 /// Process a single queue row by writing it into `karta_core`.
-async fn process_row(karta: &karta_core::Karta, row: &QueueRow) -> Result<()> {
-    let content = extract_content(&row.event_type, &row.payload);
-    let session_id = row.session_id.as_deref();
-    let ctx = karta_core::ClockContext::now();
-    karta
-        .add_note_with_clock(&content, session_id, None, ctx)
-        .await?;
+async fn process_row(handle: &KartaHandle, row: &QueueRow, precompact_enabled: bool) -> Result<()> {
+    match row.event_type.as_str() {
+        "session_end" => {
+            let summary = row.payload.get("summary").and_then(|v| v.as_str());
+            let transcript_path = row.payload.get("transcript_path").and_then(|v| v.as_str());
+            if let Some(session_id) = row.session_id.as_deref() {
+                session::session_end_with_transcript(session_id, summary, transcript_path, handle)
+                    .await?;
+            } else {
+                // No session id: store a generic marker note so the row is not lost.
+                let content = extract_content("session_end", &row.payload);
+                handle
+                    .karta
+                    .add_note_with_clock(&content, None, None, karta_core::ClockContext::now())
+                    .await?;
+            }
+        }
+        "pre_compact" => {
+            if let Some(session_id) = row.session_id.as_deref() {
+                session::pre_compact(session_id, handle, precompact_enabled).await?;
+            }
+            // Without a session id there is nothing meaningful to compact;
+            // the row is still considered processed.
+        }
+        _ => {
+            let content = extract_content(&row.event_type, &row.payload);
+            let session_id = row.session_id.as_deref();
+            let ctx = karta_core::ClockContext::now();
+            handle
+                .karta
+                .add_note_with_clock(&content, session_id, None, ctx)
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -363,16 +394,11 @@ fn extract_content(event_type: &str, payload: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use karta_core::Karta;
-    use karta_core::llm::LlmProvider;
-    use karta_core::llm::MockLlmProvider;
-    use karta_core::store::sqlite::SqliteGraphStore;
-    use karta_core::store::sqlite_vec::SqliteVectorStore;
-    use karta_core::store::{GraphStore, VectorStore};
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    const EMBEDDING_DIM: usize = 1536;
+    use crate::session::{PRECOMPACT_TAG, SESSION_END_TAG};
+    use karta_core::note::{MemoryNote, Provenance};
 
     async fn setup_queue() -> (TempDir, Arc<CaptureQueue>) {
         let dir = TempDir::new().unwrap();
@@ -381,21 +407,8 @@ mod tests {
         (dir, queue)
     }
 
-    async fn setup_karta(data_dir: &str) -> Arc<karta_core::Karta> {
-        let vector_store = SqliteVectorStore::new(data_dir, EMBEDDING_DIM)
-            .await
-            .unwrap();
-        let shared_conn = vector_store.connection();
-        let vector_store: Arc<dyn VectorStore> = Arc::new(vector_store);
-        let graph_store: Arc<dyn GraphStore> =
-            Arc::new(SqliteGraphStore::with_connection(shared_conn));
-        let llm: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::new());
-        let config = karta_core::config::KartaConfig::default();
-        Arc::new(
-            Karta::new(vector_store, graph_store, llm, config)
-                .await
-                .unwrap(),
-        )
+    async fn setup_karta(data_dir: &str) -> KartaHandle {
+        KartaHandle::open_mock(data_dir).await.unwrap()
     }
 
     #[tokio::test]
@@ -544,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn worker_drains_row_to_done() {
         let (dir, queue) = setup_queue().await;
-        let karta = setup_karta(dir.path().to_str().unwrap()).await;
+        let handle = setup_karta(dir.path().to_str().unwrap()).await;
 
         let payload = serde_json::json!({"content": "worker note"});
         let id = queue
@@ -555,9 +568,9 @@ mod tests {
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let worker_queue = queue.clone();
-        let worker_karta = karta.clone();
-        let handle = tokio::spawn(async move {
-            run_worker(worker_queue, worker_karta, worker_cancel).await;
+        let worker_handle = handle.clone();
+        let worker = tokio::spawn(async move {
+            run_worker(worker_queue, worker_handle, worker_cancel, false).await;
         });
 
         // Wait for the worker to drain the row.
@@ -569,18 +582,18 @@ mod tests {
         }
 
         cancel.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), worker).await;
 
         let row = queue.get_row(id).await.unwrap().unwrap();
         assert_eq!(row.status, "done");
         assert!(row.error.is_none());
-        assert_eq!(karta.note_count().await.unwrap(), 1);
+        assert_eq!(handle.karta.note_count().await.unwrap(), 1);
     }
 
     #[tokio::test]
     async fn failed_rows_do_not_block_worker() {
         let (dir, queue) = setup_queue().await;
-        let karta = setup_karta(dir.path().to_str().unwrap()).await;
+        let handle = setup_karta(dir.path().to_str().unwrap()).await;
 
         let failed_payload = serde_json::json!({"content": "stuck"});
         let failed_id = queue
@@ -601,11 +614,11 @@ mod tests {
             .unwrap();
 
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn({
+        let worker = tokio::spawn({
             let queue = queue.clone();
-            let karta = karta.clone();
+            let handle = handle.clone();
             let cancel = cancel.clone();
-            async move { run_worker(queue, karta, cancel).await }
+            async move { run_worker(queue, handle, cancel, false).await }
         });
 
         for _ in 0..100 {
@@ -616,7 +629,7 @@ mod tests {
         }
 
         cancel.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), worker).await;
 
         let failed_row = queue.get_row(failed_id).await.unwrap().unwrap();
         assert_eq!(failed_row.status, "failed");
@@ -626,13 +639,13 @@ mod tests {
         assert_eq!(ok_row.status, "done");
         assert!(ok_row.error.is_none());
 
-        assert_eq!(karta.note_count().await.unwrap(), 1);
+        assert_eq!(handle.karta.note_count().await.unwrap(), 1);
     }
 
     #[tokio::test]
     async fn worker_processes_rows_in_fifo_order() {
         let (dir, queue) = setup_queue().await;
-        let karta = setup_karta(dir.path().to_str().unwrap()).await;
+        let handle = setup_karta(dir.path().to_str().unwrap()).await;
 
         for i in 0..5 {
             queue
@@ -646,11 +659,11 @@ mod tests {
         }
 
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn({
+        let worker = tokio::spawn({
             let queue = queue.clone();
-            let karta = karta.clone();
+            let handle = handle.clone();
             let cancel = cancel.clone();
-            async move { run_worker(queue, karta, cancel).await }
+            async move { run_worker(queue, handle, cancel, false).await }
         });
 
         for _ in 0..200 {
@@ -661,7 +674,7 @@ mod tests {
         }
 
         cancel.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), worker).await;
 
         let rows = queue.all_rows().await.unwrap();
         assert_eq!(rows.len(), 5);
@@ -669,20 +682,20 @@ mod tests {
             assert_eq!(row.status, "done");
             assert_eq!(row.payload["content"], format!("note-{i}"));
         }
-        assert_eq!(karta.note_count().await.unwrap(), 5);
+        assert_eq!(handle.karta.note_count().await.unwrap(), 5);
     }
 
     #[tokio::test]
     async fn graceful_drain_processes_remaining_rows() {
         let (dir, queue) = setup_queue().await;
-        let karta = setup_karta(dir.path().to_str().unwrap()).await;
+        let handle = setup_karta(dir.path().to_str().unwrap()).await;
 
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn({
+        let worker = tokio::spawn({
             let queue = queue.clone();
-            let karta = karta.clone();
+            let handle = handle.clone();
             let cancel = cancel.clone();
-            async move { run_worker(queue, karta, cancel).await }
+            async move { run_worker(queue, handle, cancel, false).await }
         });
 
         // Let the worker start and wait on the poll interval.
@@ -705,13 +718,13 @@ mod tests {
 
         // Signal shutdown immediately; the worker must still drain the rows.
         cancel.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
 
         for id in ids {
             let row = queue.get_row(id).await.unwrap().unwrap();
             assert_eq!(row.status, "done");
         }
-        assert_eq!(karta.note_count().await.unwrap(), 5);
+        assert_eq!(handle.karta.note_count().await.unwrap(), 5);
     }
 
     #[tokio::test]
@@ -722,5 +735,184 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(timeout, 5000);
+    }
+
+    async fn insert_observation(
+        handle: &KartaHandle,
+        content: &str,
+        session_id: &str,
+        confidence: f32,
+    ) {
+        let mut note = MemoryNote::new(content.to_string());
+        note.provenance = Provenance::Observed;
+        note.confidence = confidence;
+        note.session_id = Some(session_id.to_string());
+        const DIM: usize = 1536;
+        let value = 1.0 / (DIM as f32).sqrt();
+        note.embedding = vec![value; DIM];
+        handle.vector_store.upsert(&note).await.unwrap();
+    }
+
+    async fn run_worker_until_queue_empty(
+        queue: &Arc<CaptureQueue>,
+        handle: &KartaHandle,
+        precompact: bool,
+    ) {
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn({
+            let queue = queue.clone();
+            let handle = handle.clone();
+            let cancel = cancel.clone();
+            async move { run_worker(queue, handle, cancel, precompact).await }
+        });
+
+        for _ in 0..200 {
+            if queue.depth().await.unwrap() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), worker).await;
+    }
+
+    #[tokio::test]
+    async fn queue_session_end_writes_marker_and_consolidates() {
+        let (dir, queue) = setup_queue().await;
+        let handle = setup_karta(dir.path().to_str().unwrap()).await;
+        let session_id = "queue-end-1";
+
+        insert_observation(&handle, "q high confidence fact", session_id, 0.9).await;
+        insert_observation(&handle, "q low confidence noise", session_id, 0.2).await;
+
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "summary": "queue session end",
+        });
+        let id = queue
+            .enqueue("session_end", &payload, Some(session_id))
+            .await
+            .unwrap();
+
+        run_worker_until_queue_empty(&queue, &handle, false).await;
+
+        let row = queue.get_row(id).await.unwrap().unwrap();
+        assert_eq!(row.status, "done");
+        assert!(row.error.is_none());
+
+        let all = handle.karta.get_all_notes().await.unwrap();
+        let markers: Vec<_> = all
+            .into_iter()
+            .filter(|n| n.content.contains(SESSION_END_TAG) || n.content.contains(PRECOMPACT_TAG))
+            .collect();
+        assert_eq!(markers.len(), 1);
+        assert!(markers[0].content.contains("queue session end"));
+        assert!(markers[0].content.contains(session_id));
+
+        assert_eq!(handle.karta.note_count().await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn queue_pre_compact_enabled_writes_marker_and_consolidates() {
+        let (dir, queue) = setup_queue().await;
+        let handle = setup_karta(dir.path().to_str().unwrap()).await;
+        let session_id = "queue-precompact-1";
+
+        insert_observation(&handle, "pre high confidence fact", session_id, 0.85).await;
+        insert_observation(&handle, "pre low confidence noise", session_id, 0.15).await;
+
+        let payload = serde_json::json!({ "session_id": session_id });
+        let id = queue
+            .enqueue("pre_compact", &payload, Some(session_id))
+            .await
+            .unwrap();
+
+        run_worker_until_queue_empty(&queue, &handle, true).await;
+
+        let row = queue.get_row(id).await.unwrap().unwrap();
+        assert_eq!(row.status, "done");
+        assert!(row.error.is_none());
+
+        let all = handle.karta.get_all_notes().await.unwrap();
+        let markers: Vec<_> = all
+            .into_iter()
+            .filter(|n| n.content.contains(SESSION_END_TAG) || n.content.contains(PRECOMPACT_TAG))
+            .collect();
+        assert_eq!(markers.len(), 1);
+        assert!(markers[0].content.contains("pre_compact"));
+        assert!(markers[0].content.contains(session_id));
+
+        assert_eq!(handle.karta.note_count().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn queue_pre_compact_disabled_does_nothing() {
+        let (dir, queue) = setup_queue().await;
+        let handle = setup_karta(dir.path().to_str().unwrap()).await;
+        let session_id = "queue-precompact-off";
+
+        insert_observation(&handle, "pre disabled fact", session_id, 0.85).await;
+
+        let payload = serde_json::json!({ "session_id": session_id });
+        let id = queue
+            .enqueue("pre_compact", &payload, Some(session_id))
+            .await
+            .unwrap();
+
+        run_worker_until_queue_empty(&queue, &handle, false).await;
+
+        let row = queue.get_row(id).await.unwrap().unwrap();
+        assert_eq!(row.status, "done");
+        assert!(row.error.is_none());
+
+        let all = handle.karta.get_all_notes().await.unwrap();
+        let markers: Vec<_> = all
+            .into_iter()
+            .filter(|n| n.content.contains(SESSION_END_TAG) || n.content.contains(PRECOMPACT_TAG))
+            .collect();
+        assert!(markers.is_empty());
+        assert_eq!(handle.karta.note_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn queue_pre_compact_and_session_end_no_double_consolidate() {
+        let (dir, queue) = setup_queue().await;
+        let handle = setup_karta(dir.path().to_str().unwrap()).await;
+        let session_id = "queue-double-1";
+
+        insert_observation(&handle, "double fact", session_id, 0.9).await;
+
+        let pre_payload = serde_json::json!({ "session_id": session_id });
+        let pre_id = queue
+            .enqueue("pre_compact", &pre_payload, Some(session_id))
+            .await
+            .unwrap();
+        let end_payload = serde_json::json!({
+            "session_id": session_id,
+            "summary": "queue double session end",
+        });
+        let end_id = queue
+            .enqueue("session_end", &end_payload, Some(session_id))
+            .await
+            .unwrap();
+
+        run_worker_until_queue_empty(&queue, &handle, true).await;
+
+        for id in [pre_id, end_id] {
+            let row = queue.get_row(id).await.unwrap().unwrap();
+            assert_eq!(row.status, "done");
+            assert!(row.error.is_none());
+        }
+
+        let all = handle.karta.get_all_notes().await.unwrap();
+        let markers: Vec<_> = all
+            .into_iter()
+            .filter(|n| n.content.contains(SESSION_END_TAG) || n.content.contains(PRECOMPACT_TAG))
+            .collect();
+        assert_eq!(markers.len(), 2);
+
+        // One observation + one promoted fact + two markers = 4 notes.
+        assert_eq!(handle.karta.note_count().await.unwrap(), 4);
     }
 }
