@@ -14,8 +14,12 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 mod config;
+mod queue;
 
 use config::Config;
 
@@ -96,6 +100,7 @@ fn init_tracing() {
 
 async fn serve(args: ServeArgs) -> Result<()> {
     let config = Config::from_env()?;
+    let data_dir = config.store_dir().to_string();
 
     tracing::info!(
         store_dir = %config.store_dir(),
@@ -104,15 +109,83 @@ async fn serve(args: ServeArgs) -> Result<()> {
         "starting karta-mcp serve"
     );
 
-    if args.mock {
+    let karta = if args.mock {
         tracing::info!("using mock LLM provider");
+        open_mock_karta(&config).await?
+    } else {
+        karta_core::Karta::with_defaults(config.core.clone()).await?
+    };
+    let karta = Arc::new(karta);
+
+    let queue = Arc::new(queue::CaptureQueue::new(&data_dir).await?);
+    let replayed = queue.replay_incomplete().await?;
+    if replayed > 0 {
+        tracing::info!(replayed_rows = replayed, "replayed incomplete queue rows");
     }
 
-    // TODO: spawn rmcp stdio server, axum HTTP endpoint, and queue worker.
-    // For the foundational feature the skeleton just waits for shutdown.
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("shutdown signal received");
+    let cancel = CancellationToken::new();
+
+    // Register signal flags before spawning the worker so a SIGTERM/SIGINT
+    // delivered while the queue is busy is still observed and can trigger a
+    // graceful drain.
+    let term_flag = Arc::new(AtomicBool::new(false));
+    let int_flag = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        signal_hook::flag::register(SIGTERM, Arc::clone(&term_flag))
+            .expect("register SIGTERM handler");
+        signal_hook::flag::register(SIGINT, Arc::clone(&int_flag))
+            .expect("register SIGINT handler");
+    }
+    #[cfg(not(unix))]
+    {
+        // On non-Unix platforms there is no SIGTERM; rely on Ctrl-C only.
+        int_flag.store(true, Ordering::Relaxed);
+    }
+
+    let mut join_set = tokio::task::JoinSet::new();
+
+    // Queue worker task.
+    join_set.spawn(queue::run_worker(
+        queue.clone(),
+        karta.clone(),
+        cancel.clone(),
+    ));
+
+    // Shutdown signal handler.
+    join_set.spawn(wait_for_shutdown(cancel, term_flag, int_flag));
+
+    // Wait for all tasks to finish. The worker exits only after it has drained
+    // any remaining queue rows, so a SIGTERM/SIGINT first cancels the token and
+    // then waits for the graceful drain to complete.
+    while let Some(res) = join_set.join_next().await {
+        res?;
+    }
+
+    tracing::info!("karta-mcp serve exiting");
     Ok(())
+}
+
+/// Poll the SIGTERM/SIGINT flags and cancel the token when either fires.
+async fn wait_for_shutdown(
+    cancel: CancellationToken,
+    term_flag: Arc<AtomicBool>,
+    int_flag: Arc<AtomicBool>,
+) {
+    loop {
+        if term_flag.load(Ordering::Relaxed) {
+            tracing::info!("received SIGTERM");
+            cancel.cancel();
+            return;
+        }
+        if int_flag.load(Ordering::Relaxed) {
+            tracing::info!("received SIGINT");
+            cancel.cancel();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn status() -> Result<()> {
@@ -121,7 +194,10 @@ async fn status() -> Result<()> {
     // Open the store with the mock provider so `status` works without a live
     // LLM endpoint. The note count and store directory are real; the
     // embedding_model label is taken from the environment when available.
-    let note_count = open_mock_karta(&config).await?.note_count().await?;
+    let karta = open_mock_karta(&config).await?;
+    let note_count = karta.note_count().await?;
+    let queue = queue::CaptureQueue::new(config.store_dir()).await?;
+    let queue_depth = queue.depth().await?;
     let embedding_model = std::env::var("KARTA_EMBEDDING_MODEL")
         .unwrap_or_else(|_| config.core.llm.default.model.clone());
 
@@ -129,7 +205,7 @@ async fn status() -> Result<()> {
     println!("store_dir: {}", config.store_dir());
     println!("embedding_model: {embedding_model}");
     println!("capture_port: {}", config.capture_port);
-    println!("queue_depth: 0");
+    println!("queue_depth: {queue_depth}");
 
     Ok(())
 }
