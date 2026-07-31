@@ -111,8 +111,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         KartaHandle::open_mock(&data_dir).await?
     } else {
         let karta = Arc::new(karta_core::Karta::with_defaults(config.core.clone()).await?);
-        let (vector_store, graph_store) = KartaHandle::open_stores_for_data_dir(&data_dir).await?;
-        KartaHandle::new(karta, vector_store, graph_store)
+        let (vector_store, graph_store, shared_conn) =
+            KartaHandle::open_stores_for_data_dir(&data_dir).await?;
+        KartaHandle::new(karta, vector_store, graph_store, shared_conn)
     };
 
     let queue = Arc::new(queue::CaptureQueue::new(&data_dir).await?);
@@ -200,21 +201,26 @@ async fn serve(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
-/// Wait for SIGTERM or SIGINT and cancel the token when either fires.
+/// Wait for a shutdown signal and cancel the token when it fires.
 ///
-/// Uses `signal-hook` instead of `tokio::signal` because the MCP server task
-/// holds a background stdin reader; on some platforms (macOS) `tokio::signal`
-/// leaves the default signal action enabled while async handlers are pending,
-/// which causes the process to be killed with the signal code before it can
-/// exit cleanly. `signal-hook` registers a real signal handler that prevents
-/// the default action.
+/// On Unix, `signal-hook` is used instead of `tokio::signal` because the MCP
+/// server task holds a background stdin reader; on some platforms (macOS)
+/// `tokio::signal` leaves the default signal action enabled while async
+/// handlers are pending, which causes the process to be killed with the
+/// signal code before it can exit cleanly. `signal-hook` registers a real
+/// signal handler that prevents the default action.
+///
+/// On non-Unix platforms, `tokio::signal::ctrl_c` is used as a portable
+/// fallback. The function is `async` and awaits the signal, so it does not
+/// cancel the token at startup.
+#[cfg(unix)]
 async fn wait_for_shutdown(cancel: CancellationToken) {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
     let (tx, rx) = tokio::sync::oneshot::channel::<i32>();
     std::thread::spawn(move || {
-        let mut signals = match signal_hook::iterator::Signals::new([
-            signal_hook::consts::SIGTERM,
-            signal_hook::consts::SIGINT,
-        ]) {
+        let mut signals = match Signals::new([SIGTERM, SIGINT]) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "failed to register signal handlers");
@@ -233,13 +239,23 @@ async fn wait_for_shutdown(cancel: CancellationToken) {
     cancel.cancel();
 }
 
+#[cfg(not(unix))]
+async fn wait_for_shutdown(cancel: CancellationToken) {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => tracing::info!("received Ctrl-C signal"),
+        Err(e) => tracing::error!(error = %e, "failed to listen for Ctrl-C signal"),
+    }
+    cancel.cancel();
+}
+
 async fn status() -> Result<()> {
     let config = Config::from_env()?;
 
     // Open the store with the mock provider so `status` works without a live
     // LLM endpoint. The note count and store directory are real; the
     // embedding_model label is taken from the environment when available.
-    let karta = open_mock_karta(&config).await?;
+    let handle = KartaHandle::open_mock(config.store_dir()).await?;
+    let karta = handle.karta;
     let note_count = karta.note_count().await?;
     let queue = queue::CaptureQueue::new(config.store_dir()).await?;
     let queue_depth = queue.depth().await?;
@@ -265,28 +281,6 @@ async fn export(dest: &PathBuf) -> Result<()> {
 
 async fn restore(from: &PathBuf) -> Result<()> {
     bail!("restore not yet implemented (source: {from:?})")
-}
-
-/// Open a `Karta` instance using the mock LLM and SQLite stores.
-///
-/// This is used by operator subcommands (`status`, `backup`, etc.) that need to
-/// inspect the store without requiring a live LLM endpoint.
-async fn open_mock_karta(config: &Config) -> Result<karta_core::Karta> {
-    use karta_core::llm::LlmProvider;
-    use karta_core::llm::MockLlmProvider;
-    use karta_core::store::sqlite::SqliteGraphStore;
-    use karta_core::store::sqlite_vec::SqliteVectorStore;
-    use karta_core::store::{GraphStore, VectorStore};
-
-    const EMBEDDING_DIM: usize = 1536;
-
-    let vector_store = SqliteVectorStore::new(config.store_dir(), EMBEDDING_DIM).await?;
-    let shared_conn = vector_store.connection();
-    let vector_store: Arc<dyn VectorStore> = Arc::new(vector_store);
-    let graph_store: Arc<dyn GraphStore> = Arc::new(SqliteGraphStore::with_connection(shared_conn));
-    let llm: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::new());
-
-    Ok(karta_core::Karta::new(vector_store, graph_store, llm, config.core.clone()).await?)
 }
 
 #[cfg(test)]

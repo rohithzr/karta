@@ -7,35 +7,54 @@
 //! the non-mock path) and makes them available to the session layer.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use karta_core::Karta;
 use karta_core::store::VectorStore;
 use karta_core::store::sqlite::SqliteGraphStore;
 use karta_core::store::sqlite_vec::SqliteVectorStore;
 use rusqlite::Connection;
 
-/// Bundles a `Karta` with the underlying vector store so session logic can
-/// perform direct, LLM-free upserts.
+/// Apply wrapper-side SQLite pragmas to a shared connection.
+///
+/// karta_core enables WAL and foreign keys, but it does not set a busy
+/// timeout. Every wrapper-side connection to `karta.db` must set
+/// `PRAGMA busy_timeout=5000` so concurrent writes do not immediately return
+/// `SQLITE_BUSY`.
+pub(crate) fn set_busy_timeout(shared_conn: &Arc<Mutex<Connection>>) -> Result<()> {
+    let conn = shared_conn
+        .lock()
+        .map_err(|e| anyhow!("store connection mutex poisoned: {e}"))?;
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")
+        .context("failed to set busy_timeout on store connection")?;
+    Ok(())
+}
+
+/// Bundles a `Karta` with the underlying vector/graph stores and the shared
+/// SQLite connection so session logic can perform direct, LLM-free upserts.
 #[derive(Clone)]
 pub struct KartaHandle {
     pub karta: Arc<Karta>,
     pub vector_store: Arc<dyn VectorStore>,
     pub graph_store: Arc<SqliteGraphStore>,
+    pub connection: Arc<Mutex<Connection>>,
 }
 
 impl KartaHandle {
-    /// Build a handle from an existing `Karta` and the stores that were used
-    /// to construct it.
+    /// Build a handle from an existing `Karta`, the stores that were used to
+    /// construct it, and the shared connection those stores use.
     pub fn new(
         karta: Arc<Karta>,
         vector_store: Arc<dyn VectorStore>,
         graph_store: Arc<SqliteGraphStore>,
+        connection: Arc<Mutex<Connection>>,
     ) -> Self {
         Self {
             karta,
             vector_store,
             graph_store,
+            connection,
         }
     }
 
@@ -48,8 +67,9 @@ impl KartaHandle {
             .await
             .context("failed to open mock vector store")?;
         let shared_conn = vector_store.connection();
+        set_busy_timeout(&shared_conn)?;
         let vector_store: Arc<dyn VectorStore> = Arc::new(vector_store);
-        let graph_store = Arc::new(SqliteGraphStore::with_connection(shared_conn));
+        let graph_store = Arc::new(SqliteGraphStore::with_connection(shared_conn.clone()));
         let llm: Arc<dyn karta_core::llm::LlmProvider> =
             Arc::new(karta_core::llm::MockLlmProvider::new());
         let config = karta_core::config::KartaConfig::default();
@@ -58,25 +78,33 @@ impl KartaHandle {
                 .await
                 .context("failed to build mock Karta")?,
         );
-        Ok(Self::new(karta, vector_store, graph_store))
+        Ok(Self::new(karta, vector_store, graph_store, shared_conn))
     }
 
     /// Re-open a `SqliteVectorStore` for a `Karta` that was created via
     /// `Karta::with_defaults`. The embedding dimension is read from the
     /// existing `notes_vec` virtual-table schema so the re-opened store is
     /// compatible with the live store.
+    ///
+    /// Returns the vector store, graph store, and the shared SQLite connection
+    /// so callers can bundle them into a `KartaHandle`.
     pub async fn open_stores_for_data_dir(
         data_dir: &str,
-    ) -> Result<(Arc<dyn VectorStore>, Arc<SqliteGraphStore>)> {
+    ) -> Result<(
+        Arc<dyn VectorStore>,
+        Arc<SqliteGraphStore>,
+        Arc<Mutex<Connection>>,
+    )> {
         let dim = read_embedding_dim_from_db(data_dir)
             .context("failed to determine embedding dimension from existing store")?;
         let vector_store = SqliteVectorStore::new(data_dir, dim)
             .await
             .context("failed to re-open vector store for session consolidation")?;
         let shared_conn = vector_store.connection();
+        set_busy_timeout(&shared_conn)?;
         let vector_store: Arc<dyn VectorStore> = Arc::new(vector_store);
-        let graph_store = Arc::new(SqliteGraphStore::with_connection(shared_conn));
-        Ok((vector_store, graph_store))
+        let graph_store = Arc::new(SqliteGraphStore::with_connection(shared_conn.clone()));
+        Ok((vector_store, graph_store, shared_conn))
     }
 }
 
@@ -92,6 +120,8 @@ fn read_embedding_dim_from_db(data_dir: &str) -> Result<usize> {
             path.display()
         )
     })?;
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")
+        .context("failed to set busy_timeout on dimension probe connection")?;
     let sql: String = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notes_vec'",
@@ -128,6 +158,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_mock_sets_busy_timeout_to_5000() {
+        let dir = TempDir::new().unwrap();
+        let handle = KartaHandle::open_mock(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let conn = handle.connection.lock().unwrap();
+        let timeout: i32 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+    }
+
+    #[tokio::test]
     async fn read_embedding_dim_from_existing_store() {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().to_str().unwrap();
@@ -136,5 +179,20 @@ mod tests {
 
         let dim = read_embedding_dim_from_db(data_dir).unwrap();
         assert_eq!(dim, 1536);
+    }
+
+    #[tokio::test]
+    async fn set_busy_timeout_helper_sets_5000() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let store = SqliteVectorStore::new(data_dir, 1536).await.unwrap();
+        let conn = store.connection();
+        set_busy_timeout(&conn).unwrap();
+        let timeout: i32 = conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
     }
 }

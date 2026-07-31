@@ -559,7 +559,7 @@ mod tests {
             .unwrap();
         let shared_conn = vector_store.connection();
         let vector_store: Arc<dyn VectorStore> = Arc::new(vector_store);
-        let graph_store = Arc::new(SqliteGraphStore::with_connection(shared_conn));
+        let graph_store = Arc::new(SqliteGraphStore::with_connection(shared_conn.clone()));
         let llm = Arc::new(CountingMockLlmProvider::new());
         let llm_dyn: Arc<dyn LlmProvider> = llm.clone();
         let config = karta_core::config::KartaConfig::default();
@@ -568,7 +568,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let handle = KartaHandle::new(karta, vector_store, graph_store);
+        let handle = KartaHandle::new(karta, vector_store, graph_store, shared_conn);
 
         insert_observation(
             &handle,

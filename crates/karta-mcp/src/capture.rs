@@ -10,11 +10,23 @@
 
 use std::sync::Arc;
 
-use axum::{Router, body::Bytes, extract::State, http::StatusCode, response::Json};
+use axum::{
+    Router,
+    body::Bytes,
+    extract::{DefaultBodyLimit, State},
+    http::StatusCode,
+    response::Json,
+};
 use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::queue::CaptureQueue;
+
+/// Maximum body size accepted by the capture endpoint.
+///
+/// Axum's default `Bytes` extractor limit is 2 MiB, which is too small for
+/// large hook payloads (e.g., Claude Code tool output). Override to 10 MiB.
+const CAPTURE_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 
 /// Shared application state for the capture router.
 #[derive(Clone)]
@@ -28,14 +40,20 @@ pub fn router(karta: Arc<karta_core::Karta>, queue: Arc<CaptureQueue>) -> Router
     Router::new()
         .route("/capture", axum::routing::post(capture_handler))
         .route("/orient", axum::routing::post(orient_handler))
+        .layer(DefaultBodyLimit::max(CAPTURE_BODY_LIMIT_BYTES))
         .with_state(AppState { karta, queue })
 }
 
 async fn capture_handler(State(state): State<AppState>, body: Bytes) -> (StatusCode, Json<Value>) {
+    let payload_size = body.len();
     let payload = match serde_json::from_slice::<Value>(&body) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, "capture request body is not valid JSON");
+            tracing::warn!(
+                error = %e,
+                payload_size,
+                "capture request body is not valid JSON"
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "invalid JSON"})),
@@ -43,10 +61,27 @@ async fn capture_handler(State(state): State<AppState>, body: Bytes) -> (StatusC
         }
     };
 
+    let event_name = payload
+        .get("hook_event_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            payload
+                .get("event")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
     let (event_type, session_id) = match resolve_event_type(&payload) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, payload = ?payload, "capture event rejected");
+            tracing::warn!(
+                error = %e,
+                event = %event_name,
+                payload_size,
+                "capture event rejected"
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": e.to_string()})),
@@ -286,6 +321,117 @@ mod tests {
         assert_eq!(
             derive_orient_query(&payload),
             "agent: agent project: default"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_accepts_payload_larger_than_default_limit() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let handle = crate::karta_handle::KartaHandle::open_mock(data_dir)
+            .await
+            .unwrap();
+        let queue = Arc::new(CaptureQueue::new(data_dir).await.unwrap());
+        let app = router(handle.karta, queue);
+
+        // 3 MiB exceeds axum's default 2 MiB Bytes limit but is under our 10 MiB override.
+        let big = "x".repeat(3 * 1024 * 1024);
+        let body = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": big,
+        })
+        .to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/capture")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn rejected_event_logs_event_name_and_size_not_payload() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let handle = crate::karta_handle::KartaHandle::open_mock(data_dir)
+            .await
+            .unwrap();
+        let queue = Arc::new(CaptureQueue::new(data_dir).await.unwrap());
+        let app = router(handle.karta, queue);
+
+        let secret = "super-secret-prompt-content";
+        let body = serde_json::json!({
+            "hook_event_name": "UnknownEvent",
+            "prompt": secret,
+        })
+        .to_string();
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = {
+            let captured = captured.clone();
+            move || {
+                let captured = captured.clone();
+                struct W(Arc<std::sync::Mutex<Vec<u8>>>);
+                impl std::io::Write for W {
+                    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                        self.0.lock().unwrap().extend_from_slice(buf);
+                        Ok(buf.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+                W(captured)
+            }
+        };
+
+        let _guard = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_env_filter("warn")
+            .set_default();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/capture")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("payload_size"),
+            "expected payload_size field in rejection log, got: {logs}"
+        );
+        assert!(
+            logs.contains("UnknownEvent"),
+            "expected event name in rejection log, got: {logs}"
+        );
+        assert!(
+            !logs.contains(secret),
+            "rejection log leaked payload content: {logs}"
         );
     }
 }

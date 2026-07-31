@@ -322,7 +322,16 @@ pub async fn run_worker(
             }
             Err(e) => {
                 tracing::error!(error = %e, "failed to claim next queue row");
-                tokio::time::sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
+                if cancel.is_cancelled() {
+                    break;
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)) => {}
+                }
+                if cancel.is_cancelled() {
+                    break;
+                }
             }
         }
     }
