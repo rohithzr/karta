@@ -128,7 +128,7 @@ async fn server_initializes_and_lists_tools() {
         "initialize should return a result: {init}"
     );
     assert!(
-        !init.get("error").is_some(),
+        init.get("error").is_none(),
         "initialize should not return an error: {init}"
     );
 

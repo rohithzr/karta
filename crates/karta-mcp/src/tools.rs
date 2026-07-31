@@ -212,8 +212,6 @@ mod tests {
 
     use super::*;
 
-    const EMBEDDING_DIM: usize = 1536;
-
     async fn setup_karta() -> (TempDir, KartaHandle) {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().to_str().unwrap();
@@ -241,7 +239,7 @@ mod tests {
         let value = parse_json(&response);
         assert_eq!(value["status"], "ok");
         assert!(
-            value["note_id"].as_str().unwrap().len() > 0,
+            !value["note_id"].as_str().unwrap().is_empty(),
             "note_id should be non-empty"
         );
         assert_eq!(handle.karta.note_count().await.unwrap(), 1);
@@ -331,7 +329,7 @@ mod tests {
         let response = handle_session_start(&handle, params).await.unwrap();
         let value = parse_json(&response);
         assert!(
-            value["session_id"].as_str().unwrap().len() > 0,
+            !value["session_id"].as_str().unwrap().is_empty(),
             "session_id should be non-empty"
         );
         assert!(value["orientation_context"].is_string());

@@ -213,9 +213,9 @@ mod tests {
 
     use karta_core::llm::{ChatMessage, ChatResponse, GenConfig, LlmProvider, MockLlmProvider};
     use karta_core::note::{MemoryNote, Provenance};
+    use karta_core::store::VectorStore;
     use karta_core::store::sqlite::SqliteGraphStore;
     use karta_core::store::sqlite_vec::SqliteVectorStore;
-    use karta_core::store::{GraphStore, VectorStore};
     use karta_core::{ClockContext, Karta};
     use tempfile::TempDir;
 
