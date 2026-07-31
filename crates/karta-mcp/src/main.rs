@@ -10,17 +10,13 @@
 //! stdout is reserved for MCP JSON-RPC traffic from the `serve` subcommand.
 //! All logging goes to stderr via `tracing`.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-mod config;
-mod queue;
-mod server;
-mod session;
-mod tools;
+use karta_mcp::{capture, config, queue, server};
 
 use config::Config;
 
@@ -144,6 +140,30 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let worker_cancel = cancel.clone();
     join_set.spawn(async move {
         queue::run_worker(worker_queue, worker_karta, worker_cancel).await;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // HTTP capture endpoint task.
+    let capture_router = capture::router(karta.clone(), queue.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", config.capture_port))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to bind HTTP capture endpoint to 127.0.0.1:{}",
+                config.capture_port
+            )
+        })?;
+    let capture_addr = listener.local_addr()?;
+    let capture_cancel = cancel.clone();
+    join_set.spawn(async move {
+        tracing::info!(addr = %capture_addr, "HTTP capture endpoint listening");
+        let shutdown = capture_cancel.cancelled_owned();
+        if let Err(e) = axum::serve(listener, capture_router)
+            .with_graceful_shutdown(shutdown)
+            .await
+        {
+            tracing::error!(error = %e, "HTTP capture server exited early");
+        }
         Ok::<(), anyhow::Error>(())
     });
 

@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -17,7 +18,17 @@ use tempfile::TempDir;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
-const SERVE_PORT: u16 = 3137;
+/// Port range for spawned `serve` processes in these tests.
+///
+/// Each test gets a distinct loopback port so the tests can run in parallel
+/// without colliding on the HTTP capture endpoint. The range starts well above
+/// the default `3137` used by other integration tests.
+static NEXT_PORT: AtomicU16 = AtomicU16::new(31500);
+
+fn allocate_test_port() -> u16 {
+    NEXT_PORT.fetch_add(1, Ordering::SeqCst)
+}
+
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Create the karta.db file with the capture_queue table and WAL mode.
@@ -80,7 +91,7 @@ fn count_statuses(conn: &Connection, statuses: &[&str]) -> usize {
 /// are delivered to the serve process and not to a cargo wrapper. Uses the
 /// synchronous `std::process::Command` to avoid `tokio::process` signal-mask
 /// inheritance issues on macOS.
-fn spawn_serve(data_dir: &str) -> std::process::Child {
+fn spawn_serve(data_dir: &str, port: u16) -> std::process::Child {
     let bin = std::env::var("CARGO_BIN_EXE_karta-mcp")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -102,7 +113,7 @@ fn spawn_serve(data_dir: &str) -> std::process::Child {
     std::process::Command::new(bin)
         .args(["serve", "--mock"])
         .env("KARTA_STORE_DIR", data_dir)
-        .env("KARTA_CAPTURE_PORT", SERVE_PORT.to_string())
+        .env("KARTA_CAPTURE_PORT", port.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -196,7 +207,7 @@ async fn crash_recovery_replays_queued_in_flight_and_failed_rows() {
 
     // Start serve. Startup replay should reset the in_flight and failed rows
     // to queued, then the worker drains all three.
-    let mut child = spawn_serve(data_dir);
+    let mut child = spawn_serve(data_dir, allocate_test_port());
     sleep(Duration::from_millis(500)).await;
 
     wait_for_empty_queue(&db_path).await;
@@ -238,7 +249,7 @@ async fn sigterm_drains_in_flight_and_queued_rows() {
     );
     drop(conn);
 
-    let mut child = spawn_serve(data_dir);
+    let mut child = spawn_serve(data_dir, allocate_test_port());
     // Wait until the worker has completed at least one full row before
     // sending SIGTERM. This ensures the signal handler and polling task are
     // active and avoids killing the process before it is ready to drain.
@@ -326,7 +337,7 @@ async fn startup_replay_does_not_touch_done_rows() {
         .unwrap();
     drop(conn);
 
-    let mut child = spawn_serve(data_dir);
+    let mut child = spawn_serve(data_dir, allocate_test_port());
     wait_for_empty_queue(&db_path).await;
     send_sigterm(&child);
     let _ = wait_for_exit(&mut child).await;
@@ -378,7 +389,7 @@ async fn worker_processes_rows_in_fifo_order() {
     }
     drop(conn);
 
-    let mut child = spawn_serve(data_dir);
+    let mut child = spawn_serve(data_dir, allocate_test_port());
     wait_for_empty_queue(&db_path).await;
     send_sigterm(&child);
     let _ = wait_for_exit(&mut child).await;
