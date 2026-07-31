@@ -23,6 +23,13 @@ use config::Config;
 #[derive(Parser)]
 #[command(name = "karta-mcp", version, about = "Karta MCP server + auto-capture")]
 struct Cli {
+    /// Use mock LLM and SQLite stores instead of a real LLM endpoint.
+    ///
+    /// This is a global flag so `karta-mcp --mock` works without an explicit
+    /// `serve` subcommand, which is the default command.
+    #[arg(long, global = true)]
+    mock: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -31,7 +38,7 @@ struct Cli {
 enum Commands {
     /// Run the MCP server and HTTP capture endpoint (default).
     #[command(name = "serve")]
-    Serve(ServeArgs),
+    Serve,
 
     /// Print the current store status.
     #[command(name = "status")]
@@ -59,23 +66,13 @@ enum Commands {
     },
 }
 
-#[derive(Parser)]
-struct ServeArgs {
-    /// Use mock LLM and SQLite stores instead of a real LLM endpoint.
-    #[arg(long)]
-    mock: bool,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    match cli
-        .command
-        .unwrap_or(Commands::Serve(ServeArgs { mock: false }))
-    {
-        Commands::Serve(args) => serve(args).await,
+    match cli.command.unwrap_or(Commands::Serve) {
+        Commands::Serve => serve(cli.mock).await,
         Commands::Status => status().await,
         Commands::Backup { dest } => backup(&dest).await,
         Commands::Export { dest } => export(&dest).await,
@@ -95,7 +92,7 @@ fn init_tracing() {
         .init();
 }
 
-async fn serve(args: ServeArgs) -> Result<()> {
+async fn serve(mock: bool) -> Result<()> {
     let config = Config::from_env()?;
     let data_dir = config.store_dir().to_string();
 
@@ -106,7 +103,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         "starting karta-mcp serve"
     );
 
-    let handle = if args.mock {
+    let handle = if mock {
         tracing::info!("using mock LLM provider");
         KartaHandle::open_mock(&data_dir).await?
     } else {
@@ -296,12 +293,16 @@ mod tests {
     }
 
     #[test]
-    fn mock_flag_is_available() {
+    fn mock_flag_is_available_on_serve_subcommand() {
         let cli = Cli::parse_from(["karta-mcp", "serve", "--mock"]);
-        if let Some(Commands::Serve(args)) = cli.command {
-            assert!(args.mock);
-        } else {
-            panic!("expected serve subcommand");
-        }
+        assert!(matches!(cli.command, Some(Commands::Serve)));
+        assert!(cli.mock);
+    }
+
+    #[test]
+    fn global_mock_flag_works_without_subcommand() {
+        let cli = Cli::parse_from(["karta-mcp", "--mock"]);
+        assert!(cli.command.is_none());
+        assert!(cli.mock);
     }
 }

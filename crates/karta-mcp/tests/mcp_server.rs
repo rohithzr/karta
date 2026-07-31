@@ -50,6 +50,7 @@ fn bin_path() -> PathBuf {
 async fn spawn_serve(
     temp_dir: &TempDir,
     port: u16,
+    args: &[&str],
 ) -> (
     Child,
     ChildStdin,
@@ -57,8 +58,7 @@ async fn spawn_serve(
     tokio::task::JoinHandle<()>,
 ) {
     let mut child = Command::new(bin_path())
-        .arg("serve")
-        .arg("--mock")
+        .args(args)
         .env("KARTA_STORE_DIR", temp_dir.path().to_str().unwrap())
         .env("KARTA_CAPTURE_PORT", port.to_string())
         .stdin(Stdio::piped())
@@ -122,7 +122,8 @@ async fn read_message_timeout(reader: &mut BufReader<ChildStdout>, label: &str) 
 async fn server_initializes_and_lists_tools() {
     let temp_dir = TempDir::new().unwrap();
     let port = allocate_test_port();
-    let (mut child, mut stdin, mut reader, stderr_handle) = spawn_serve(&temp_dir, port).await;
+    let (mut child, mut stdin, mut reader, stderr_handle) =
+        spawn_serve(&temp_dir, port, &["serve", "--mock"]).await;
 
     // Initialize handshake.
     write_request(
@@ -188,7 +189,8 @@ async fn server_initializes_and_lists_tools() {
 async fn rejects_tool_call_with_unknown_field() {
     let temp_dir = TempDir::new().unwrap();
     let port = allocate_test_port();
-    let (mut child, mut stdin, mut reader, stderr_handle) = spawn_serve(&temp_dir, port).await;
+    let (mut child, mut stdin, mut reader, stderr_handle) =
+        spawn_serve(&temp_dir, port, &["serve", "--mock"]).await;
 
     // Initialize handshake.
     write_request(
@@ -248,6 +250,66 @@ async fn rejects_tool_call_with_unknown_field() {
     assert!(
         content_text.contains("unknown field"),
         "expected unknown field deserialization error, got: {content_text}"
+    );
+
+    let _ = child.kill().await;
+    let _ = stderr_handle.await;
+}
+
+#[tokio::test]
+async fn default_serve_with_global_mock_flag() {
+    let temp_dir = TempDir::new().unwrap();
+    let port = allocate_test_port();
+    // Spawn `karta-mcp --mock` with no explicit `serve` subcommand. The
+    // global `--mock` flag must be forwarded to the default serve command.
+    let (mut child, mut stdin, mut reader, stderr_handle) =
+        spawn_serve(&temp_dir, port, &["--mock"]).await;
+
+    // Initialize handshake.
+    write_request(
+        &mut stdin,
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "0.0.1" },
+        }),
+    )
+    .await;
+
+    let init = read_message_timeout(&mut reader, "initialize response").await;
+    assert!(
+        init.get("result").is_some(),
+        "initialize should return a result: {init}"
+    );
+    assert!(
+        init.get("error").is_none(),
+        "initialize should not return an error: {init}"
+    );
+
+    // Initialized notification.
+    let notify = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    let msg = format!("{}\n", serde_json::to_string(&notify).unwrap());
+    stdin.write_all(msg.as_bytes()).await.unwrap();
+    stdin.flush().await.unwrap();
+
+    // Also verify the HTTP capture endpoint is up, which proves the serve
+    // command was started rather than clap exiting with an error.
+    let client = reqwest::Client::new();
+    let orient_url = format!("http://127.0.0.1:{port}/orient");
+    let response = client
+        .post(&orient_url)
+        .header("Content-Type", "application/json")
+        .json(&json!({"hook_event_name": "SessionStart", "query": "healthcheck"}))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .expect("orient request should reach the server");
+    assert_eq!(
+        response.status(),
+        200,
+        "orient should return 200 when serve is running with --mock"
     );
 
     let _ = child.kill().await;
