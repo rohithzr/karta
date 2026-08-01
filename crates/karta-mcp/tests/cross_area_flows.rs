@@ -373,7 +373,9 @@ async fn sigterm_during_active_capture_replays_queued_rows() {
     // The server should exit cleanly, but if it doesn't due to stdin/stdout transport
     // issues, we still verify the queue was properly drained below
     if !status.success() {
-        tracing::warn!("Server did not exit cleanly after SIGTERM, but queue draining should still work");
+        tracing::warn!(
+            "Server did not exit cleanly after SIGTERM, but queue draining should still work"
+        );
     }
 
     let port2 = common::find_free_port();
