@@ -137,6 +137,15 @@ Add a crontab entry that keeps seven days of snapshots:
 0 2 * * * mkdir -p ~/.karta/backups && find ~/.karta/backups -name 'karta-*.db' -mtime +7 -delete && /path/to/karta-mcp backup --dest ~/.karta/backups/karta-$(date +\%Y\%m\%d-\%H\%M\%S).db >> ~/.karta/backups/backup.log 2>&1
 ```
 
+## License
+
+`karta-mcp` is Copyright (c) 2026 AJ Alon, licensed under the MIT License
+(see `LICENSE` in this directory).
+
+`karta-core` and `karta-cli` are upstream code from
+[rohithzr/karta](https://github.com/rohithzr/karta), Copyright (c) Rohit Hazra,
+licensed under MIT (see the repository root `LICENSE`).
+
 ## Fork pin
 
 Built against karta fork HEAD `866a664`.
