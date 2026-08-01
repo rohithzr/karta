@@ -5,17 +5,24 @@ These golden fixtures represent the JSONL transcript formats that
 
 ## `droid-session.jsonl`
 
-A real Droid session transcript. Each line is a JSON object with a top-level
-`type` field. The relevant shapes are:
+A synthetic Droid session transcript based on attested real Droid transcript
+shapes. Each line is a JSON object with a top-level `type` field. The relevant
+shapes are:
 
 - `session_start`: session metadata (`sessionId`, `agent`, `project`, `cwd`).
 - `message` with `message.role = "user"`:
   - `content` is an array of blocks.
-  - `text` blocks carry the user prompt.
+  - `text` blocks carry the user prompt. On real Droid transcripts these
+    messages do **not** have a `hookEventName`.
   - `tool_result` blocks carry the result of a previous tool call
-    (`tool_use_id`, `content`, `is_error`).
-  - `hookEventName` may be `UserPromptSubmit`, `PostToolUse`, or
-    `SubagentStop`.
+    (`tool_use_id`, `content`, `is_error`). On real Droid transcripts these
+    messages also do **not** have a `hookEventName`.
+  - `hookEventName` appears only on separate hook-execution messages, which
+    usually have an empty `content` array and carry metadata such as
+    `hookCommands`, `hookResults`, and `hookToolCallId`. The only attested
+    value on this machine is `PostToolUse`.
+  - `SubagentStop` messages carry `taskName`/`taskResult` fields and may have
+    an empty `content` array.
 - `message` with `message.role = "assistant"`:
   - `content` may contain `thinking`, `text`, and `tool_use` blocks.
   - `tool_use` blocks have `id`, `name`, and `input`.

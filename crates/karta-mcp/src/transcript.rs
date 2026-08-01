@@ -99,14 +99,19 @@ pub fn detect_client(path: &str) -> Result<TranscriptClient> {
 /// Parse a Droid session transcript JSONL file.
 ///
 /// Recognised events:
-/// - `message` with `message.role = "user"` and `hookEventName = "UserPromptSubmit"`
-///   -> `user_prompt`
+/// - `message` with `message.role = "user"` and text content blocks (and no
+///   `tool_result` blocks) -> `user_prompt`. Real Droid transcripts do not put a
+///   `hookEventName` on content-bearing user prompt messages, so the parser
+///   must not require one.
 /// - `message` with `message.role = "assistant"` containing `tool_use` blocks
 ///   -> `observation` (tool input)
-/// - `message` with `message.role = "user"` containing `tool_result` blocks or
-///   `hookEventName = "PostToolUse"` -> `observation` (tool output)
+/// - `message` with `message.role = "user"` containing `tool_result` blocks
+///   -> `observation` (tool output)
 /// - `message` with `hookEventName = "SubagentStop"` -> `subagent_result`
 /// - `message` with `message.role = "assistant"` final text -> `turn_summary`
+///
+/// Malformed JSONL lines are logged and skipped rather than aborting the whole
+/// sweep.
 pub fn parse_droid_transcript(path: &str) -> Result<Vec<SweptEvent>> {
     let file =
         File::open(path).with_context(|| format!("failed to open Droid transcript: {path}"))?;
@@ -119,12 +124,17 @@ pub fn parse_droid_transcript(path: &str) -> Result<Vec<SweptEvent>> {
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(&line).with_context(|| {
-            format!(
-                "failed to parse Droid transcript line {} in {path}",
-                line_no + 1
-            )
-        })?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    line = line_no + 1,
+                    error = %e,
+                    "skipping malformed Droid transcript line"
+                );
+                continue;
+            }
+        };
 
         if let Some(message) = value.get("message") {
             let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -132,8 +142,15 @@ pub fn parse_droid_transcript(path: &str) -> Result<Vec<SweptEvent>> {
 
             match role {
                 "user" => {
-                    if hook_event_name == Some("UserPromptSubmit") {
-                        if let Some(text) = extract_text_from_content_blocks(message) {
+                    if hook_event_name == Some("SubagentStop") {
+                        let content = build_subagent_result_content(message);
+                        events.push(SweptEvent {
+                            event_type: "subagent_result".to_string(),
+                            content,
+                            turn_index: Some(turn_index),
+                        });
+                    } else if let Some(text) = extract_text_from_content_blocks(message) {
+                        if !has_tool_result_blocks(message) {
                             events.push(SweptEvent {
                                 event_type: "user_prompt".to_string(),
                                 content: text,
@@ -141,13 +158,6 @@ pub fn parse_droid_transcript(path: &str) -> Result<Vec<SweptEvent>> {
                             });
                             turn_index += 1;
                         }
-                    } else if hook_event_name == Some("SubagentStop") {
-                        let content = build_subagent_result_content(message);
-                        events.push(SweptEvent {
-                            event_type: "subagent_result".to_string(),
-                            content,
-                            turn_index: Some(turn_index),
-                        });
                     } else if let Some(tool_result) = extract_tool_result(message) {
                         events.push(SweptEvent {
                             event_type: "observation".to_string(),
@@ -204,12 +214,17 @@ pub fn parse_claude_transcript(path: &str) -> Result<Vec<SweptEvent>> {
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(&line).with_context(|| {
-            format!(
-                "failed to parse Claude Code transcript line {} in {path}",
-                line_no + 1
-            )
-        })?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    line = line_no + 1,
+                    error = %e,
+                    "skipping malformed Claude Code transcript line"
+                );
+                continue;
+            }
+        };
 
         let hook_event_name = value.get("hook_event_name").and_then(|v| v.as_str());
 
@@ -340,6 +355,18 @@ fn extract_tool_result(message: &Value) -> Option<String> {
     } else {
         Some(results.join(" | "))
     }
+}
+
+fn has_tool_result_blocks(message: &Value) -> bool {
+    let Some(content) = message.get("content") else {
+        return false;
+    };
+    let Some(blocks) = content.as_array() else {
+        return false;
+    };
+    blocks
+        .iter()
+        .any(|block| block.get("type").and_then(|v| v.as_str()) == Some("tool_result"))
 }
 
 fn build_subagent_result_content(message: &Value) -> String {
@@ -578,21 +605,50 @@ mod tests {
     }
 
     #[test]
-    fn parse_droid_transcript_skips_unknown_lines() {
+    fn parse_droid_transcript_extracts_user_prompt_without_hook_event_name() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("real-shaped.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "{{\"type\":\"session_start\",\"sessionId\":\"s1\"}}").unwrap();
+        writeln!(
+            file,
+            "{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"Add a transcript parser\"}}]}}}}"
+        )
+        .unwrap();
+        drop(file);
+
+        let events = parse_droid_transcript(path.to_str().unwrap()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "user_prompt");
+        assert!(events[0].content.contains("Add a transcript parser"));
+    }
+
+    #[test]
+    fn parse_droid_transcript_skips_malformed_lines() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("mixed.jsonl");
         let mut file = std::fs::File::create(&path).unwrap();
         writeln!(file, "{{\"type\":\"session_start\",\"sessionId\":\"s1\"}}").unwrap();
         writeln!(
             file,
-            "{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":[],\"hookEventName\":\"UserPromptSubmit\"}}}}"
+            "{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"first\"}}]}}}}"
         )
         .unwrap();
         writeln!(file, "not valid json").unwrap();
+        writeln!(
+            file,
+            "{{\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"second\"}}]}}}}"
+        )
+        .unwrap();
+        writeln!(file, "").unwrap();
         drop(file);
 
-        let err = parse_droid_transcript(path.to_str().unwrap()).unwrap_err();
-        assert!(err.to_string().contains("failed to parse"));
+        let events = parse_droid_transcript(path.to_str().unwrap()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "user_prompt");
+        assert_eq!(events[0].content, "first");
+        assert_eq!(events[1].event_type, "turn_summary");
+        assert_eq!(events[1].content, "second");
     }
 
     #[test]
@@ -617,5 +673,37 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "user_prompt");
         assert_eq!(events[0].content, "hello");
+    }
+
+    #[test]
+    fn parse_claude_transcript_skips_malformed_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("claude-mixed.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"s1\"}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"first\"}}"
+        )
+        .unwrap();
+        writeln!(file, "not valid json").unwrap();
+        writeln!(
+            file,
+            "{{\"hook_event_name\":\"Stop\",\"last_assistant_message\":\"second\"}}"
+        )
+        .unwrap();
+        writeln!(file, "").unwrap();
+        drop(file);
+
+        let events = parse_claude_transcript(path.to_str().unwrap()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "user_prompt");
+        assert_eq!(events[0].content, "first");
+        assert_eq!(events[1].event_type, "turn_summary");
+        assert_eq!(events[1].content, "second");
     }
 }
