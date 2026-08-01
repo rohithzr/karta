@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "droid-contract-s1",
+  "tool_name": "Execute",
+  "tool_input": { "command": "mkdir tests/fixtures/hooks" },
+  "tool_output": "Directory created"
+}

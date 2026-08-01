@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "claude-contract-s1",
+  "tool_name": "Edit",
+  "tool_input": { "path": "tests/fixtures/hooks/README.md" },
+  "tool_response": "File updated"
+}

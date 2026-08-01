@@ -4,9 +4,9 @@
 //! call through a real `karta-mcp serve --mock` process. This complements the
 //! unit tests in `src/tools.rs` by verifying the rmcp wiring end-to-end.
 
-use std::path::PathBuf;
+mod common;
+
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -14,50 +14,18 @@ use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-/// Port range for spawned `serve` processes in these tests.
-///
-/// Each test gets a distinct loopback port so the tests can run in parallel
-/// without colliding on the HTTP capture endpoint. The range starts well above
-/// the default `3137` and the `31500` range used by the queue durability
-/// integration tests.
-static NEXT_PORT: AtomicU16 = AtomicU16::new(31700);
-
-fn allocate_test_port() -> u16 {
-    NEXT_PORT.fetch_add(1, Ordering::SeqCst)
-}
-
-fn bin_path() -> PathBuf {
-    std::env::var("CARGO_BIN_EXE_karta-mcp")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            // Fallback: from the crate manifest go up to the workspace root,
-            // then into the workspace target directory. This covers `cargo test`.
-            let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| {
-                std::env::current_dir()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            });
-            PathBuf::from(manifest_dir)
-                .join("..")
-                .join("..")
-                .join("target")
-                .join("debug")
-                .join("karta-mcp")
-        })
-}
-
 async fn spawn_serve(
     temp_dir: &TempDir,
-    port: u16,
     args: &[&str],
 ) -> (
+    u16,
     Child,
     ChildStdin,
     BufReader<ChildStdout>,
     tokio::task::JoinHandle<()>,
 ) {
-    let mut child = Command::new(bin_path())
+    let port = common::find_free_port();
+    let mut child = Command::new(common::bin_path())
         .args(args)
         .env("KARTA_STORE_DIR", temp_dir.path().to_str().unwrap())
         .env("KARTA_CAPTURE_PORT", port.to_string())
@@ -81,7 +49,15 @@ async fn spawn_serve(
 
     // Give the server time to open the store and start listening.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    (child, stdin, reader, stderr_handle)
+
+    if let Some(status) = child.try_wait().expect("try_wait failed") {
+        panic!(
+            "karta-mcp serve exited early with status {status:?}; \
+             the HTTP capture port may be in use"
+        );
+    }
+
+    (port, child, stdin, reader, stderr_handle)
 }
 
 async fn read_message(reader: &mut BufReader<ChildStdout>) -> Option<Value> {
@@ -121,9 +97,8 @@ async fn read_message_timeout(reader: &mut BufReader<ChildStdout>, label: &str) 
 #[tokio::test]
 async fn server_initializes_and_lists_tools() {
     let temp_dir = TempDir::new().unwrap();
-    let port = allocate_test_port();
-    let (mut child, mut stdin, mut reader, stderr_handle) =
-        spawn_serve(&temp_dir, port, &["serve", "--mock"]).await;
+    let (_port, mut child, mut stdin, mut reader, stderr_handle) =
+        spawn_serve(&temp_dir, &["serve", "--mock"]).await;
 
     // Initialize handshake.
     write_request(
@@ -188,9 +163,8 @@ async fn server_initializes_and_lists_tools() {
 #[tokio::test]
 async fn rejects_tool_call_with_unknown_field() {
     let temp_dir = TempDir::new().unwrap();
-    let port = allocate_test_port();
-    let (mut child, mut stdin, mut reader, stderr_handle) =
-        spawn_serve(&temp_dir, port, &["serve", "--mock"]).await;
+    let (_port, mut child, mut stdin, mut reader, stderr_handle) =
+        spawn_serve(&temp_dir, &["serve", "--mock"]).await;
 
     // Initialize handshake.
     write_request(
@@ -259,11 +233,10 @@ async fn rejects_tool_call_with_unknown_field() {
 #[tokio::test]
 async fn default_serve_with_global_mock_flag() {
     let temp_dir = TempDir::new().unwrap();
-    let port = allocate_test_port();
     // Spawn `karta-mcp --mock` with no explicit `serve` subcommand. The
     // global `--mock` flag must be forwarded to the default serve command.
-    let (mut child, mut stdin, mut reader, stderr_handle) =
-        spawn_serve(&temp_dir, port, &["--mock"]).await;
+    let (port, mut child, mut stdin, mut reader, stderr_handle) =
+        spawn_serve(&temp_dir, &["--mock"]).await;
 
     // Initialize handshake.
     write_request(
@@ -311,6 +284,81 @@ async fn default_serve_with_global_mock_flag() {
         200,
         "orient should return 200 when serve is running with --mock"
     );
+
+    let _ = child.kill().await;
+    let _ = stderr_handle.await;
+}
+
+#[tokio::test]
+async fn mcp_reachability_via_tool_list_and_call() {
+    let temp_dir = TempDir::new().unwrap();
+    let (_port, mut child, mut stdin, mut reader, stderr_handle) =
+        spawn_serve(&temp_dir, &["serve", "--mock"]).await;
+
+    // Initialize handshake.
+    write_request(
+        &mut stdin,
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "0.0.1" },
+        }),
+    )
+    .await;
+
+    let init = read_message_timeout(&mut reader, "initialize response").await;
+    assert!(
+        init.get("result").is_some(),
+        "initialize should return a result: {init}"
+    );
+
+    let notify = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    let msg = format!("{}\n", serde_json::to_string(&notify).unwrap());
+    stdin.write_all(msg.as_bytes()).await.unwrap();
+    stdin.flush().await.unwrap();
+
+    // tools/list request.
+    write_request(&mut stdin, 2, "tools/list", json!({})).await;
+    let tools = read_message_timeout(&mut reader, "tools/list response").await;
+    let result = tools
+        .get("result")
+        .expect("tools/list should have a result");
+    let names: Vec<String> = result["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&"karta_status".to_string()));
+    assert_eq!(names.len(), 7, "expected exactly 7 tools");
+
+    // tools/call request for karta_status.
+    write_request(
+        &mut stdin,
+        3,
+        "tools/call",
+        json!({
+            "name": "karta_status",
+            "arguments": {}
+        }),
+    )
+    .await;
+    let response = read_message_timeout(&mut reader, "tools/call response").await;
+    let result = response
+        .get("result")
+        .expect("tools/call should return a result object");
+    let content_text = result["content"][0]["text"]
+        .as_str()
+        .expect("tool result content should contain text");
+    let payload: Value =
+        serde_json::from_str(content_text).expect("karta_status content should be parseable JSON");
+    assert!(payload["note_count"].is_number());
+    assert!(payload["store_dir"].is_string());
+    assert!(payload["embedding_model"].is_string());
+    assert!(payload["capture_port"].is_number());
+    assert!(payload["queue_depth"].is_number());
 
     let _ = child.kill().await;
     let _ = stderr_handle.await;

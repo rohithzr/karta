@@ -1,0 +1,5 @@
+{
+  "hook_event_name": "Stop",
+  "session_id": "claude-contract-s1",
+  "last_assistant_message": "Contract replay harness added"
+}

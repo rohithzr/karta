@@ -1,0 +1,5 @@
+{
+  "hook_event_name": "PreCompact",
+  "session_id": "claude-contract-s1",
+  "context": "about to lose context"
+}

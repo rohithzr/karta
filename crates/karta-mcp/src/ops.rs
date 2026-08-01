@@ -39,9 +39,10 @@ pub async fn status(config: &Config) -> Result<String> {
 
 /// Create an online snapshot of the store at `source` into `dest`.
 ///
-/// Uses `VACUUM INTO` so the resulting SQLite file is a consistent
-/// point-in-time copy that includes vectors, graph, slot ledger, and the
-/// capture queue. `VACUUM INTO` is safe on a live WAL database.
+/// Uses SQLite's `VACUUM INTO` statement so the resulting SQLite file is a
+/// consistent point-in-time copy that includes vectors, graph, slot ledger, and
+/// the capture queue. The backup is safe to run while `serve` is actively
+/// writing the same database.
 pub async fn backup(source: &Path, dest: &Path) -> Result<()> {
     if !source.exists() {
         bail!("store file not found: {}", source.display());
@@ -56,31 +57,29 @@ pub async fn backup(source: &Path, dest: &Path) -> Result<()> {
         })?;
     }
 
-    // VACUUM INTO requires the destination to not exist.
     if dest.exists() {
         std::fs::remove_file(dest).with_context(|| {
             format!("failed to remove existing destination: {}", dest.display())
         })?;
     }
 
-    let conn = Connection::open(source)
+    let src = Connection::open(source)
         .with_context(|| format!("failed to open store for backup: {}", source.display()))?;
-    conn.execute_batch("PRAGMA busy_timeout = 5000;")
-        .context("failed to set busy_timeout on backup connection")?;
+    src.execute_batch("PRAGMA busy_timeout = 5000;")
+        .context("failed to set busy_timeout on backup source connection")?;
 
-    // Use a literal path because SQLite's VACUUM INTO does not accept bound
-    // parameters. Escaping single quotes keeps the generated SQL safe.
-    let escaped = escape_sql_string_literal(&dest.to_string_lossy());
-    let sql = format!("VACUUM INTO '{escaped}'");
-    conn.execute_batch(&sql)
-        .with_context(|| format!("VACUUM INTO failed for destination: {}", dest.display()))?;
+    src.execute(
+        "VACUUM INTO ?1",
+        rusqlite::params![dest.to_string_lossy().as_ref()],
+    )
+    .with_context(|| {
+        format!(
+            "VACUUM INTO backup failed for destination: {}",
+            dest.display()
+        )
+    })?;
 
     Ok(())
-}
-
-/// Escape a path for use as a single-quoted SQL string literal.
-fn escape_sql_string_literal(s: &str) -> String {
-    s.replace('\'', "''")
 }
 
 /// Export all notes to markdown files under `dest`.

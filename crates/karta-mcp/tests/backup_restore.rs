@@ -3,9 +3,9 @@
 //! These tests exercise the CLI subcommands against a real store and, for
 //! the concurrent-capture-during-backup test, against a live `serve` process.
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::atomic::{AtomicU16, Ordering};
+mod common;
+
+use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -13,68 +13,9 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::time::{interval, sleep, timeout};
 
-/// Port range for spawned `serve` processes in these tests.
-///
-/// Each test gets a distinct loopback port so the tests can run in parallel
-/// without colliding on the HTTP capture endpoint.
-static NEXT_PORT: AtomicU16 = AtomicU16::new(31900);
-
-fn allocate_test_port() -> u16 {
-    NEXT_PORT.fetch_add(1, Ordering::SeqCst)
-}
-
-fn bin_path() -> PathBuf {
-    std::env::var("CARGO_BIN_EXE_karta-mcp")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| {
-                std::env::current_dir()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            });
-            PathBuf::from(manifest_dir)
-                .join("..")
-                .join("..")
-                .join("target")
-                .join("debug")
-                .join("karta-mcp")
-        })
-}
-
-/// Spawn `karta-mcp serve --mock` in the background.
-fn spawn_serve(data_dir: &str, port: u16) -> std::process::Child {
-    std::process::Command::new(bin_path())
-        .args(["serve", "--mock"])
-        .env("KARTA_STORE_DIR", data_dir)
-        .env("KARTA_CAPTURE_PORT", port.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn karta-mcp serve --mock")
-}
-
-/// Wait until the HTTP capture endpoint responds to /orient.
-async fn wait_for_server(port: u16) {
-    let client = reqwest::Client::new();
-    for _ in 0..100 {
-        if client
-            .post(format!("http://127.0.0.1:{port}/orient"))
-            .json(&json!({"query":"ready"}))
-            .send()
-            .await
-            .is_ok()
-        {
-            return;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("server did not become ready in time");
-}
-
 /// Run the `backup` CLI subcommand and return the captured stdout.
 async fn run_backup(data_dir: &str, dest: &Path) -> std::process::Output {
-    tokio::process::Command::new(bin_path())
+    tokio::process::Command::new(common::bin_path())
         .args(["backup", "--dest", &dest.to_string_lossy()])
         .env("KARTA_STORE_DIR", data_dir)
         .output()
@@ -98,10 +39,10 @@ fn snapshot_counts(path: &Path) -> (usize, usize) {
 async fn concurrent_capture_during_backup_preserves_consistency() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().to_str().unwrap();
-    let port = allocate_test_port();
+    let port = common::find_free_port();
 
-    let mut child = spawn_serve(data_dir, port);
-    wait_for_server(port).await;
+    let mut child = common::spawn_serve(data_dir, port);
+    common::wait_for_server(port).await;
 
     let client = reqwest::Client::new();
     let capture_url = format!("http://127.0.0.1:{port}/capture");
@@ -170,7 +111,7 @@ async fn concurrent_capture_during_backup_preserves_consistency() {
 
     // Restore the backup into a fresh directory and verify it opens cleanly.
     let restore_dir = TempDir::new().unwrap();
-    let restore_output = tokio::process::Command::new(bin_path())
+    let restore_output = tokio::process::Command::new(common::bin_path())
         .args(["restore", "--from", &backup_path.to_string_lossy()])
         .env("KARTA_STORE_DIR", restore_dir.path().to_str().unwrap())
         .output()

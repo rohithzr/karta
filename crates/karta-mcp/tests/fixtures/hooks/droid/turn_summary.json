@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "Stop",
+  "session_id": "droid-contract-s1",
+  "turn": 3,
+  "duration_ms": 1200,
+  "last_assistant_message": "Directory created successfully"
+}

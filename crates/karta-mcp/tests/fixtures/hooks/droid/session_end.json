@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "SessionEnd",
+  "session_id": "droid-contract-s1",
+  "transcript_path": "/tmp/droid-contract-s1.jsonl",
+  "summary": "Completed Droid contract harness"
+}

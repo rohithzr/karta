@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "SubagentStop",
+  "session_id": "droid-contract-s1",
+  "task_name": "contract-review",
+  "task_result": "parser approved"
+}

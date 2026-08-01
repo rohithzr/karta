@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "UserPromptSubmit",
+  "session_id": "droid-contract-s1",
+  "cwd": "/workspace/karta",
+  "prompt": "Add a contract replay harness for Droid"
+}

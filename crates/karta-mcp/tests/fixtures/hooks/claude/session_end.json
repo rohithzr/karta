@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "SessionEnd",
+  "session_id": "claude-contract-s1",
+  "transcript_path": "/tmp/claude-contract-s1.jsonl",
+  "summary": "Completed Claude Code contract harness"
+}
