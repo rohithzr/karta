@@ -640,7 +640,7 @@ mod tests {
             "{{\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"second\"}}]}}}}"
         )
         .unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         drop(file);
 
         let events = parse_droid_transcript(path.to_str().unwrap()).unwrap();
@@ -696,7 +696,7 @@ mod tests {
             "{{\"hook_event_name\":\"Stop\",\"last_assistant_message\":\"second\"}}"
         )
         .unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         drop(file);
 
         let events = parse_claude_transcript(path.to_str().unwrap()).unwrap();

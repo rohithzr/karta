@@ -27,6 +27,3 @@ tempfile = "3"
 reqwest = { version = "0.12", features = ["json"] }
 async-trait = "0.1"
 tower = { version = "0.5", features = ["util"] }
-nix = "0.29"
-#[cfg(not(unix))]
-tracing = "0.1"

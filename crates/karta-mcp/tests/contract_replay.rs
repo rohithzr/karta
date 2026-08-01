@@ -64,7 +64,7 @@ async fn contract_replay_maps_all_client_events_and_stores_content() {
             .unwrap()
             .map(|e| e.unwrap())
             .collect();
-        entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {

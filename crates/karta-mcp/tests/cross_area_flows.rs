@@ -370,13 +370,7 @@ async fn sigterm_during_active_capture_replays_queued_rows() {
     let status = common::wait_for_exit(&mut child, Duration::from_secs(20))
         .await
         .unwrap();
-    // The server should exit cleanly, but if it doesn't due to stdin/stdout transport
-    // issues, we still verify the queue was properly drained below
-    if !status.success() {
-        tracing::warn!(
-            "Server did not exit cleanly after SIGTERM, but queue draining should still work"
-        );
-    }
+    assert!(status.success(), "serve should exit cleanly after SIGTERM");
 
     let port2 = common::find_free_port();
     let mut child2 = common::spawn_serve(data_dir, port2);

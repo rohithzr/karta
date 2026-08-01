@@ -241,22 +241,18 @@ pub async fn wait_for_server(port: u16) {
     panic!("server did not become ready in time");
 }
 
-/// Send SIGINT to a child process.
+/// Send SIGTERM to a child process.
 pub fn send_sigterm(child: &std::process::Child) {
     let pid = child.id() as i32;
 
-    // Try using the kill command first (works on Unix systems)
-    // Use SIGINT instead of SIGTERM as it's more reliably handled
     let status = std::process::Command::new("kill")
-        .args(["-INT", &pid.to_string()])
+        .args(["-TERM", &pid.to_string()])
         .status();
 
-    // If kill command fails, the process might have already exited
-    // This is not necessarily an error condition
+    // If kill command fails, the process might have already exited.
+    // This is not necessarily an error condition.
     if let Err(e) = status {
-        // On some systems/platforms, the kill command might not be available
-        // or might fail for other reasons. We'll log it but not fail the test.
-        tracing::debug!("Failed to send SIGINT via kill command: {}", e);
+        tracing::debug!("Failed to send SIGTERM via kill command: {}", e);
     }
 }
 
