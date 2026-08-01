@@ -6,6 +6,7 @@
 //! same `Arc` references that were passed into `Karta::new` (or reopened for
 //! the non-mock path) and makes them available to the session layer.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -62,8 +63,14 @@ impl KartaHandle {
     /// stores at the given data directory. This is the canonical test
     /// construction pattern.
     pub async fn open_mock(data_dir: &str) -> Result<Self> {
-        const EMBEDDING_DIM: usize = 1536;
-        let vector_store = SqliteVectorStore::new(data_dir, EMBEDDING_DIM)
+        Self::open_mock_with_dim(data_dir, 1536).await
+    }
+
+    /// Construct a handle using the mock LLM provider and an explicit
+    /// embedding dimension. Use this when the store is known to have been
+    /// created with a dimension other than 1536.
+    pub async fn open_mock_with_dim(data_dir: &str, dim: usize) -> Result<Self> {
+        let vector_store = SqliteVectorStore::new(data_dir, dim)
             .await
             .context("failed to open mock vector store")?;
         let shared_conn = vector_store.connection();
@@ -79,6 +86,23 @@ impl KartaHandle {
                 .context("failed to build mock Karta")?,
         );
         Ok(Self::new(karta, vector_store, graph_store, shared_conn))
+    }
+
+    /// Open a mock-backed handle for an existing data directory, reading the
+    /// embedding dimension from the on-disk `notes_vec` schema. Falls back to
+    /// 1536 if the database has not been created yet.
+    ///
+    /// This is the right entry point for read-only diagnostics like `status`
+    /// that must work against real stores created with non-1536-dim models.
+    pub async fn open_mock_for_data_dir(data_dir: &str) -> Result<Self> {
+        let path = Path::new(data_dir).join("karta.db");
+        let dim = if path.exists() {
+            read_embedding_dim_from_db(data_dir)
+                .context("failed to read embedding dimension from existing store")?
+        } else {
+            1536
+        };
+        Self::open_mock_with_dim(data_dir, dim).await
     }
 
     /// Re-open a `SqliteVectorStore` for a `Karta` that was created via
@@ -194,5 +218,20 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(timeout, 5000);
+    }
+
+    #[tokio::test]
+    async fn open_mock_for_data_dir_reads_non_default_embedding_dim() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        // Create a store with a non-default dimension.
+        let store = SqliteVectorStore::new(data_dir, 768).await.unwrap();
+        drop(store);
+
+        let handle = KartaHandle::open_mock_for_data_dir(data_dir).await.unwrap();
+        assert_eq!(handle.karta.note_count().await.unwrap(), 0);
+        // Re-opening with the wrong dimension would corrupt the sqlite-vec
+        // virtual table; reaching this point means the dimension was read
+        // correctly from the on-disk schema.
     }
 }

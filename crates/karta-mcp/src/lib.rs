@@ -7,6 +7,7 @@
 pub mod capture;
 pub mod config;
 pub mod karta_handle;
+pub mod ops;
 pub mod queue;
 pub mod server;
 pub mod session;

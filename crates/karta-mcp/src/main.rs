@@ -10,13 +10,13 @@
 //! stdout is reserved for MCP JSON-RPC traffic from the `serve` subcommand.
 //! All logging goes to stderr via `tracing`.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-use karta_mcp::{capture, config, karta_handle::KartaHandle, queue, server};
+use karta_mcp::{capture, config, karta_handle::KartaHandle, ops, queue, server};
 
 use config::Config;
 
@@ -247,37 +247,38 @@ async fn wait_for_shutdown(cancel: CancellationToken) {
 
 async fn status() -> Result<()> {
     let config = Config::from_env()?;
-
-    // Open the store with the mock provider so `status` works without a live
-    // LLM endpoint. The note count and store directory are real; the
-    // embedding_model label is taken from the environment when available.
-    let handle = KartaHandle::open_mock(config.store_dir()).await?;
-    let karta = handle.karta;
-    let note_count = karta.note_count().await?;
-    let queue = queue::CaptureQueue::new(config.store_dir()).await?;
-    let queue_depth = queue.depth().await?;
-    let embedding_model = std::env::var("KARTA_EMBEDDING_MODEL")
-        .unwrap_or_else(|_| config.core.llm.default.model.clone());
-
-    println!("note_count: {note_count}");
-    println!("store_dir: {}", config.store_dir());
-    println!("embedding_model: {embedding_model}");
-    println!("capture_port: {}", config.capture_port);
-    println!("queue_depth: {queue_depth}");
-
+    let output = ops::status(&config).await?;
+    print!("{output}");
     Ok(())
 }
 
-async fn backup(dest: &PathBuf) -> Result<()> {
-    bail!("backup not yet implemented (destination: {dest:?})")
+async fn backup(dest: &Path) -> Result<()> {
+    let config = Config::from_env()?;
+    let source = Path::new(config.store_dir()).join("karta.db");
+    ops::backup(&source, dest).await?;
+    println!("backup: {} -> {}", source.display(), dest.display());
+    Ok(())
 }
 
-async fn export(dest: &PathBuf) -> Result<()> {
-    bail!("export not yet implemented (destination: {dest:?})")
+async fn export(dest: &Path) -> Result<()> {
+    let config = Config::from_env()?;
+    let handle = KartaHandle::open_mock_for_data_dir(config.store_dir()).await?;
+    let count = ops::export(&handle, dest).await?;
+    println!("export: {count} notes -> {}", dest.display());
+    Ok(())
 }
 
-async fn restore(from: &PathBuf) -> Result<()> {
-    bail!("restore not yet implemented (source: {from:?})")
+async fn restore(from: &Path) -> Result<()> {
+    let config = Config::from_env()?;
+    let data_dir = Path::new(config.store_dir());
+    ops::restore(from, data_dir).await?;
+    println!(
+        "restore: {} -> {}/karta.db",
+        from.display(),
+        data_dir.display()
+    );
+    println!("restart karta-mcp serve to use the restored store");
+    Ok(())
 }
 
 #[cfg(test)]
