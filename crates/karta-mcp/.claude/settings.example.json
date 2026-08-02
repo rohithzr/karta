@@ -24,7 +24,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "*",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "http",
