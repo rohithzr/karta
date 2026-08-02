@@ -89,6 +89,45 @@ karta-mcp restore --from /path/to/karta-backup.db
 
 After restore, restart `serve` to use the restored store.
 
+## Hook templates (Droid and Claude Code)
+
+Example hook configurations are shipped as `.example` files so they are **not**
+activated automatically. copy them into the live config locations and edit as
+needed (manual installation).
+
+### Droid
+
+From the repository root:
+
+```bash
+cp crates/karta-mcp/.factory/hooks.example.json .factory/hooks.json
+cp crates/karta-mcp/.factory/hooks/karta-*.sh .factory/hooks/
+chmod +x .factory/hooks/karta-*.sh
+```
+
+The Droid templates use `command`-type hooks. `SessionStart` calls
+`karta-orient.sh` (which POSTs to `/orient`), and the six capture events call
+`karta-capture.sh` (which POSTs to `/capture` with the correct server-side event
+mapping).
+
+### Claude Code
+
+From the repository root:
+
+```bash
+cp crates/karta-mcp/.claude/settings.example.json .claude/settings.json
+```
+
+The Claude Code template uses `http`-type hooks. `SessionStart` points to
+`/orient`; all other wired events point to `/capture`.
+
+### Port configuration
+
+The Droid helper scripts read `KARTA_CAPTURE_PORT` from the environment and
+default to `3137`, so changing the port does not require editing the scripts.
+The Claude Code example uses the default port in each URL; replace `3137` with
+your configured port if you run karta-mcp on a non-default port.
+
 ## Scheduled backups with launchd (macOS)
 
 Save the following as `~/Library/LaunchAgents/ai.karta.backup.plist` to run a
