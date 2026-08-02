@@ -23,7 +23,9 @@ shapes are:
     value on this machine is `PostToolUse`.
   - `SubagentStop` messages carry `taskName`/`taskResult` fields and may have
     an empty `content` array.
-- `message` with `message.role = "assistant"`:
+  - `PreCompact` messages carry `reason` and `hookToolCallId` and have an empty
+    `content` array.
+- `message` with `message.role = "assistant":
   - `content` may contain `thinking`, `text`, and `tool_use` blocks.
   - `tool_use` blocks have `id`, `name`, and `input`.
 - `message` with `stop = true` or `hookEventName = "SessionEnd"` marks the end

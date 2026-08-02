@@ -108,6 +108,7 @@ pub fn detect_client(path: &str) -> Result<TranscriptClient> {
 /// - `message` with `message.role = "user"` containing `tool_result` blocks
 ///   -> `observation` (tool output)
 /// - `message` with `hookEventName = "SubagentStop"` -> `subagent_result`
+/// - `message` with `hookEventName = "PreCompact"` -> `pre_compact`
 /// - `message` with `message.role = "assistant"` final text -> `turn_summary`
 ///
 /// Malformed JSONL lines are logged and skipped rather than aborting the whole
@@ -146,6 +147,13 @@ pub fn parse_droid_transcript(path: &str) -> Result<Vec<SweptEvent>> {
                         let content = build_subagent_result_content(message);
                         events.push(SweptEvent {
                             event_type: "subagent_result".to_string(),
+                            content,
+                            turn_index: Some(turn_index),
+                        });
+                    } else if hook_event_name == Some("PreCompact") {
+                        let content = build_precompact_content(message);
+                        events.push(SweptEvent {
+                            event_type: "pre_compact".to_string(),
                             content,
                             turn_index: Some(turn_index),
                         });
@@ -381,6 +389,14 @@ fn build_subagent_result_content(message: &Value) -> String {
     format!("task: {task_name} result: {task_result}")
 }
 
+fn build_precompact_content(message: &Value) -> String {
+    let reason = message
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("context-window");
+    format!("pre-compact: reason={reason}")
+}
+
 fn build_claude_observation_content(value: &Value) -> String {
     let tool_name = value
         .get("tool_name")
@@ -496,6 +512,13 @@ mod tests {
                 .content
                 .contains("parser design approved")
         );
+
+        let pre_compact: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "pre_compact")
+            .collect();
+        assert_eq!(pre_compact.len(), 1);
+        assert!(pre_compact[0].content.contains("pre-compact"));
     }
 
     #[test]
@@ -571,6 +594,11 @@ mod tests {
             transcript_notes
                 .iter()
                 .any(|n| n.content.contains("transcript-design-review"))
+        );
+        assert!(
+            transcript_notes
+                .iter()
+                .any(|n| n.content.contains("pre-compact"))
         );
     }
 
