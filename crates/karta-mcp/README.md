@@ -50,13 +50,13 @@ Register `karta-mcp` as a stdio MCP server in your client. The server speaks MCP
 Use the pre-built binary (replace the path with your own):
 
 ```bash
-droid mcp add karta-mcp -- /Users/aj/workspace/karta/target/debug/karta-mcp serve --mock
+droid mcp add karta-mcp -- /path/to/karta/target/debug/karta-mcp serve --mock
 ```
 
 To pass environment variables (for example a custom store directory or capture port):
 
 ```bash
-droid mcp add karta-mcp -- /Users/aj/workspace/karta/target/debug/karta-mcp serve --mock \
+droid mcp add karta-mcp -- /path/to/karta/target/debug/karta-mcp serve --mock \
   --env KARTA_STORE_DIR=/Users/aj/.karta/store \
   --env KARTA_CAPTURE_PORT=3137
 ```
@@ -74,7 +74,7 @@ You can also commit a project-level `.factory/mcp.json`:
   "mcpServers": {
     "karta-mcp": {
       "type": "stdio",
-      "command": "/Users/aj/workspace/karta/target/debug/karta-mcp",
+      "command": "/path/to/karta/target/debug/karta-mcp",
       "args": ["serve", "--mock"],
       "env": {
         "KARTA_STORE_DIR": "/Users/aj/.karta/store",
@@ -90,7 +90,7 @@ You can also commit a project-level `.factory/mcp.json`:
 Register the server from the shell:
 
 ```bash
-claude mcp add karta-mcp -- /Users/aj/workspace/karta/target/debug/karta-mcp serve --mock
+claude mcp add karta-mcp -- /path/to/karta/target/debug/karta-mcp serve --mock
 ```
 
 Or add a project-scoped `.mcp.json` in the repository root:
@@ -100,7 +100,7 @@ Or add a project-scoped `.mcp.json` in the repository root:
   "mcpServers": {
     "karta-mcp": {
       "type": "stdio",
-      "command": "/Users/aj/workspace/karta/target/debug/karta-mcp",
+      "command": "/path/to/karta/target/debug/karta-mcp",
       "args": ["serve", "--mock"]
     }
   }
@@ -222,8 +222,9 @@ After restore, restart `serve` to use the restored store.
 ## Hook templates (Droid and Claude Code)
 
 Example hook configurations are shipped as `.example` files so they are **not**
-activated automatically. copy them into the live config locations and edit as
-needed (manual installation).
+activated automatically. Copy them into the live config locations and edit as
+needed (manual installation). `jq` and `curl` are required for the Droid helper
+scripts.
 
 ### Droid
 

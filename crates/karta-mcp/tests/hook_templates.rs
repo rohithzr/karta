@@ -308,8 +308,11 @@ fn hook_templates_are_examples_not_live_configs() {
         readme.contains(".example"),
         "README must mention the .example template files"
     );
+    let readme_lower = readme.to_lowercase();
     assert!(
-        readme.contains("copy") || readme.contains("install") || readme.contains("manual"),
+        readme_lower.contains("copy")
+            || readme_lower.contains("install")
+            || readme_lower.contains("manual"),
         "README must explain that the templates require manual installation"
     );
 }
