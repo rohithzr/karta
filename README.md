@@ -238,6 +238,7 @@ BEAM_DATASET_PATH=data/beam-100k.json cargo test --test beam_100k beam_100k_sing
 - **[`benchmarks/`](./benchmarks/)** — benchmark results, reproduction commands, experiment logs
 - **[`docs/landscape.md`](./docs/landscape.md)** — AI memory systems landscape research
 - **[`docs/retrieval-plan.md`](./docs/retrieval-plan.md)** — open retrieval experiment backlog
+- **[`docs/security.md`](./docs/security.md)** — security notes: network egress surface, known findings, integration checklist
 - **[`CONTRIBUTING.md`](./CONTRIBUTING.md)** — how to contribute
 - **[`CHANGELOG.md`](./CHANGELOG.md)** — release notes
 
