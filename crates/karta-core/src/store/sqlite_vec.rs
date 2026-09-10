@@ -17,7 +17,7 @@ pub struct SqliteVectorStore {
 impl SqliteVectorStore {
     /// Open (or create) a SQLite vector store at `data_dir/karta.db`.
     ///
-    /// Registers the sqlite-vec FFI extension, enables WAL mode, and
+    /// Registers the sqlite-vec FFI extension, enables DELETE journal mode, and
     /// initialises the schema before returning.
     pub async fn new(data_dir: &str, embedding_dim: usize) -> Result<Self> {
         // Register the sqlite-vec extension process-globally before any
@@ -36,7 +36,9 @@ impl SqliteVectorStore {
         let conn = Connection::open(&path)
             .map_err(|e| KartaError::VectorStore(e.to_string()))?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        // DELETE mode works on mounted network filesystems where WAL shared-memory
+        // files are not available, including the Cloud Run volume used by karta-server.
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA foreign_keys=ON;")
             .map_err(|e| KartaError::VectorStore(e.to_string()))?;
 
         let store = Self {
