@@ -6,9 +6,9 @@ license.workspace = true
 description = "Agentic memory system that thinks, not just stores"
 
 [features]
-default = ["lance", "sqlite", "openai"]
-lance = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
+default = ["sqlite-vec", "sqlite", "openai"]
 sqlite = ["dep:rusqlite"]
+sqlite-vec = ["dep:sqlite-vec", "dep:rusqlite"]
 openai = ["dep:async-openai"]
 
 [dependencies]
@@ -31,7 +31,7 @@ thiserror = "2"
 anyhow = "1"
 
 # HTTP client (for reranker APIs)
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # Logging
 tracing = "0.1"
@@ -39,13 +39,14 @@ tracing = "0.1"
 # Env
 dotenvy = "0.15"
 
-# Vector store: LanceDB
-lancedb = { version = "0.27", optional = true, features = ["gcs"] }
-arrow-array = { version = "57", optional = true }
-arrow-schema = { version = "57", optional = true }
+# Regex (tier 1 temporal resolver)
+regex = "1"
 
 # Graph store: SQLite
 rusqlite = { version = "0.35", features = ["bundled"], optional = true }
+
+# Vector store: sqlite-vec
+sqlite-vec = { version = "=0.1.10-alpha.3", optional = true }
 
 # LLM: OpenAI-compatible
 async-openai = { version = "0.27", optional = true }
@@ -53,3 +54,4 @@ async-openai = { version = "0.27", optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 uuid = { version = "1", features = ["v4"] }
+tempfile = "3"

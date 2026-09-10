@@ -5,6 +5,7 @@ use chrono::Utc;
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use crate::clock::ClockContext;
 use crate::config::DreamConfig;
 use crate::error::Result;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
@@ -12,6 +13,18 @@ use crate::note::{MemoryNote, Provenance};
 use crate::store::{GraphStore, VectorStore};
 
 use super::types::{DreamRecord, DreamRun, DreamType};
+
+/// max(input.source_timestamp) across a dream's input batch — the bounded
+/// claim used to stamp dream-output notes. Falls back to ctx.reference_time()
+/// for an empty batch (defensive; the caller currently never passes an
+/// empty slice but this keeps the helper total).
+fn max_source_timestamp(notes: &[&MemoryNote], ctx: ClockContext) -> chrono::DateTime<chrono::Utc> {
+    notes
+        .iter()
+        .map(|n| n.source_timestamp)
+        .max()
+        .unwrap_or_else(|| ctx.reference_time())
+}
 
 pub struct DreamEngine {
     vector_store: Arc<dyn VectorStore>,
@@ -40,13 +53,27 @@ impl DreamEngine {
         scope_type: &str,
         scope_id: &str,
     ) -> Result<DreamRun> {
+        self.run_with_clock(scope_type, scope_id, ClockContext::now()).await
+    }
+
+    /// Snapshot semantics (codex #8): one read of the input batch, one
+    /// fixed reference_time for the entire run. Concurrent writes after
+    /// `vector_store.get_all()` returns don't affect this run's outputs.
+    pub async fn run_with_clock(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        ctx: ClockContext,
+    ) -> Result<DreamRun> {
         let run_id = Uuid::new_v4().to_string();
         let started_at = Utc::now();
         let mut total_tokens: u64 = 0;
         let mut dreams: Vec<DreamRecord> = Vec::new();
 
-        // Expire stale foresight signals
-        let expired = self.graph_store.expire_foresights(Utc::now()).await?;
+        // Expire stale foresight signals against the data's reference_time,
+        // not the wall clock. A foresight extracted from a 2024 message at
+        // a 2024 reference_time should expire on its own 2024 calendar.
+        let expired = self.graph_store.expire_foresights(ctx.reference_time()).await?;
         if expired > 0 {
             debug!(expired = expired, "Expired foresight signals");
         }
@@ -54,7 +81,8 @@ impl DreamEngine {
         // Get dream cursor for incremental processing
         let cursor = self.graph_store.get_dream_cursor().await?;
 
-        // Get all non-dream notes, filtered by cursor for incremental runs
+        // Snapshot the input batch once. Everything downstream — clustering,
+        // dreaming, foresight expiry — sees the same set of notes.
         let all_notes: Vec<MemoryNote> = self
             .vector_store
             .get_all()
@@ -114,13 +142,16 @@ impl DreamEngine {
             .filter_map(|s| DreamType::from_str(s))
             .collect();
 
-        // Per-cluster dreams (with dedup)
+        // Per-cluster dreams (with dedup). source_timestamp for any persisted
+        // dream-note = max(input.source_timestamp) — the bounded claim.
         for cluster in &clusters {
+            let evidence_max = max_source_timestamp(cluster, ctx);
+
             if enabled.contains(&DreamType::Consolidation) && cluster.len() >= 3 {
                 let (dream, tokens) = self.dream_consolidation(cluster).await?;
                 total_tokens += tokens;
                 if dream.would_write && !self.is_duplicate_dream(&dream).await? {
-                    self.persist_dream(&dream).await?;
+                    self.persist_dream(&dream, evidence_max).await?;
                 }
                 dreams.push(dream);
             }
@@ -129,7 +160,7 @@ impl DreamEngine {
                 let (dream, tokens) = self.dream_deduction(cluster).await?;
                 total_tokens += tokens;
                 if dream.would_write && !self.is_duplicate_dream(&dream).await? {
-                    self.persist_dream(&dream).await?;
+                    self.persist_dream(&dream, evidence_max).await?;
                 }
                 dreams.push(dream);
             }
@@ -138,7 +169,7 @@ impl DreamEngine {
                 let (dream, tokens) = self.dream_contradiction(cluster).await?;
                 total_tokens += tokens;
                 if dream.would_write && !self.is_duplicate_dream(&dream).await? {
-                    self.persist_dream(&dream).await?;
+                    self.persist_dream(&dream, evidence_max).await?;
                 }
                 dreams.push(dream);
             }
@@ -148,15 +179,15 @@ impl DreamEngine {
         let max = self.config.max_notes_per_prompt;
 
         if enabled.contains(&DreamType::Induction) && notes_to_process.len() >= 4 {
-            // Run induction across multiple windows of notes
             for chunk in notes_to_process.chunks(max) {
                 if chunk.len() < 4 {
                     continue;
                 }
+                let evidence_max = max_source_timestamp(chunk, ctx);
                 let (dream, tokens) = self.dream_induction(chunk).await?;
                 total_tokens += tokens;
                 if dream.would_write && !self.is_duplicate_dream(&dream).await? {
-                    self.persist_dream(&dream).await?;
+                    self.persist_dream(&dream, evidence_max).await?;
                 }
                 dreams.push(dream);
             }
@@ -167,10 +198,11 @@ impl DreamEngine {
                 if chunk.len() < 3 {
                     continue;
                 }
-                let (dream, tokens) = self.dream_abduction(chunk).await?;
+                let evidence_max = max_source_timestamp(chunk, ctx);
+                let (dream, tokens) = self.dream_abduction(chunk, ctx).await?;
                 total_tokens += tokens;
                 if dream.would_write && !self.is_duplicate_dream(&dream).await? {
-                    self.persist_dream(&dream).await?;
+                    self.persist_dream(&dream, evidence_max).await?;
                 }
                 dreams.push(dream);
             }
@@ -186,11 +218,16 @@ impl DreamEngine {
                     if !episode.note_ids.is_empty() {
                         let note_refs: Vec<&str> = episode.note_ids.iter().map(|s| s.as_str()).collect();
                         if let Ok(ep_notes) = self.vector_store.get_many(&note_refs).await {
-                            match self.dream_episode_digest(&episode, &ep_notes).await {
+                            let evidence_max = ep_notes
+                                .iter()
+                                .map(|n| n.source_timestamp)
+                                .max()
+                                .unwrap_or_else(|| ctx.reference_time());
+                            match self.dream_episode_digest(&episode, &ep_notes, evidence_max).await {
                                 Ok((dream, tokens)) => {
                                     total_tokens += tokens;
                                     if dream.would_write {
-                                        let _ = self.persist_dream(&dream).await;
+                                        let _ = self.persist_dream(&dream, evidence_max).await;
                                     }
                                     dreams.push(dream);
                                 }
@@ -212,7 +249,7 @@ impl DreamEngine {
                         Ok((dream, tokens)) => {
                             total_tokens += tokens;
                             if dream.would_write && !self.is_duplicate_dream(&dream).await.unwrap_or(false) {
-                                let _ = self.persist_dream(&dream).await;
+                                let _ = self.persist_dream(&dream, ctx.reference_time()).await;
                             }
                             dreams.push(dream);
                         }
@@ -406,7 +443,11 @@ impl DreamEngine {
         ))
     }
 
-    async fn dream_abduction(&self, notes: &[&MemoryNote]) -> Result<(DreamRecord, u64)> {
+    async fn dream_abduction(
+        &self,
+        notes: &[&MemoryNote],
+        ctx: ClockContext,
+    ) -> Result<(DreamRecord, u64)> {
         let notes_text = Self::format_notes(notes);
         let prompt = Prompts::dream_abduction(&notes_text);
 
@@ -419,13 +460,15 @@ impl DreamEngine {
 
         let dream_id = Uuid::new_v4().to_string();
 
-        // Emit foresight signal from hypothesis if it's forward-looking
+        // Abductive foresight TTL anchors to ctx.reference_time(), not Utc::now().
+        // 90 days from the data's "now" — survives a back-dated query with the
+        // matched reference_time; expires correctly on a wall-clock dream pass.
         if let Some(ref h) = hypothesis {
             if would_write {
                 let fs = crate::note::ForesightSignal::new(
                     h.clone(),
                     dream_id.clone(),
-                    Some(chrono::Utc::now() + chrono::Duration::days(90)),
+                    Some(ctx.reference_time() + chrono::Duration::days(90)),
                 );
                 let _ = self.graph_store.upsert_foresight(&fs).await;
             }
@@ -548,7 +591,9 @@ impl DreamEngine {
             status: crate::note::NoteStatus::Active,
             last_accessed_at: Utc::now(),
             turn_index: None,
-            source_timestamp: None,
+            source_timestamp: Utc::now(),
+            session_id: None,
+            seq: 0,
         };
 
         self.vector_store.upsert(&note).await?;
@@ -641,7 +686,11 @@ impl DreamEngine {
 
     // --- Persist dream as a note ---
 
-    async fn persist_dream(&self, dream: &DreamRecord) -> Result<()> {
+    async fn persist_dream(
+        &self,
+        dream: &DreamRecord,
+        source_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
         let embedding_text = &dream.dream_content;
         let embeddings = self.llm.embed(&[embedding_text]).await?;
         let embedding = embeddings.into_iter().next().unwrap_or_default();
@@ -686,7 +735,10 @@ impl DreamEngine {
             status: crate::note::NoteStatus::Active,
             last_accessed_at: dream.created_at,
             turn_index: None,
-            source_timestamp: None,
+            // bounded claim: this inference is as fresh as its newest evidence.
+            source_timestamp,
+            session_id: None,
+            seq: 0,
         };
 
         self.vector_store.upsert(&note).await?;
@@ -713,10 +765,12 @@ impl DreamEngine {
         &self,
         episode: &crate::note::Episode,
         notes: &[MemoryNote],
+        source_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<(DreamRecord, u64)> {
         use crate::llm::Prompts;
         use crate::note::{
             AggregationEntry, DateRange, EntityMention, EpisodeDigest, NoteStatus, Provenance,
+            TimedEvent,
         };
 
         let notes_text: String = notes.iter().enumerate()
@@ -730,7 +784,7 @@ impl DreamEngine {
             content: prompt,
         }];
         let config = crate::llm::GenConfig {
-            max_tokens: 4096,
+            max_tokens: 6144,
             temperature: 0.0,
             json_mode: true,
             json_schema: None,
@@ -778,6 +832,22 @@ impl DreamEngine {
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
 
+        let events: Vec<TimedEvent> = parsed["timed_events"].as_array()
+            .map(|a| a.iter().filter_map(|v| {
+                let description = v["description"].as_str()?.trim();
+                if description.is_empty() { return None; }
+                Some(TimedEvent {
+                    description: description.to_string(),
+                    date: v["date"].as_str().and_then(|s| {
+                        let s = s.trim();
+                        if s.is_empty() || s.eq_ignore_ascii_case("null") { None }
+                        else { Some(s.to_string()) }
+                    }),
+                    source_turn: v["source_turn"].as_u64().map(|n| n as u32),
+                })
+            }).collect())
+            .unwrap_or_default();
+
         // Create digest note for ANN searchability
         let mut digest_note_id = None;
         if !digest_text.is_empty() {
@@ -800,7 +870,10 @@ impl DreamEngine {
                 status: NoteStatus::Active,
                 last_accessed_at: Utc::now(),
                 turn_index: None,
-                source_timestamp: None,
+                // bounded claim: digest freshness == newest evidence.
+                source_timestamp,
+                session_id: None,
+                seq: 0,
             };
 
             digest_note_id = Some(note.id.clone());
@@ -815,6 +888,7 @@ impl DreamEngine {
             date_range,
             aggregations,
             topic_sequence,
+            events,
             digest_text: digest_text.clone(),
             digest_note_id: digest_note_id.clone(),
             created_at: Utc::now(),
@@ -830,6 +904,7 @@ impl DreamEngine {
             episode_id = %episode.id,
             entities = digest.entities.len(),
             aggregations = digest.aggregations.len(),
+            events = digest.events.len(),
             "Episode digest created"
         );
 
@@ -853,6 +928,10 @@ impl DreamEngine {
         digests: &[crate::note::EpisodeDigest],
     ) -> Result<(DreamRecord, u64)> {
         use crate::llm::Prompts;
+        use crate::note::{
+            AggregationEntry, CrossEpisodeDigest, EntityTimelineChange, EntityTimelineEntry,
+            TimedEvent,
+        };
 
         // Build mapping from display labels to real episode UUIDs
         // The LLM may return "Episode 1" or the UUID — we need to resolve both
@@ -862,15 +941,29 @@ impl DreamEngine {
             label_to_uuid.insert(d.episode_id.clone(), d.episode_id.clone()); // UUID maps to itself
         }
 
+        // Pass the per-episode events through so the LLM can dedupe/merge them
+        // instead of re-inferring from digest text alone.
         let digests_text: String = digests.iter().enumerate()
-            .map(|(i, d)| format!(
-                "[Episode {} (id={})] {}\n  Entities: {}\n  Topics: {}",
-                i + 1,
-                d.episode_id,
-                d.digest_text,
-                d.entities.iter().map(|e| format!("{}({})", e.name, e.count)).collect::<Vec<_>>().join(", "),
-                d.topic_sequence.join(" → "),
-            ))
+            .map(|(i, d)| {
+                let events_line = if d.events.is_empty() {
+                    String::new()
+                } else {
+                    let inline: Vec<String> = d.events.iter().take(20).map(|e| {
+                        let date = e.date.as_deref().unwrap_or("?");
+                        format!("{}: {}", date, e.description)
+                    }).collect();
+                    format!("\n  Events: {}", inline.join(" | "))
+                };
+                format!(
+                    "[Episode {} (id={})] {}\n  Entities: {}\n  Topics: {}{}",
+                    i + 1,
+                    d.episode_id,
+                    d.digest_text,
+                    d.entities.iter().map(|e| format!("{}({})", e.name, e.count)).collect::<Vec<_>>().join(", "),
+                    d.topic_sequence.join(" → "),
+                    events_line,
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n\n");
 
@@ -880,7 +973,7 @@ impl DreamEngine {
             content: prompt,
         }];
         let config = crate::llm::GenConfig {
-            max_tokens: 4096,
+            max_tokens: 6144,
             temperature: 0.0,
             json_mode: true,
             json_schema: None,
@@ -893,41 +986,101 @@ impl DreamEngine {
         let confidence = parsed["confidence"].as_f64().unwrap_or(0.6) as f32;
         let digest_text = parsed["digest_text"].as_str().unwrap_or("").to_string();
 
-        // Create episode links from entity timelines
-        // Resolve LLM-returned episode IDs ("Episode 1" or UUID) to real UUIDs
-        if let Some(timelines) = parsed["entity_timeline"].as_array() {
-            for timeline in timelines {
-                let entity_name = timeline["name"].as_str().unwrap_or("");
-                if let Some(changes) = timeline["changes"].as_array() {
-                    // Resolve each episode_id through the label mapping
-                    let episode_ids: Vec<String> = changes.iter()
-                        .filter_map(|c| {
-                            let raw = c["episode_id"].as_str()?;
-                            label_to_uuid.get(raw).cloned()
+        // Parse structured fields for persistent storage
+        let entity_timeline: Vec<EntityTimelineEntry> = parsed["entity_timeline"].as_array()
+            .map(|a| a.iter().filter_map(|v| {
+                let name = v["name"].as_str()?.to_string();
+                let entity_type = v["type"].as_str().unwrap_or("other").to_string();
+                let changes: Vec<EntityTimelineChange> = v["changes"].as_array()
+                    .map(|arr| arr.iter().filter_map(|c| {
+                        let raw = c["episode_id"].as_str()?;
+                        let resolved = label_to_uuid.get(raw).cloned().unwrap_or_else(|| raw.to_string());
+                        Some(EntityTimelineChange {
+                            episode_id: resolved,
+                            value: c["value"].as_str().unwrap_or("").to_string(),
                         })
-                        .collect();
+                    }).collect())
+                    .unwrap_or_default();
+                Some(EntityTimelineEntry { name, entity_type, changes })
+            }).collect())
+            .unwrap_or_default();
 
-                    // Link each pair of episodes for this entity
-                    for window in episode_ids.windows(2) {
-                        if window.len() == 2 {
-                            let has_value_change = changes.iter()
-                                .filter(|c| {
-                                    let resolved = c["episode_id"].as_str()
-                                        .and_then(|r| label_to_uuid.get(r));
-                                    resolved == Some(&window[0]) || resolved == Some(&window[1])
-                                })
-                                .map(|c| c["value"].as_str().unwrap_or(""))
-                                .collect::<std::collections::HashSet<_>>()
-                                .len() > 1;
+        let cross_aggregations: Vec<AggregationEntry> = parsed["cross_aggregations"].as_array()
+            .map(|a| a.iter().filter_map(|v| {
+                Some(AggregationEntry {
+                    label: v["label"].as_str()?.to_string(),
+                    count: v["count"].as_u64().unwrap_or(0) as u32,
+                    items: v["items"].as_array()
+                        .map(|arr| arr.iter().filter_map(|i| i.as_str().map(String::from)).collect())
+                        .unwrap_or_default(),
+                })
+            }).collect())
+            .unwrap_or_default();
 
-                            let link_type = if has_value_change { "value_update" } else { "entity_continuity" };
-                            let reason = format!("{} appears in both episodes", entity_name);
-                            let _ = self.graph_store.add_episode_link(
-                                &window[0], &window[1], link_type, Some(entity_name), &reason
-                            ).await;
-                        }
-                    }
+        let cross_events: Vec<TimedEvent> = parsed["timed_events"].as_array()
+            .map(|a| a.iter().filter_map(|v| {
+                let description = v["description"].as_str()?.trim();
+                if description.is_empty() { return None; }
+                Some(TimedEvent {
+                    description: description.to_string(),
+                    date: v["date"].as_str().and_then(|s| {
+                        let s = s.trim();
+                        if s.is_empty() || s.eq_ignore_ascii_case("null") { None }
+                        else { Some(s.to_string()) }
+                    }),
+                    source_turn: v["source_turn"].as_u64().map(|n| n as u32),
+                })
+            }).collect())
+            .unwrap_or_default();
+
+        let topic_progression: Vec<String> = parsed["topic_progression"].as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        // Create episode links from entity timelines
+        for timeline in &entity_timeline {
+            let episode_ids: Vec<String> = timeline.changes.iter()
+                .map(|c| c.episode_id.clone())
+                .collect();
+
+            for window in episode_ids.windows(2) {
+                if window.len() == 2 {
+                    let has_value_change = timeline.changes.iter()
+                        .filter(|c| c.episode_id == window[0] || c.episode_id == window[1])
+                        .map(|c| c.value.as_str())
+                        .collect::<std::collections::HashSet<_>>()
+                        .len() > 1;
+
+                    let link_type = if has_value_change { "value_update" } else { "entity_continuity" };
+                    let reason = format!("{} appears in both episodes", timeline.name);
+                    let _ = self.graph_store.add_episode_link(
+                        &window[0], &window[1], link_type, Some(&timeline.name), &reason
+                    ).await;
                 }
+            }
+        }
+
+        // Persist structured cross-level digest so query-time retrieval can read it
+        if !digest_text.is_empty() {
+            let cross_digest = CrossEpisodeDigest {
+                id: Uuid::new_v4().to_string(),
+                scope_id: "default".to_string(),
+                entity_timeline,
+                cross_aggregations,
+                events: cross_events.clone(),
+                topic_progression,
+                digest_text: digest_text.clone(),
+                created_at: Utc::now(),
+            };
+            if let Err(e) = self.graph_store.upsert_cross_episode_digest(&cross_digest).await {
+                debug!(error = %e, "Failed to persist cross-episode digest");
+            } else {
+                debug!(
+                    entities = cross_digest.entity_timeline.len(),
+                    aggregations = cross_digest.cross_aggregations.len(),
+                    events = cross_digest.events.len(),
+                    "Cross-episode digest stored"
+                );
             }
         }
 
@@ -939,7 +1092,8 @@ impl DreamEngine {
             id: Uuid::new_v4().to_string(),
             dream_type: DreamType::CrossEpisodeDigest,
             source_note_ids: source_ids,
-            reasoning: format!("Cross-episode digest across {} episodes", digests.len()),
+            reasoning: format!("Cross-episode digest across {} episodes ({} merged events)",
+                digests.len(), cross_events.len()),
             dream_content: digest_text,
             confidence,
             would_write: confidence >= self.config.write_threshold,

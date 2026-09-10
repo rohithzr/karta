@@ -21,4 +21,11 @@ pub enum KartaError {
     NoteNotFound(String),
 }
 
+#[cfg(feature = "sqlite-vec")]
+impl From<rusqlite::Error> for KartaError {
+    fn from(e: rusqlite::Error) -> Self {
+        KartaError::VectorStore(e.to_string())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, KartaError>;

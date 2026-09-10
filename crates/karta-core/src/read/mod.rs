@@ -1,15 +1,44 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use tracing::{debug, info};
 
+pub mod temporal;
+pub mod resolve;
+pub mod resolve_llm;
+
+use crate::clock::ClockContext;
 use crate::config::ReadConfig;
 use crate::error::Result;
+use crate::extract::slots::Predicate;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
-use crate::note::{AskResult, MemoryNote, Provenance, SearchResult};
+use crate::note::{AskResult, FetchedMemories, MemoryNote, Provenance, SearchResult};
 use crate::rerank::{Reranker, RerankerConfig};
+use crate::store::slot_ledger::{LedgerRow, SlotLedger};
 use crate::store::{GraphStore, VectorStore};
+
+/// Chronological ordering comparator for notes: seq (true global order) takes
+/// precedence over the legacy turn_index/source_timestamp heuristic. Notes
+/// with `seq == 0` (legacy/unsequenced) fall back to the original
+/// turn_index > source_timestamp ordering exactly, so existing behavior for
+/// pre-substrate data is unchanged.
+pub(crate) fn note_order_cmp(a: &MemoryNote, b: &MemoryNote) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.seq, b.seq) {
+        // Both unsequenced (legacy/synthetic notes): preserve the prior
+        // turn_index > source_timestamp ordering exactly.
+        (0, 0) => match (a.turn_index, b.turn_index) {
+            (Some(ai), Some(bi)) => ai.cmp(&bi),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => a.source_timestamp.cmp(&b.source_timestamp),
+        },
+        // At least one is sequenced: global seq is the true total order.
+        // Tie-break equal seq by source_timestamp for determinism.
+        _ => a.seq.cmp(&b.seq).then_with(|| a.source_timestamp.cmp(&b.source_timestamp)),
+    }
+}
 
 /// Query classification for mode-specific retrieval behavior.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -202,15 +231,205 @@ fn classify_query_keywords(query: &str) -> QueryMode {
     QueryMode::Standard
 }
 
+/// Lightweight regex/keyword pre-filter that flags queries containing temporal
+/// indicators (relative phrases, weekday/month names, year tokens, ISO dates).
+///
+/// Used by the query classifier to set [`QueryClassification::temporal`] which
+/// in turn enables interval-overlap SQL filtering at retrieval time. This is
+/// purely lexical — semantic temporal intent is captured separately by
+/// [`QueryMode::Temporal`] via embedding similarity.
+pub(crate) fn has_temporal_indicator(query: &str) -> bool {
+    let q = query.to_lowercase();
+
+    let keywords = [
+        "when", "last ", "next ", "yesterday", "today", "tomorrow",
+        "before", "after", "during", "recently", "this week",
+        "this month", "this year", "this quarter",
+    ];
+    if keywords.iter().any(|k| q.contains(k)) {
+        return true;
+    }
+
+    let months = [
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+    ];
+    if months.iter().any(|m| q.contains(m)) {
+        return true;
+    }
+
+    let days = [
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    ];
+    if days.iter().any(|d| q.contains(d)) {
+        return true;
+    }
+
+    // 4-digit year (1900–2099) — also catches ISO dates like 2024-03-15.
+    static YEAR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = YEAR_RE.get_or_init(|| regex::Regex::new(r"\b(19|20)\d{2}\b").unwrap());
+    re.is_match(&q)
+}
+
+/// Public, integration-test-visible wrapper around [`has_temporal_indicator`].
+///
+/// Crate-internal callers should prefer the `pub(crate)` helper; this wrapper
+/// exists so tests under `crates/karta-core/tests/` (which see only `pub` API)
+/// can verify the temporal pre-filter.
+pub fn query_is_temporal(q: &str) -> bool {
+    has_temporal_indicator(q)
+}
+
+/// Output of the query classifier: the mode bucket plus auxiliary flags that
+/// downstream retrieval uses to gate behavior (e.g. interval-overlap SQL).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueryClassification {
+    pub mode: QueryMode,
+    /// True when the query contains lexical temporal indicators (weekday/month
+    /// names, year/ISO dates, "yesterday/last week/before/after/...").
+    /// Set independently of `mode` — a query can be `QueryMode::Standard` and
+    /// still be temporal (e.g. "did I deploy on March 15").
+    pub temporal: bool,
+}
+
+/// Keyword-only classifier that returns the full [`QueryClassification`]
+/// (mode + `temporal` flag). Embedding-based callers compose this with the
+/// embedding-derived mode separately; see `ReadEngine::search_wide`.
+pub fn classify_query(query: &str) -> QueryClassification {
+    QueryClassification {
+        mode: classify_query_keywords(query),
+        temporal: has_temporal_indicator(query),
+    }
+}
+
+/// Map a free-text query to a mutable-slot [`Predicate`] via keyword
+/// matching, ordered so more-specific phrases are checked before more
+/// general ones. Returns `None` if nothing matches — the caller should
+/// then skip ledger injection entirely.
+fn query_predicate(query: &str) -> Option<Predicate> {
+    let q = query.to_lowercase();
+
+    if q.contains("deadline") || q.contains("due") {
+        return Some(Predicate::Deadline);
+    }
+    if q.contains("how many") || q.contains("count") || q.contains("number of") {
+        return Some(Predicate::Count);
+    }
+    if q.contains("role") || q.contains("title") || q.contains("job") {
+        return Some(Predicate::RoleTitle);
+    }
+    if q.contains("employer") || q.contains("work for") || q.contains("company") {
+        return Some(Predicate::Employer);
+    }
+    if q.contains("where") || q.contains("location") || q.contains("located") {
+        return Some(Predicate::Location);
+    }
+    if q.contains("status") {
+        return Some(Predicate::Status);
+    }
+    if q.contains("scheduled") || q.contains("when is") {
+        return Some(Predicate::ScheduledDate);
+    }
+    if q.contains("amount") || q.contains("salary") || q.contains("cost") || q.contains("price") {
+        return Some(Predicate::Amount);
+    }
+    if q.contains("using") || q.contains("tech") || q.contains("tool") || q.contains("stack") {
+        return Some(Predicate::TechChoice);
+    }
+    if q.contains("prefer") || q.contains("preference") || q.contains("favorite") {
+        return Some(Predicate::Preference);
+    }
+    if q.contains("own") || q.contains("owner") {
+        return Some(Predicate::Ownership);
+    }
+    if q.contains("metric") || q.contains("accuracy") || q.contains("latency") || q.contains("score") {
+        return Some(Predicate::MetricValue);
+    }
+    None
+}
+
+/// Render a Spike-4 style context block for mutable-slot ledger rows: one
+/// `[CURRENT] entity predicate = value (as of date)` line per row, or a
+/// `[CONFLICT] entity predicate: both "a" and "b" stated` line when 2+ rows
+/// share the same `conflict_group`. Pure and side-effect free.
+pub(crate) fn build_ledger_block(rows: &[LedgerRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    // Group rows by conflict_group (if any) while preserving encounter order.
+    let mut conflict_order: Vec<i64> = Vec::new();
+    let mut conflict_groups: std::collections::HashMap<i64, Vec<&LedgerRow>> =
+        std::collections::HashMap::new();
+    let mut singles: Vec<&LedgerRow> = Vec::new();
+
+    for row in rows {
+        match row.conflict_group {
+            Some(cg) => {
+                let entry = conflict_groups.entry(cg).or_insert_with(|| {
+                    conflict_order.push(cg);
+                    Vec::new()
+                });
+                entry.push(row);
+            }
+            None => singles.push(row),
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+
+    for cg in &conflict_order {
+        let group = &conflict_groups[cg];
+        if group.len() < 2 {
+            // Not actually a conflict (only one row tagged) — treat as CURRENT.
+            for row in group {
+                lines.push(render_current_line(row));
+            }
+            continue;
+        }
+        let first = group[0];
+        let values: Vec<String> = group.iter().map(|r| format!("\"{}\"", r.value)).collect();
+        let joined = if values.len() == 2 {
+            format!("{} and {}", values[0], values[1])
+        } else {
+            values.join(", ")
+        };
+        lines.push(format!(
+            "[CONFLICT] {} {}: both {} stated",
+            first.entity_key, first.predicate, joined
+        ));
+    }
+
+    for row in &singles {
+        lines.push(render_current_line(row));
+    }
+
+    lines.join("\n")
+}
+
+fn render_current_line(row: &LedgerRow) -> String {
+    let date = row
+        .valid_from
+        .unwrap_or(row.mention_time)
+        .format("%Y-%m-%d");
+    format!(
+        "[CURRENT] {} {} = {} (as of {})",
+        row.entity_key, row.predicate, row.value, date
+    )
+}
+
 /// Handles the read path: search, graph traversal, reranking, synthesis.
 pub struct ReadEngine {
     vector_store: Arc<dyn VectorStore>,
     graph_store: Arc<dyn GraphStore>,
     llm: Arc<dyn LlmProvider>,
+    synthesis_llm: Option<Arc<dyn LlmProvider>>,
     reranker: Arc<dyn Reranker>,
     config: ReadConfig,
     reranker_config: RerankerConfig,
     classifier: tokio::sync::OnceCell<QueryClassifier>,
+    slot_ledger: Option<Arc<SlotLedger>>,
+    entity_aliases: Option<Arc<Mutex<crate::extract::entity_key::EntityAliases>>>,
 }
 
 impl ReadEngine {
@@ -218,6 +437,7 @@ impl ReadEngine {
         vector_store: Arc<dyn VectorStore>,
         graph_store: Arc<dyn GraphStore>,
         llm: Arc<dyn LlmProvider>,
+        synthesis_llm: Option<Arc<dyn LlmProvider>>,
         reranker: Arc<dyn Reranker>,
         config: ReadConfig,
         reranker_config: RerankerConfig,
@@ -226,11 +446,40 @@ impl ReadEngine {
             vector_store,
             graph_store,
             llm,
+            synthesis_llm,
             reranker,
             config,
             reranker_config,
             classifier: tokio::sync::OnceCell::new(),
+            slot_ledger: None,
+            entity_aliases: None,
         }
+    }
+
+    /// Attach the shared mutable-slot ledger so synthesis can inject
+    /// [CURRENT]/[CONFLICT] context for queries about mutable facts.
+    pub(crate) fn attach_slot_ledger(&mut self, ledger: Arc<SlotLedger>) {
+        self.slot_ledger = Some(ledger);
+    }
+
+    /// Attach the shared write-time entity-alias table (read-only lookups
+    /// only — the read path never inserts new aliases).
+    pub(crate) fn set_entity_aliases(
+        &mut self,
+        aliases: Arc<Mutex<crate::extract::entity_key::EntityAliases>>,
+    ) {
+        self.entity_aliases = Some(aliases);
+    }
+
+    /// LLM used for the final answer-synthesis call. Defaults to `self.llm`
+    /// (same as all internal Karta work) unless an explicit override was
+    /// configured — lets the caller route only the user-facing answer step
+    /// to a different model while keeping ingest/dream/retrieval on the
+    /// primary LLM.
+    fn synth_llm(&self) -> &dyn LlmProvider {
+        self.synthesis_llm
+            .as_deref()
+            .unwrap_or_else(|| self.llm.as_ref())
     }
 
     /// Get or initialize the embedding-based query classifier.
@@ -256,15 +505,18 @@ impl ReadEngine {
 
     /// Compute a recency score for a note using exponential decay.
     /// Returns 1.0 for brand new notes, decaying toward 0.0 for old notes.
-    fn recency_score(&self, note: &MemoryNote) -> f32 {
-        let age_days = Utc::now()
-            .signed_duration_since(note.updated_at)
+    /// Uses source_timestamp (the data's "now" at ingest) and the query's
+    /// reference_time, NOT Utc::now() — replays must age relative to the
+    /// query, not the wall clock.
+    fn recency_score(&self, note: &MemoryNote, ctx: ClockContext) -> f32 {
+        // Forward-date clamp (codex #2). If source_timestamp is past
+        // reference_time (clock skew, future-dated import, bug), age_days
+        // goes negative — clamp at 0.0 so recency = 1.0 (treated as
+        // fresh-as-possible). Better than producing decay > 1 or NaN.
+        let age_days = (ctx.reference_time() - note.source_timestamp)
             .num_seconds() as f64
             / 86400.0;
-
-        if age_days <= 0.0 {
-            return 1.0;
-        }
+        let age_days = age_days.max(0.0);
 
         // Exponential decay: score = 0.5^(age / half_life)
         let half_life = self.config.recency_half_life_days.max(1.0);
@@ -273,10 +525,48 @@ impl ReadEngine {
 
     /// Combine similarity score with recency to produce a final score.
     /// Accepts an explicit recency weight for mode-specific overrides.
-    fn blended_score_with_weight(&self, similarity: f32, note: &MemoryNote, recency_weight: f32) -> f32 {
+    fn blended_score_with_weight(
+        &self,
+        similarity: f32,
+        note: &MemoryNote,
+        recency_weight: f32,
+        ctx: ClockContext,
+    ) -> f32 {
         let w = recency_weight.clamp(0.0, 1.0);
-        let recency = self.recency_score(note);
+        let recency = self.recency_score(note, ctx);
         (1.0 - w) * similarity + w * recency
+    }
+
+    /// Fetch the last `n` user-turn notes from a session for tier 2
+    /// temporal-resolver context. Returns empty when session context is
+    /// unavailable (the common case on `search_wide` today) or on any
+    /// store error — the tier 2 resolver tolerates a missing recent-turn
+    /// list and anchors on `reference_time` instead.
+    ///
+    /// Plumbing a real session_id end-to-end is a follow-up; today's read
+    /// path doesn't thread one, so callers pass `None` and get an empty
+    /// vec.
+    async fn recent_user_turns_in_session(
+        &self,
+        session_id: Option<&str>,
+        n: usize,
+    ) -> Option<Vec<String>> {
+        let sid = session_id?;
+        let eps = self.graph_store.get_episodes_for_session(sid).await.ok()?;
+        let last_ep = eps.last()?;
+        let note_ids = self
+            .graph_store
+            .get_notes_for_episode(&last_ep.id)
+            .await
+            .ok()?;
+        let mut out = Vec::new();
+        for id in note_ids.iter().rev().take(n) {
+            if let Ok(Some(note)) = self.vector_store.get(id).await {
+                out.push(note.content);
+            }
+        }
+        out.reverse();
+        Some(out)
     }
 
     /// Drill into an episode: fetch constituent notes, filter active, sort chronologically.
@@ -295,20 +585,8 @@ impl ReadEngine {
             .filter(|n| n.is_active())
             .collect();
 
-        // Chronological order: prefer turn_index > source_timestamp > created_at
-        notes.sort_by(|a, b| {
-            match (a.turn_index, b.turn_index) {
-                (Some(ai), Some(bi)) => ai.cmp(&bi),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => match (a.source_timestamp, b.source_timestamp) {
-                    (Some(at), Some(bt)) => at.cmp(&bt),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.created_at.cmp(&b.created_at),
-                },
-            }
-        });
+        // Chronological order: seq (true order) > turn_index > source_timestamp
+        notes.sort_by(note_order_cmp);
         notes.truncate(self.config.max_notes_per_episode);
         Ok(notes)
     }
@@ -316,6 +594,11 @@ impl ReadEngine {
     /// BFS traversal through the link graph up to max_depth hops.
     /// Each hop applies a decay factor to the weight.
     /// Returns deduplicated notes sorted by traversal weight.
+    ///
+    /// Two-phase approach for latency: first traverse the graph (SQLite,
+    /// sub-millisecond per hop) to collect all reachable IDs + weights,
+    /// then fetch the notes in one batched vector-store call instead of
+    /// N individual get() calls.
     async fn multi_hop_traverse(
         &self,
         seed_id: &str,
@@ -328,9 +611,8 @@ impl ReadEngine {
         visited.insert(seed_id.to_string());
 
         let mut queue: VecDeque<(String, usize, f32)> = VecDeque::new();
-        let mut weighted_notes: Vec<(MemoryNote, f32)> = Vec::new();
+        let mut id_weights: Vec<(String, f32)> = Vec::new();
 
-        // Seed with direct links at depth 0
         let initial_links = self.graph_store.get_links(seed_id).await?;
         for link_id in initial_links {
             if visited.insert(link_id.clone()) {
@@ -340,14 +622,13 @@ impl ReadEngine {
 
         const MAX_TRAVERSED: usize = 50;
 
+        // Phase 1: graph-only BFS (SQLite, fast) — collect IDs + weights
         while let Some((current_id, depth, weight)) = queue.pop_front() {
-            if weighted_notes.len() >= MAX_TRAVERSED {
+            if id_weights.len() >= MAX_TRAVERSED {
                 break;
             }
 
-            if let Some(note) = self.vector_store.get(&current_id).await? {
-                weighted_notes.push((note, weight));
-            }
+            id_weights.push((current_id.clone(), weight));
 
             if depth < max_depth {
                 let next_weight = weight * decay;
@@ -360,13 +641,69 @@ impl ReadEngine {
             }
         }
 
-        // Sort by weight descending
+        if id_weights.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: batch fetch from vector store (one call instead of N)
+        let id_refs: Vec<&str> = id_weights.iter().map(|(id, _)| id.as_str()).collect();
+        let fetched = self.vector_store.get_many(&id_refs).await?;
+        let note_map: std::collections::HashMap<String, MemoryNote> = fetched
+            .into_iter()
+            .map(|n| (n.id.clone(), n))
+            .collect();
+
+        let mut weighted_notes: Vec<(MemoryNote, f32)> = Vec::new();
+        for (id, weight) in &id_weights {
+            if let Some(note) = note_map.get(id) {
+                weighted_notes.push((note.clone(), *weight));
+            }
+        }
+
         weighted_notes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(weighted_notes.into_iter().map(|(n, _)| n).collect())
     }
 
-    /// Embed query, find top-K with two-level episode retrieval, apply temporal scoring, follow links.
+    /// Public search: returns exactly top_k results. Live default — anchors
+    /// recency to Utc::now() via ClockContext::now().
     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+        self.search_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    /// Time-travel / replay query — recency anchored to ctx.reference_time().
+    pub async fn search_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<Vec<SearchResult>> {
+        let (mut results, _mode) = self.search_wide(query, top_k, ctx).await?;
+        results.truncate(top_k);
+
+        // Access tracking (fire-and-forget — don't block the read path)
+        let vs = Arc::clone(&self.vector_store);
+        let ids: Vec<String> = results.iter().map(|r| r.note.id.clone()).collect();
+        tokio::spawn(async move {
+            for id in ids {
+                if let Ok(Some(mut note)) = vs.get(&id).await {
+                    note.last_accessed_at = Utc::now();
+                    let _ = vs.upsert(&note).await;
+                }
+            }
+        });
+
+        Ok(results)
+    }
+
+    /// Internal search: returns the full expanded candidate pool (not truncated)
+    /// plus the classified query mode. Used by ask() so the reranker can see the
+    /// full pool before truncation, and ask() can use the same mode for top_k sizing.
+    async fn search_wide(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<(Vec<SearchResult>, QueryMode)> {
         info!("Searching: \"{}\"", query);
 
         let embeddings = self.llm.embed(&[query]).await?;
@@ -394,14 +731,64 @@ impl ReadEngine {
             QueryMode::Recency => 0.60,
             _ => self.config.recency_weight,
         };
-        // Parallel search: notes + atomic facts (if enabled)
+        // Parallel search: notes + atomic facts (if enabled).
+        //
+        // Temporal gating: if the query carries a lexical temporal indicator
+        // AND tier 1 (Rust regex) resolves it to a concrete interval, we
+        // route fact retrieval through `find_similar_facts_in_interval` so
+        // out-of-window facts are filtered at the SQL layer. If tier 1 punts
+        // (ambiguous phrase like "last spring"), we fall back to tier 2
+        // (LLM resolver). Both resolvers' outputs pass through
+        // `validate_resolver_output`; schema violations degrade to
+        // unrestricted fact retrieval.
         let fact_k = fetch_k / 2;
+        let temporal_interval = if has_temporal_indicator(query) {
+            let ref_time = ctx.reference_time();
+            match resolve::resolve_temporal_phrase(query, ref_time) {
+                Some((interval, _conf)) => Some(interval),
+                None => {
+                    // Tier 2 fallback. Session context is not plumbed into
+                    // search_wide yet; pass empty recent_turns — the
+                    // resolver still handles self-anchored phrases like
+                    // "last spring" via reference_time alone.
+                    let recent = self
+                        .recent_user_turns_in_session(None, 3)
+                        .await
+                        .unwrap_or_default();
+                    let llm_resolver =
+                        resolve_llm::LlmResolver::new(Arc::clone(&self.llm));
+                    let ctx_r = resolve_llm::ResolverContext { recent_turns: recent };
+                    llm_resolver
+                        .resolve(query, ref_time, &ctx_r)
+                        .await
+                        .map(|(iv, _)| iv)
+                }
+            }
+        } else {
+            None
+        };
         let (direct, fact_hits) = if self.config.fact_retrieval_enabled {
-            let (direct_result, fact_hits_result) = tokio::join!(
-                self.vector_store.find_similar(&query_embedding, fetch_k, &[]),
-                self.vector_store.find_similar_facts(&query_embedding, fact_k, &[])
-            );
-            (direct_result?, fact_hits_result.unwrap_or_default())
+            match temporal_interval {
+                Some(interval) => {
+                    let (direct_result, fact_hits_result) = tokio::join!(
+                        self.vector_store.find_similar(&query_embedding, fetch_k, &[]),
+                        self.vector_store.find_similar_facts_in_interval(
+                            &query_embedding,
+                            fact_k,
+                            interval.start,
+                            interval.end,
+                        )
+                    );
+                    (direct_result?, fact_hits_result.unwrap_or_default())
+                }
+                None => {
+                    let (direct_result, fact_hits_result) = tokio::join!(
+                        self.vector_store.find_similar(&query_embedding, fetch_k, &[]),
+                        self.vector_store.find_similar_facts(&query_embedding, fact_k, &[])
+                    );
+                    (direct_result?, fact_hits_result.unwrap_or_default())
+                }
+            }
         } else {
             let direct = self.vector_store.find_similar(&query_embedding, fetch_k, &[]).await?;
             (direct, Vec::new())
@@ -468,7 +855,7 @@ impl ReadEngine {
                 _ => {}
             }
 
-            let mut final_score = self.blended_score_with_weight(sim, &note, effective_recency_weight);
+            let mut final_score = self.blended_score_with_weight(sim, &note, effective_recency_weight, ctx);
 
             // Graph-aware scoring: notes with more links score higher (PageRank-lite)
             let link_count = self.graph_store.get_link_count(&note.id).await?;
@@ -568,8 +955,16 @@ impl ReadEngine {
             if seen_note_ids.insert(fact.source_note_id.clone()) {
                 if let Ok(Some(parent)) = self.vector_store.get(&fact.source_note_id).await {
                     if parent.is_active() {
+                        // Clone the parent and prepend the matched fact text so the
+                        // synthesis LLM sees the exact value. The clone prevents
+                        // the access-tracking upsert from corrupting stored content.
+                        let mut annotated = parent.clone();
+                        annotated.content = format!(
+                            "[Matched fact: {}]\n\n{}",
+                            fact.content, annotated.content
+                        );
                         fact_expanded.push(SearchResult {
-                            note: parent,
+                            note: annotated,
                             score: score + fact_boost,
                             linked_notes: Vec::new(),
                         });
@@ -688,21 +1083,17 @@ impl ReadEngine {
             }
         }
 
-        // Merge: profiles → structurally matched digests → linked digests → episode-drilled → fact-expanded → flat hits
+        // Merge: profiles -> structurally matched digests -> linked digests -> episode-drilled -> fact-expanded -> flat hits
+        // Do NOT truncate here. Return the full expanded pool so that ask() can
+        // rerank the entire candidate set before truncating to final top_k.
+        // Access tracking is done by the caller (search() or ask()) after truncation,
+        // so only notes actually returned to the user get their access time bumped.
         let mut results = profile_results;
         results.extend(digest_matched_results);
         results.extend(linked_digest_results);
         results.extend(episode_results);
         results.extend(fact_expanded);
         results.extend(flat_results);
-        results.truncate(top_k);
-
-        // Update last_accessed_at for all returned notes (access tracking for forgetting)
-        for result in &results {
-            let mut accessed = result.note.clone();
-            accessed.last_accessed_at = Utc::now();
-            let _ = self.vector_store.upsert(&accessed).await;
-        }
 
         info!(
             results = results.len(),
@@ -711,25 +1102,284 @@ impl ReadEngine {
             "Search complete"
         );
 
-        Ok(results)
+        Ok((results, mode))
     }
 
-    /// Search + deduplicate + synthesize an answer with provenance markers.
-    /// Includes abstention calibration: if no notes are sufficiently relevant, abstains.
-    pub async fn ask(&self, query: &str, top_k: usize) -> Result<AskResult> {
-        // Adaptive top-K based on query mode (keyword fallback; search() uses embedding classifier)
-        let mode = classify_query_keywords(query);
+    /// Public retrieve-only API. Runs Karta's full retrieval pipeline —
+    /// query classification, wide search, reranking, deduplication,
+    /// chronological ordering, contradiction force-retrieval, and context
+    /// assembly — then returns the assembled notes WITHOUT calling any LLM
+    /// for answer composition.
+    ///
+    /// Karta's job is to find and organize the right memories; the caller
+    /// decides what to do with them (run their own LLM, display them, pass
+    /// them to an agent, etc.). Use `ask()` if you want Karta to also
+    /// compose an answer via its configured answer-LLM.
+    pub async fn fetch_memories(&self, query: &str, top_k: usize) -> Result<FetchedMemories> {
+        self.fetch_memories_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    pub async fn fetch_memories_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<FetchedMemories> {
+        let wide_k = top_k * self.config.summarization_top_k_multiplier.max(4);
+        let mut reranker_best: Option<f32> = None;
+
+        let (mut results, mode) = self.search_wide(query, wide_k, ctx).await?;
+
         let effective_top_k = match mode {
             QueryMode::Breadth => top_k * self.config.summarization_top_k_multiplier,
             QueryMode::Temporal => top_k * 4,
             QueryMode::Computation => top_k * 2,
             _ => top_k,
         };
-
         let mode_str = format!("{:?}", mode);
+
+        if results.is_empty() {
+            return Ok(FetchedMemories {
+                query: query.to_string(),
+                context: String::new(),
+                notes: Vec::new(),
+                note_ids: Vec::new(),
+                query_mode: mode_str,
+                contradiction_injected: 0,
+                reranker_best_score: None,
+            });
+        }
+
+        // --- Reranker ---
+        if self.reranker_config.enabled {
+            let notes_for_rerank: Vec<(MemoryNote, f32)> = results
+                .iter()
+                .take(self.reranker_config.max_rerank)
+                .map(|r| (r.note.clone(), r.score))
+                .collect();
+
+            let reranked = self.reranker.rerank(query, notes_for_rerank).await?;
+            let best_relevance = reranked
+                .iter()
+                .map(|r| r.relevance_score)
+                .fold(0.0f32, f32::max);
+            reranker_best = Some(best_relevance);
+
+            if mode != QueryMode::Computation {
+                let reranked_ids: HashSet<String> =
+                    reranked.iter().map(|r| r.note.id.clone()).collect();
+                let mut reordered: Vec<SearchResult> = Vec::new();
+                for rr in &reranked {
+                    let linked = results
+                        .iter()
+                        .find(|r| r.note.id == rr.note.id)
+                        .map(|r| r.linked_notes.clone())
+                        .unwrap_or_default();
+                    reordered.push(SearchResult {
+                        note: rr.note.clone(),
+                        score: rr.relevance_score,
+                        linked_notes: linked,
+                    });
+                }
+                for r in &results {
+                    if !reranked_ids.contains(&r.note.id) {
+                        reordered.push(r.clone());
+                    }
+                }
+                results = reordered;
+            }
+        }
+
+        results.truncate(effective_top_k);
+
+        // Dedup unique notes (direct + linked)
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut all_notes: Vec<MemoryNote> = Vec::new();
+        for result in &results {
+            if seen.insert(result.note.id.clone()) {
+                all_notes.push(result.note.clone());
+            }
+            for linked in &result.linked_notes {
+                if seen.insert(linked.id.clone()) {
+                    all_notes.push(linked.clone());
+                }
+            }
+        }
+
+        if all_notes.is_empty() {
+            return Ok(FetchedMemories {
+                query: query.to_string(),
+                context: String::new(),
+                notes: Vec::new(),
+                note_ids: Vec::new(),
+                query_mode: mode_str,
+                contradiction_injected: 0,
+                reranker_best_score: reranker_best,
+            });
+        }
+
+        // Sort chronologically: seq (true order) > turn_index > source_timestamp
+        all_notes.sort_by(note_order_cmp);
+
+        // Contradiction force-retrieval
+        let mut contradiction_inject_ids: HashSet<String> = HashSet::new();
+        let seen_ids: HashSet<String> = all_notes.iter().map(|n| n.id.clone()).collect();
+
+        for note in all_notes.iter() {
+            if let Provenance::Dream { dream_type, source_note_ids, .. } = &note.provenance {
+                if dream_type == "contradiction" {
+                    for sid in source_note_ids {
+                        if !seen_ids.contains(sid) {
+                            contradiction_inject_ids.insert(sid.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        for note in all_notes.iter().take(10) {
+            if let Ok(links) = self.graph_store.get_links_with_reasons(&note.id).await {
+                for (linked_id, reason) in &links {
+                    if reason.contains("contradiction dream") && !seen_ids.contains(linked_id) {
+                        if let Ok(Some(dream_note)) = self.vector_store.get(linked_id).await {
+                            if let Provenance::Dream { source_note_ids, .. } = &dream_note.provenance {
+                                for sid in source_note_ids {
+                                    if !seen_ids.contains(sid) {
+                                        contradiction_inject_ids.insert(sid.clone());
+                                    }
+                                }
+                            }
+                            contradiction_inject_ids.insert(linked_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut inject_ids_vec: Vec<&str> = contradiction_inject_ids
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        inject_ids_vec.truncate(10);
+        let contradiction_notes: Vec<MemoryNote> = if inject_ids_vec.is_empty() {
+            Vec::new()
+        } else {
+            self.vector_store
+                .get_many(&inject_ids_vec)
+                .await
+                .unwrap_or_default()
+        };
+
+        // Build notes text with provenance markers
+        let mut note_entries: Vec<String> = Vec::new();
+        for (i, note) in all_notes.iter().enumerate() {
+            note_entries.push(Self::format_note_entry(i, note, false));
+        }
+        let base_count = all_notes.len();
+        for (i, note) in contradiction_notes.iter().enumerate() {
+            note_entries.push(Self::format_note_entry(base_count + i, note, true));
+        }
+        let joined_notes = note_entries.join("\n\n");
+
+        let events_block = self.build_events_block(mode).await;
+        let notes_text = if events_block.is_empty() {
+            joined_notes
+        } else {
+            format!("{}\n\n{}", events_block, joined_notes)
+        };
+
+        let contradiction_injected = contradiction_notes.len();
+        let mut ordered = all_notes;
+        ordered.extend(contradiction_notes);
+        let note_ids: Vec<String> = ordered.iter().map(|n| n.id.clone()).collect();
+
+        Ok(FetchedMemories {
+            query: query.to_string(),
+            context: notes_text,
+            notes: ordered,
+            note_ids,
+            query_mode: mode_str,
+            contradiction_injected,
+            reranker_best_score: reranker_best,
+        })
+    }
+
+    /// Format a single retrieved note as a context entry with provenance
+    /// markers, date, and recency annotation. Shared between the retrieval
+    /// path (`fetch_memories`) and the retry path inside `ask`.
+    fn format_note_entry(i: usize, note: &MemoryNote, is_contradiction_source: bool) -> String {
+        let provenance_marker = match &note.provenance {
+            Provenance::Observed => "FACT".to_string(),
+            Provenance::Dream { dream_type, confidence, .. } => {
+                format!("INFERRED:{} conf={:.0}%", dream_type, confidence * 100.0)
+            }
+            Provenance::Profile { entity_id } => format!("PROFILE:{}", entity_id),
+            Provenance::Episode { episode_id } => format!("EPISODE:{}", episode_id),
+            Provenance::Fact { source_note_id } => format!(
+                "FACT:from-{}",
+                &source_note_id[..8.min(source_note_id.len())]
+            ),
+            Provenance::Digest { episode_id } => {
+                format!("DIGEST:{}", &episode_id[..8.min(episode_id.len())])
+            }
+        };
+        let display_time = note.source_timestamp;
+        let age = Utc::now()
+            .signed_duration_since(display_time)
+            .num_days();
+        let recency = if age == 0 {
+            "today".to_string()
+        } else if age == 1 {
+            "1 day ago".to_string()
+        } else {
+            format!("{} days ago", age)
+        };
+        let date_str = display_time.format("%Y-%m-%d");
+        let prefix = if is_contradiction_source {
+            "[CONTRADICTION SOURCE] "
+        } else {
+            ""
+        };
+        format!(
+            "[{}] {}({}, {}, {}) {}\n    Context: {}",
+            i + 1,
+            prefix,
+            provenance_marker,
+            date_str,
+            recency,
+            note.content,
+            note.context,
+        )
+    }
+
+    /// Search + deduplicate + synthesize an answer with provenance markers.
+    /// Includes abstention calibration: if no notes are sufficiently relevant, abstains.
+    pub async fn ask(&self, query: &str, top_k: usize) -> Result<AskResult> {
+        self.ask_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    /// Time-travel ask — recency anchored to ctx.reference_time().
+    pub async fn ask_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<AskResult> {
+        // Fetch a wide pool from search_wide(), which classifies the query using
+        // the embedding classifier. We pass a generous top_k so the pool is large
+        // enough for any mode, then truncate based on the actual classified mode.
+        let wide_k = top_k * self.config.summarization_top_k_multiplier.max(4);
         let mut reranker_best: Option<f32> = None;
 
-        let mut results = self.search(query, effective_top_k).await?;
+        let (mut results, mode) = self.search_wide(query, wide_k, ctx).await?;
+
+        let effective_top_k = match mode {
+            QueryMode::Breadth => top_k * self.config.summarization_top_k_multiplier,
+            QueryMode::Temporal => top_k * 4,
+            QueryMode::Computation => top_k * 2,
+            _ => top_k,
+        };
+        let mode_str = format!("{:?}", mode);
 
         if results.is_empty() {
             return Ok(AskResult {
@@ -759,21 +1409,16 @@ impl ReadEngine {
 
             reranker_best = Some(best_relevance);
 
+            // Log low-relevance signal but do NOT abstain here.
+            // Let the synthesis model decide whether to answer or abstain based on
+            // the actual note content. Hard-gating on reranker score causes false
+            // abstention on queries where notes are relevant but use different vocabulary.
             if best_relevance < self.reranker_config.abstention_threshold {
                 debug!(
                     best_relevance = best_relevance,
                     threshold = self.reranker_config.abstention_threshold,
-                    "Reranker: abstaining — notes not relevant to query"
+                    "Reranker: low relevance signal (proceeding to synthesis)"
                 );
-                return Ok(AskResult {
-                    answer: "Based on the available memories, I don't have information about this topic.".to_string(),
-                    query_mode: mode_str,
-                    notes_used: 0,
-                    note_ids: Vec::new(),
-                    contradiction_injected: 0,
-                    has_contradiction: false,
-                    reranker_best_score: reranker_best,
-                });
             }
 
             // Reorder results by cross-encoder relevance, EXCEPT for Computation mode.
@@ -808,6 +1453,23 @@ impl ReadEngine {
             }
         }
 
+        // Now truncate to final top_k after reranking has reordered the full pool
+        results.truncate(effective_top_k);
+
+        // Access tracking (fire-and-forget — don't block the read path)
+        {
+            let vs = Arc::clone(&self.vector_store);
+            let ids: Vec<String> = results.iter().map(|r| r.note.id.clone()).collect();
+            tokio::spawn(async move {
+                for id in ids {
+                    if let Ok(Some(mut note)) = vs.get(&id).await {
+                        note.last_accessed_at = Utc::now();
+                        let _ = vs.upsert(&note).await;
+                    }
+                }
+            });
+        }
+
         // Deduplicate: collect all unique notes (direct + linked)
         let mut seen = HashSet::new();
         let mut all_notes: Vec<&MemoryNote> = Vec::new();
@@ -835,21 +1497,9 @@ impl ReadEngine {
             });
         }
 
-        // Sort notes by conversation order (turn_index > source_timestamp > created_at).
+        // Sort notes by conversation order: seq (true order) > turn_index > source_timestamp.
         // LLMs perform better when notes arrive in chronological sequence, not relevance order.
-        all_notes.sort_by(|a, b| {
-            match (a.turn_index, b.turn_index) {
-                (Some(ai), Some(bi)) => ai.cmp(&bi),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => match (a.source_timestamp, b.source_timestamp) {
-                    (Some(at), Some(bt)) => at.cmp(&bt),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.created_at.cmp(&b.created_at),
-                },
-            }
-        });
+        all_notes.sort_by(|a, b| note_order_cmp(a, b));
 
         // --- Contradiction force-retrieval ---
         // When a contradiction dream is among results (or a result note is linked to one),
@@ -924,7 +1574,7 @@ impl ReadEngine {
                 }
             };
             // Use source_timestamp (real conversation date) if available, fall back to created_at
-            let display_time = note.source_timestamp.unwrap_or(note.created_at);
+            let display_time = note.source_timestamp;
             let age = Utc::now()
                 .signed_duration_since(display_time)
                 .num_days();
@@ -959,7 +1609,25 @@ impl ReadEngine {
             note_entries.push(format_note(base_count + i, note, true));
         }
 
-        let notes_text = note_entries.join("\n\n");
+        let joined_notes = note_entries.join("\n\n");
+
+        // For date-arithmetic / ordering queries, prepend a structured EVENTS
+        // block extracted at dream time from per-episode and cross-episode
+        // digests. Dates in the digest are LLM-extracted from note content,
+        // which is much more reliable than expecting the synthesis model to
+        // pick dates out of scattered note excerpts at query time.
+        let ledger_block = self.build_ledger_context(query).await;
+        let events_block = self.build_events_block(mode).await;
+        let mut prefix = String::new();
+        if !ledger_block.is_empty() {
+            prefix.push_str(&ledger_block);
+            prefix.push_str("\n\n");
+        }
+        if !events_block.is_empty() {
+            prefix.push_str(&events_block);
+            prefix.push_str("\n\n");
+        }
+        let notes_text = format!("{}{}", prefix, joined_notes);
 
         let messages = vec![
             ChatMessage {
@@ -980,7 +1648,7 @@ impl ReadEngine {
             json_schema: Some(crate::llm::schemas::synthesis_schema()),
         };
 
-        let response = self.llm.chat(&messages, &config).await?;
+        let response = self.synth_llm().chat(&messages, &config).await?;
 
         // Parse structured response
         let parsed: serde_json::Value =
@@ -1054,25 +1722,24 @@ impl ReadEngine {
                     }
                 }
 
-                // Sort chronologically
-                retry_notes.sort_by(|a, b| {
-                    match (a.turn_index, b.turn_index) {
-                        (Some(ai), Some(bi)) => ai.cmp(&bi),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => match (a.source_timestamp, b.source_timestamp) {
-                            (Some(at), Some(bt)) => at.cmp(&bt),
-                            (Some(_), None) => std::cmp::Ordering::Less,
-                            (None, Some(_)) => std::cmp::Ordering::Greater,
-                            (None, None) => a.created_at.cmp(&b.created_at),
-                        },
-                    }
-                });
+                // Sort chronologically: seq (true order) > turn_index > source_timestamp
+                retry_notes.sort_by(|a, b| note_order_cmp(a, b));
 
-                let retry_notes_text: String = retry_notes.iter().enumerate()
+                let joined_retry: String = retry_notes.iter().enumerate()
                     .map(|(i, note)| format_note(i, note, false))
                     .collect::<Vec<_>>()
                     .join("\n\n");
+                let retry_events_block = self.build_events_block(mode).await;
+                let mut retry_prefix = String::new();
+                if !ledger_block.is_empty() {
+                    retry_prefix.push_str(&ledger_block);
+                    retry_prefix.push_str("\n\n");
+                }
+                if !retry_events_block.is_empty() {
+                    retry_prefix.push_str(&retry_events_block);
+                    retry_prefix.push_str("\n\n");
+                }
+                let retry_notes_text = format!("{}{}", retry_prefix, joined_retry);
 
                 let retry_messages = vec![
                     ChatMessage {
@@ -1091,7 +1758,7 @@ impl ReadEngine {
                     "Retry: synthesizing with wider note set"
                 );
 
-                if let Ok(retry_response) = self.llm.chat(&retry_messages, &config).await {
+                if let Ok(retry_response) = self.synth_llm().chat(&retry_messages, &config).await {
                     let retry_parsed: serde_json::Value =
                         serde_json::from_str(&retry_response.content).unwrap_or_default();
                     if let Some(retry_answer) = retry_parsed["answer"].as_str() {
@@ -1135,6 +1802,121 @@ impl ReadEngine {
         })
     }
 
+    /// Build a [CURRENT]/[CONFLICT] context block for mutable-slot queries by
+    /// resolving the query to a known entity + predicate and reading the
+    /// current ledger rows for that pair. Returns empty string unless a
+    /// ledger and alias table are attached and both an entity and predicate
+    /// can be resolved from the query — additive and side-effect free
+    /// (never mutates the shared alias table).
+    async fn build_ledger_context(&self, query: &str) -> String {
+        let Some(ledger) = &self.slot_ledger else { return String::new(); };
+        let Some(aliases) = &self.entity_aliases else { return String::new(); };
+        let Some(predicate) = query_predicate(query) else { return String::new(); };
+
+        let entity_key = {
+            let guard = match aliases.lock() {
+                Ok(g) => g,
+                Err(_) => return String::new(),
+            };
+            let nq = crate::extract::entity_key::normalize_entity(query);
+            guard
+                .keys()
+                .into_iter()
+                .find(|k| k.split_whitespace().all(|w| nq.contains(w)))
+        };
+        let Some(entity_key) = entity_key else { return String::new(); };
+
+        match ledger.current(&entity_key, predicate.as_str()) {
+            Ok(rows) if !rows.is_empty() => build_ledger_block(&rows),
+            _ => String::new(),
+        }
+    }
+
+    /// Build a structured EVENTS block from stored episode digests and the
+    /// cross-episode digest. Returns empty string if the query mode does not
+    /// benefit from dated events, or if no digests exist yet (pre-dream).
+    ///
+    /// Events are merged across per-episode and cross-episode digests, deduped
+    /// by (description, date), and sorted chronologically with undated events
+    /// at the end. The block is prepended to the synthesis context so the LLM
+    /// has a clean ISO-dated table to compute against for "how many days
+    /// between X and Y" and "in what order did I bring up X" questions.
+    async fn build_events_block(&self, mode: QueryMode) -> String {
+        // Only applicable to date/sequence-heavy modes. Other modes retain
+        // the narrow note-only context to avoid noise.
+        if !matches!(mode, QueryMode::Computation | QueryMode::Temporal) {
+            return String::new();
+        }
+
+        let per_episode = self.graph_store.get_all_episode_digests().await.unwrap_or_default();
+        let cross_level = self.graph_store.get_all_cross_episode_digests().await.unwrap_or_default();
+
+        if per_episode.is_empty() && cross_level.is_empty() {
+            return String::new();
+        }
+
+        // Dedup key: (lowercased description, date-or-empty). Events from the
+        // cross-episode digest are already deduped by the LLM, but per-episode
+        // events can overlap with each other.
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut merged: Vec<crate::note::TimedEvent> = Vec::new();
+
+        let push_event = |ev: &crate::note::TimedEvent,
+                          seen: &mut HashSet<(String, String)>,
+                          merged: &mut Vec<crate::note::TimedEvent>| {
+            let key = (
+                ev.description.to_lowercase(),
+                ev.date.clone().unwrap_or_default(),
+            );
+            if seen.insert(key) {
+                merged.push(ev.clone());
+            }
+        };
+
+        for d in &per_episode {
+            for ev in &d.events {
+                push_event(ev, &mut seen, &mut merged);
+            }
+        }
+        for d in &cross_level {
+            for ev in &d.events {
+                push_event(ev, &mut seen, &mut merged);
+            }
+        }
+
+        if merged.is_empty() {
+            return String::new();
+        }
+
+        // Sort: dated events chronologically, undated last (by source_turn if present)
+        merged.sort_by(|a, b| match (&a.date, &b.date) {
+            (Some(ad), Some(bd)) => ad.cmp(bd),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.source_turn.unwrap_or(u32::MAX).cmp(&b.source_turn.unwrap_or(u32::MAX)),
+        });
+
+        // Cap to keep the context tight. 400 events ≈ 6-8k tokens; smoke
+        // run showed conv 1 produces ~324 dated events across per-episode +
+        // cross-level digests, so 400 keeps all dated events and a margin of
+        // undated ones for ordering queries.
+        const MAX_EVENTS: usize = 400;
+        if merged.len() > MAX_EVENTS {
+            merged.truncate(MAX_EVENTS);
+        }
+
+        let mut lines: Vec<String> = Vec::with_capacity(merged.len() + 2);
+        lines.push("EVENTS IN THIS CONVERSATION (chronological, dream-extracted):".to_string());
+        for ev in &merged {
+            let date = ev.date.as_deref().unwrap_or("undated");
+            lines.push(format!("- {}: {}", date, ev.description));
+        }
+        lines.push(
+            "\nFor date-arithmetic questions, prefer the dates above over dates mentioned inside note text.".to_string()
+        );
+        lines.join("\n")
+    }
+
     /// Check if an answer contains language indicating the LLM couldn't find enough information.
     fn answer_admits_insufficient_info(answer: &str) -> bool {
         let lower = answer.to_lowercase();
@@ -1149,5 +1931,65 @@ impl ReadEngine {
             || lower.contains("not in the notes")
             || lower.contains("not provided in")
             || lower.contains("i don't see any note")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ledger_block_renders_current_and_conflict() {
+        use crate::store::slot_ledger::LedgerRow;
+        use chrono::{TimeZone, Utc};
+        let base = |value: &str, cg: Option<i64>| LedgerRow {
+            id: 1, entity_key: "first sprint".into(), predicate: "deadline".into(),
+            value: value.into(), value_norm: value.to_lowercase(), seq: 1,
+            valid_from: Some(Utc.with_ymd_and_hms(2024, 4, 5, 0, 0, 0).unwrap()),
+            mention_time: Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap(),
+            valid_to: None, superseded_by: None, conflict_group: cg,
+            note_id: "n1".into(), source_span: "s".into(),
+        };
+        // CURRENT
+        let cur = build_ledger_block(&[base("April 5", None)]);
+        assert_eq!(cur, "[CURRENT] first sprint deadline = April 5 (as of 2024-04-05)");
+        // CONFLICT (two rows, same conflict_group)
+        let mut r1 = base("April 5", Some(7));
+        let mut r2 = base("April 6", Some(7));
+        r2.id = 2;
+        let conf = build_ledger_block(&[r1.clone(), r2.clone()]);
+        assert_eq!(conf, "[CONFLICT] first sprint deadline: both \"April 5\" and \"April 6\" stated");
+        let _ = (&mut r1, &mut r2);
+    }
+
+    #[test]
+    fn orders_by_seq_over_timestamp() {
+        use chrono::{TimeZone, Utc};
+        let mk = |seq: u64, ts_day: u32| {
+            let mut n = crate::note::MemoryNote::new("x".to_string());
+            n.seq = seq;
+            n.source_timestamp = Utc.with_ymd_and_hms(2024, 1, ts_day, 0, 0, 0).unwrap();
+            n.turn_index = None;
+            n
+        };
+        // seq increasing but timestamps DECREASING — seq must win.
+        let mut v = vec![mk(3, 1), mk(1, 3), mk(2, 2)];
+        v.sort_by(note_order_cmp);
+        let seqs: Vec<u64> = v.iter().map(|n| n.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn legacy_zero_seq_falls_back_to_turn_index() {
+        let mk = |ti: Option<u32>| {
+            let mut n = crate::note::MemoryNote::new("x".to_string());
+            n.seq = 0;
+            n.turn_index = ti;
+            n
+        };
+        let mut v = vec![mk(Some(2)), mk(Some(0)), mk(Some(1))];
+        v.sort_by(note_order_cmp);
+        let tis: Vec<Option<u32>> = v.iter().map(|n| n.turn_index).collect();
+        assert_eq!(tis, vec![Some(0), Some(1), Some(2)]);
     }
 }

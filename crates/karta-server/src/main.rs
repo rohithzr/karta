@@ -64,8 +64,8 @@ async fn main() -> anyhow::Result<()> {
     // Initialize karta-core
     let karta = {
         let mut karta_config = karta_core::config::KartaConfig::default();
-        if let Ok(lance_uri) = std::env::var("KARTA_LANCE_URI") {
-            karta_config.storage.lance_uri = Some(lance_uri);
+        if let Ok(data_dir) = std::env::var("KARTA_DATA_DIR") {
+            karta_config.storage.data_dir = data_dir;
         }
         match Karta::with_defaults(karta_config).await {
             Ok(k) => {

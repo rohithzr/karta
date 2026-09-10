@@ -1,7 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
-
+use crate::clock::ClockContext;
 use crate::config::KartaConfig;
 use crate::dream::{DreamEngine, DreamRun};
 use crate::error::{KartaError, Result};
@@ -20,6 +19,8 @@ pub struct Karta {
     graph_store: Arc<dyn GraphStore>,
     llm: Arc<dyn LlmProvider>,
     config: KartaConfig,
+    slot_ledger: Option<Arc<crate::store::slot_ledger::SlotLedger>>,
+    entity_aliases: Arc<Mutex<crate::extract::entity_key::EntityAliases>>,
 }
 
 impl Karta {
@@ -28,6 +29,21 @@ impl Karta {
         vector_store: Arc<dyn VectorStore>,
         graph_store: Arc<dyn GraphStore>,
         llm: Arc<dyn LlmProvider>,
+        config: KartaConfig,
+    ) -> Result<Self> {
+        Self::new_with_synthesis(vector_store, graph_store, llm, None, config).await
+    }
+
+    /// Create a Karta instance where the final answer-synthesis call can be
+    /// routed to a separate LLM (e.g. a stronger model used only at answer
+    /// time). All other Karta-internal calls — write, dream, rerank, query
+    /// classification — still go through `llm`. Pass `None` for `synthesis_llm`
+    /// to keep synthesis on the primary LLM (standard behavior).
+    pub async fn new_with_synthesis(
+        vector_store: Arc<dyn VectorStore>,
+        graph_store: Arc<dyn GraphStore>,
+        llm: Arc<dyn LlmProvider>,
+        synthesis_llm: Option<Arc<dyn LlmProvider>>,
         config: KartaConfig,
     ) -> Result<Self> {
         // Initialize graph store schema
@@ -52,14 +68,18 @@ impl Karta {
             Arc::new(NoopReranker)
         };
 
-        let read_engine = ReadEngine::new(
+        let mut read_engine = ReadEngine::new(
             Arc::clone(&vector_store),
             Arc::clone(&graph_store),
             Arc::clone(&llm),
+            synthesis_llm,
             reranker,
             config.read.clone(),
             config.reranker.clone(),
         );
+
+        let entity_aliases = write_engine.entity_aliases_handle();
+        read_engine.set_entity_aliases(Arc::clone(&entity_aliases));
 
         Ok(Self {
             write_engine,
@@ -68,74 +88,97 @@ impl Karta {
             graph_store,
             llm,
             config,
+            slot_ledger: None,
+            entity_aliases,
         })
     }
 
-    /// Create with default embedded stores (LanceDB + SQLite) and OpenAI-compatible LLM.
+    /// Attach a slot ledger for mutable-slot tracking. Wires the same
+    /// `Arc` into the write engine (so ingest populates it) and keeps a
+    /// copy here (so reads can query it via `slot_ledger_current`).
+    pub(crate) fn attach_slot_ledger(&mut self, ledger: Arc<crate::store::slot_ledger::SlotLedger>) {
+        self.write_engine.attach_slot_ledger(Arc::clone(&ledger));
+        self.read_engine.attach_slot_ledger(Arc::clone(&ledger));
+        self.slot_ledger = Some(ledger);
+    }
+
+    /// Create with default embedded stores (sqlite-vec + SQLite) and OpenAI-compatible LLM.
     ///
-    /// Loads `.env` file if present (via dotenvy). Reads credentials from env vars:
+    /// Loads `.env` file if present (via dotenvy). Backend is chosen in this order:
     ///
-    /// For standard OpenAI:
-    ///   - `OPENAI_API_KEY` (read by async-openai automatically)
+    /// 1. **Explicit config**: `config.llm.default.base_url` set → OpenAI-compatible
+    ///    endpoint (Ollama, vLLM, Groq, Together, …).
+    /// 2. **`OPENAI_API_BASE` env var**: same OpenAI-compatible path. Wins over
+    ///    `AZURE_OPENAI_API_KEY` so you can flip a single env var to redirect
+    ///    Karta at a local Ollama during benchmarks without editing `.env`.
+    /// 3. **`AZURE_OPENAI_API_KEY` env var**: Azure OpenAI via native `AzureConfig`.
+    ///    Also reads `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_VERSION` (default
+    ///    `2025-04-01-preview`), `AZURE_OPENAI_CHAT_MODEL`, `AZURE_OPENAI_EMBEDDING_MODEL`.
+    /// 4. **Fallback**: standard OpenAI (reads `OPENAI_API_KEY`).
     ///
-    /// For Azure OpenAI:
-    ///   - `AZURE_OPENAI_API_KEY`
-    ///   - `AZURE_OPENAI_ENDPOINT`
-    ///   - `AZURE_OPENAI_API_VERSION` (optional, defaults to 2025-04-01-preview)
+    /// Chat model resolution, in order: `KARTA_CHAT_MODEL` env →
+    /// `AZURE_OPENAI_CHAT_MODEL` env (Azure branch only) → `config.llm.default.model`.
     ///
-    /// For other OpenAI-compatible providers (Ollama, vLLM, Groq, Together):
-    ///   - Set `llm.default.base_url` in config, or
-    ///   - Set `OPENAI_API_BASE` env var
+    /// Embedding model resolution, in order: `KARTA_EMBEDDING_MODEL` env →
+    /// `AZURE_OPENAI_EMBEDDING_MODEL` env → `"text-embedding-3-small"`.
     ///
-    /// Model names come from `config.llm.default.model` and can be overridden
-    /// per-operation via `config.llm.overrides`.
-    #[cfg(all(feature = "lance", feature = "sqlite", feature = "openai"))]
+    /// **Provider split:** if both `OPENAI_API_BASE` (chat, e.g. Ollama) *and*
+    /// `AZURE_OPENAI_API_KEY` (embeddings) are set, chat goes to the
+    /// OpenAI-compatible endpoint and embeddings go to Azure. This is the
+    /// recommended BEAM config: local GPU for gen throughput, Azure for
+    /// high-quality embeddings that match the P1 baseline's vector space.
+    #[cfg(all(feature = "sqlite-vec", feature = "sqlite", feature = "openai"))]
     pub async fn with_defaults(config: KartaConfig) -> Result<Self> {
-        use crate::llm::OpenAiProvider;
-        use crate::store::lance::LanceVectorStore;
+        use crate::llm::{OpenAiProvider, SplitProvider};
         use crate::store::sqlite::SqliteGraphStore;
+        use crate::store::sqlite_vec::SqliteVectorStore;
 
         // Load .env if present (silently ignore if missing)
         let _ = dotenvy::dotenv();
 
-        let lance_uri = config.storage.lance_uri.clone()
-            .unwrap_or_else(|| format!("{}/lance", config.storage.data_dir));
-        let vector_store = Arc::new(
-            LanceVectorStore::new(&lance_uri).await?,
-        ) as Arc<dyn VectorStore>;
-
-        let graph_store = Arc::new(
-            SqliteGraphStore::new(&config.storage.data_dir)?,
-        ) as Arc<dyn GraphStore>;
-
         let model_ref = &config.llm.default;
 
-        // Determine embedding model from config or env
+        let chat_model_base = std::env::var("KARTA_CORE_MODEL")
+            .or_else(|_| std::env::var("KARTA_CHAT_MODEL"))
+            .unwrap_or_else(|_| model_ref.model.clone());
+
         let embedding_model = std::env::var("KARTA_EMBEDDING_MODEL")
             .unwrap_or_else(|_| {
                 std::env::var("AZURE_OPENAI_EMBEDDING_MODEL")
                     .unwrap_or_else(|_| "text-embedding-3-small".to_string())
             });
 
-        // Build LLM provider based on what credentials are available
-        let llm: Arc<dyn LlmProvider> = if let Some(ref base_url) = model_ref.base_url {
-            // Explicit base URL in config (Ollama, vLLM, etc.)
-            Arc::new(OpenAiProvider::with_base_url(
-                &model_ref.model,
-                &embedding_model,
-                base_url,
-            ))
-        } else if let Ok(azure_key) = std::env::var("AZURE_OPENAI_API_KEY") {
-            // Azure OpenAI — uses native AzureConfig for correct URL construction
-            let endpoint = std::env::var("AZURE_OPENAI_ENDPOINT")
-                .map_err(|_| KartaError::Config(
+        let openai_base = model_ref
+            .base_url
+            .clone()
+            .or_else(|| std::env::var("OPENAI_API_BASE").ok());
+        let azure_creds = match (
+            std::env::var("AZURE_OPENAI_API_KEY").ok(),
+            std::env::var("AZURE_OPENAI_ENDPOINT").ok(),
+        ) {
+            (Some(key), Some(endpoint)) => Some((key, endpoint)),
+            (Some(_), None) => {
+                return Err(KartaError::Config(
                     "AZURE_OPENAI_API_KEY is set but AZURE_OPENAI_ENDPOINT is missing".into(),
-                ))?;
+                ));
+            }
+            _ => None,
+        };
+
+        let chat_llm: Arc<dyn LlmProvider> = if let Some(ref base_url) = openai_base {
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .unwrap_or_else(|_| "ollama".to_string());
+            Arc::new(OpenAiProvider::with_api_key(
+                &chat_model_base,
+                &embedding_model,
+                &api_key,
+                Some(base_url),
+            ))
+        } else if let Some((azure_key, endpoint)) = azure_creds.clone() {
             let chat_model = std::env::var("AZURE_OPENAI_CHAT_MODEL")
-                .unwrap_or_else(|_| model_ref.model.clone());
+                .unwrap_or_else(|_| chat_model_base.clone());
             let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
                 .unwrap_or_else(|_| "2025-04-01-preview".to_string());
-
             Arc::new(OpenAiProvider::azure(
                 &endpoint,
                 &azure_key,
@@ -144,64 +187,200 @@ impl Karta {
                 &embedding_model,
             ))
         } else {
-            // Standard OpenAI (reads OPENAI_API_KEY from env automatically)
-            Arc::new(OpenAiProvider::new(
-                &model_ref.model,
-                &embedding_model,
-            ))
+            Arc::new(OpenAiProvider::new(&chat_model_base, &embedding_model))
         };
 
-        Self::new(vector_store, graph_store, llm, config).await
+        let answer_model_opt = std::env::var("KARTA_ANSWER_MODEL").ok();
+        let mut synthesis_llm: Option<Arc<dyn LlmProvider>> = None;
+
+        let llm: Arc<dyn LlmProvider> = if openai_base.is_some() {
+            if let Some((azure_key, endpoint)) = azure_creds.clone() {
+                let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
+                    .unwrap_or_else(|_| "2025-04-01-preview".to_string());
+                let azure_chat_model = std::env::var("AZURE_OPENAI_CHAT_MODEL")
+                    .unwrap_or_else(|_| chat_model_base.clone());
+                let azure_embedding_model = std::env::var("AZURE_OPENAI_EMBEDDING_MODEL")
+                    .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+                let embed_llm: Arc<dyn LlmProvider> = Arc::new(OpenAiProvider::azure(
+                    &endpoint,
+                    &azure_key,
+                    &api_version,
+                    &azure_chat_model,
+                    &azure_embedding_model,
+                ));
+                Arc::new(SplitProvider::new(chat_llm, embed_llm))
+            } else {
+                chat_llm
+            }
+        } else {
+            chat_llm
+        };
+
+        if let Some(answer_model) = answer_model_opt {
+            if let Ok(answer_base) = std::env::var("KARTA_ANSWER_BASE_URL") {
+                let answer_key = std::env::var("KARTA_ANSWER_API_KEY")
+                    .unwrap_or_else(|_| "placeholder".to_string());
+                synthesis_llm = Some(Arc::new(OpenAiProvider::with_api_key(
+                    &answer_model,
+                    &embedding_model,
+                    &answer_key,
+                    Some(&answer_base),
+                )));
+            } else if let Some((azure_key, endpoint)) = azure_creds {
+                let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
+                    .unwrap_or_else(|_| "2025-04-01-preview".to_string());
+                let azure_embedding_model = std::env::var("AZURE_OPENAI_EMBEDDING_MODEL")
+                    .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+                synthesis_llm = Some(Arc::new(OpenAiProvider::azure(
+                    &endpoint,
+                    &azure_key,
+                    &api_version,
+                    &answer_model,
+                    &azure_embedding_model,
+                )));
+            }
+        }
+
+        const DEFAULT_DIM: usize = 1536;
+        let embedding_dim = match llm.embed(&["karta-init-probe"]).await {
+            Ok(vectors) if !vectors.is_empty() && !vectors[0].is_empty() => vectors[0].len(),
+            _ => DEFAULT_DIM,
+        };
+
+        let sqlite_vec_store =
+            SqliteVectorStore::new(&config.storage.data_dir, embedding_dim).await?;
+        let shared_conn = sqlite_vec_store.connection();
+        let vector_store = Arc::new(sqlite_vec_store) as Arc<dyn VectorStore>;
+        let graph_store = Arc::new(SqliteGraphStore::with_connection(shared_conn.clone())) as Arc<dyn GraphStore>;
+
+        let mut karta = Self::new_with_synthesis(vector_store, graph_store, llm, synthesis_llm, config).await?;
+        let ledger = Arc::new(crate::store::slot_ledger::SlotLedger::new(shared_conn)?);
+        karta.attach_slot_ledger(ledger);
+        Ok(karta)
     }
+
 
     // --- Write ---
 
+    /// Live default — sugar over `add_note_with_clock(content, None, None,
+    /// ClockContext::now())`. Intended for smoke tests, docs examples, and
+    /// quick scripts. Production callers should prefer `add_note_with_clock`.
     pub async fn add_note(&self, content: &str) -> Result<MemoryNote> {
-        self.write_engine.add_note(content).await
+        self.add_note_with_clock(content, None, None, ClockContext::now()).await
     }
 
-    pub async fn add_note_with_session(
+    /// Canonical ingest with full clock + session control. session_id is
+    /// optional because not every note belongs to a session (a one-shot
+    /// `add_note(content)` doesn't have one). turn_index is optional for
+    /// non-conversational ingest paths.
+    pub async fn add_note_with_clock(
         &self,
         content: &str,
-        session_id: &str,
+        session_id: Option<&str>,
+        turn_index: Option<u32>,
+        ctx: ClockContext,
     ) -> Result<MemoryNote> {
         self.write_engine
-            .add_note_with_session(content, session_id)
+            .add_note_with_clock(content, session_id, turn_index, ctx)
             .await
-    }
-
-    /// Add a note with session context and optional temporal metadata.
-    /// `turn_index`: position of this message within its conversation (0-indexed).
-    /// `source_timestamp`: original timestamp from source data (distinct from ingestion time).
-    pub async fn add_note_with_metadata(
-        &self,
-        content: &str,
-        session_id: &str,
-        turn_index: Option<u32>,
-        source_timestamp: Option<DateTime<Utc>>,
-    ) -> Result<MemoryNote> {
-        let mut note = self
-            .write_engine
-            .add_note_with_session(content, session_id)
-            .await?;
-
-        if turn_index.is_some() || source_timestamp.is_some() {
-            note.turn_index = turn_index;
-            note.source_timestamp = source_timestamp;
-            self.vector_store.upsert(&note).await?;
-        }
-
-        Ok(note)
     }
 
     // --- Read ---
 
+    /// Current open ledger rows for a mutable slot. Canonicalizes `entity`
+    /// via the same write-time normalization, then reads the slot_ledger.
+    /// Empty when no ledger is attached (e.g. non-`with_defaults` construction).
+    pub async fn slot_ledger_current(
+        &self,
+        entity: &str,
+        predicate: &str,
+    ) -> Result<Vec<crate::store::slot_ledger::LedgerRow>> {
+        let Some(ledger) = &self.slot_ledger else {
+            return Ok(Vec::new());
+        };
+        let norm = crate::extract::entity_key::normalize_entity(entity);
+        let key = self
+            .entity_aliases
+            .lock()
+            .ok()
+            .and_then(|a| a.lookup_exact(&norm))
+            .unwrap_or(norm);
+        ledger.current(&key, predicate)
+    }
+
+    /// Full ledger history (open + superseded rows) for a mutable slot.
+    /// Canonicalizes `entity` via the same write-time normalization, then
+    /// reads the slot_ledger. Empty when no ledger is attached (e.g.
+    /// non-`with_defaults` construction).
+    pub async fn slot_ledger_history(
+        &self,
+        entity: &str,
+        predicate: &str,
+    ) -> Result<Vec<crate::store::slot_ledger::LedgerRow>> {
+        let Some(ledger) = &self.slot_ledger else {
+            return Ok(Vec::new());
+        };
+        let norm = crate::extract::entity_key::normalize_entity(entity);
+        let key = self
+            .entity_aliases
+            .lock()
+            .ok()
+            .and_then(|a| a.lookup_exact(&norm))
+            .unwrap_or(norm);
+        ledger.history(&key, predicate)
+    }
+
     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
-        self.read_engine.search(query, top_k).await
+        self.search_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    pub async fn search_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<Vec<SearchResult>> {
+        self.read_engine.search_with_clock(query, top_k, ctx).await
     }
 
     pub async fn ask(&self, query: &str, top_k: usize) -> Result<crate::note::AskResult> {
-        self.read_engine.ask(query, top_k).await
+        self.ask_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    pub async fn ask_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<crate::note::AskResult> {
+        self.read_engine.ask_with_clock(query, top_k, ctx).await
+    }
+
+    /// Retrieve-only entry point: runs the full Karta retrieval pipeline
+    /// (classify → search → rerank → dedup → order → contradiction inject
+    /// → assemble context) and returns the assembled memories **without**
+    /// calling any LLM for answer composition.
+    ///
+    /// Karta's responsibility ends at "here are the relevant memories,
+    /// pre-assembled into an LLM-ready context string". The caller composes
+    /// the final prompt, picks their own model, and runs the generation
+    /// step themselves. Use [`ask`] if you want Karta to also compose an
+    /// answer via its configured answer-LLM.
+    pub async fn fetch_memories(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<crate::note::FetchedMemories> {
+        self.fetch_memories_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    pub async fn fetch_memories_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<crate::note::FetchedMemories> {
+        self.read_engine.fetch_memories_with_clock(query, top_k, ctx).await
     }
 
     // --- Dream ---
@@ -211,13 +390,22 @@ impl Karta {
         scope_type: &str,
         scope_id: &str,
     ) -> Result<DreamRun> {
+        self.run_dreaming_with_clock(scope_type, scope_id, ClockContext::now()).await
+    }
+
+    pub async fn run_dreaming_with_clock(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        ctx: ClockContext,
+    ) -> Result<DreamRun> {
         let engine = DreamEngine::new(
             Arc::clone(&self.vector_store),
             Arc::clone(&self.graph_store),
             Arc::clone(&self.llm),
             self.config.dream.clone(),
         );
-        engine.run(scope_type, scope_id).await
+        engine.run_with_clock(scope_type, scope_id, ctx).await
     }
 
     // --- Inspection ---
@@ -237,6 +425,14 @@ impl Karta {
     /// Get links for a note from the graph store.
     pub async fn get_links(&self, note_id: &str) -> Result<Vec<String>> {
         self.graph_store.get_links(note_id).await
+    }
+
+    /// Get the atomic facts extracted from a note, in ordinal order.
+    pub async fn get_facts_for_note(
+        &self,
+        note_id: &str,
+    ) -> Result<Vec<crate::note::AtomicFact>> {
+        self.vector_store.get_facts_for_note(note_id).await
     }
 
     /// Raw LLM chat access for evaluation/judge use cases.

@@ -9,7 +9,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use karta_core::Karta;
+use karta_core::{ClockContext, Karta};
 
 // -- Tool parameter types --
 
@@ -100,13 +100,15 @@ impl KartaService {
         &self,
         Parameters(params): Parameters<AddNoteParams>,
     ) -> Result<CallToolResult, McpError> {
-        let result = if let Some(session_id) = &params.session_id {
-            self.karta
-                .add_note_with_session(&params.content, session_id)
-                .await
-        } else {
-            self.karta.add_note(&params.content).await
-        };
+        let result = self
+            .karta
+            .add_note_with_clock(
+                &params.content,
+                params.session_id.as_deref(),
+                None,
+                ClockContext::now(),
+            )
+            .await;
 
         match result {
             Ok(note) => {

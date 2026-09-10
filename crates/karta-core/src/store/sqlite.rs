@@ -1,17 +1,23 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::dream::DreamRun;
 use crate::error::{KartaError, Result};
 use crate::note::EvolutionRecord;
 
 pub struct SqliteGraphStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteGraphStore {
+    /// Create with a shared connection (preferred — shares with SqliteVectorStore).
+    pub fn with_connection(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    /// Create with own connection (backwards compat for tests).
     pub fn new(data_dir: &str) -> Result<Self> {
         let path = format!("{}/karta.db", data_dir);
         std::fs::create_dir_all(data_dir)
@@ -25,11 +31,8 @@ impl SqliteGraphStore {
         conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA foreign_keys=ON;")
             .map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
         // We'll call init() from Karta::new()
-        Ok(store)
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 }
 
@@ -117,16 +120,12 @@ impl crate::store::GraphStore for SqliteGraphStore {
             );
             CREATE INDEX IF NOT EXISTS idx_note_episodes_episode ON note_episodes(episode_id);
 
-            -- Atomic facts metadata (Phase Next)
-            CREATE TABLE IF NOT EXISTS atomic_facts (
-                id TEXT PRIMARY KEY,
-                source_note_id TEXT NOT NULL,
-                ordinal INTEGER NOT NULL DEFAULT 0,
-                subject TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_facts_source ON atomic_facts(source_note_id);
-            CREATE INDEX IF NOT EXISTS idx_facts_subject ON atomic_facts(subject);
+            -- `atomic_facts` is owned by SqliteVectorStore (sqlite_vec.rs) as of
+            -- STEP2 Task 5. The graph store no longer shadows its schema —
+            -- `record_fact` is a trait-default no-op here, and the canonical row
+            -- (including memory_kind/facet/entity_type/etc.) lives in the vector
+            -- store's table. Keeping the DDL here would silently collide with
+            -- the shared-connection setup and drop columns via INSERT OR REPLACE.
 
             -- Episode digests (Phase Next)
             CREATE TABLE IF NOT EXISTS episode_digests (
@@ -136,11 +135,25 @@ impl crate::store::GraphStore for SqliteGraphStore {
                 date_range_json TEXT,
                 aggregations_json TEXT NOT NULL DEFAULT '[]',
                 topic_sequence_json TEXT NOT NULL DEFAULT '[]',
+                events_json TEXT NOT NULL DEFAULT '[]',
                 digest_text TEXT NOT NULL DEFAULT '',
                 digest_note_id TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_digests_episode ON episode_digests(episode_id);
+
+            -- Cross-episode digests (structural cross-level metadata)
+            CREATE TABLE IF NOT EXISTS cross_episode_digests (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                entity_timeline_json TEXT NOT NULL DEFAULT '[]',
+                cross_aggregations_json TEXT NOT NULL DEFAULT '[]',
+                events_json TEXT NOT NULL DEFAULT '[]',
+                topic_progression_json TEXT NOT NULL DEFAULT '[]',
+                digest_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_cross_digests_scope ON cross_episode_digests(scope_id);
 
             -- Episode links (Phase Next)
             CREATE TABLE IF NOT EXISTS episode_links (
@@ -596,9 +609,10 @@ impl crate::store::GraphStore for SqliteGraphStore {
         let date_range_json = digest.date_range.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default());
         let aggregations_json = serde_json::to_string(&digest.aggregations)?;
         let topic_sequence_json = serde_json::to_string(&digest.topic_sequence)?;
+        let events_json = serde_json::to_string(&digest.events)?;
         conn.execute(
-            "INSERT OR REPLACE INTO episode_digests (id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest_text, digest_note_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![digest.id, digest.episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest.digest_text, digest.digest_note_id, digest.created_at.to_rfc3339()],
+            "INSERT OR REPLACE INTO episode_digests (id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, events_json, digest_text, digest_note_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![digest.id, digest.episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, events_json, digest.digest_text, digest.digest_note_id, digest.created_at.to_rfc3339()],
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
         Ok(())
     }
@@ -606,7 +620,7 @@ impl crate::store::GraphStore for SqliteGraphStore {
     async fn get_episode_digest(&self, episode_id: &str) -> Result<Option<crate::note::EpisodeDigest>> {
         let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn.prepare(
-            "SELECT id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest_text, digest_note_id, created_at FROM episode_digests WHERE episode_id = ?1"
+            "SELECT id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, events_json, digest_text, digest_note_id, created_at FROM episode_digests WHERE episode_id = ?1"
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
         let result = stmt.query_row(rusqlite::params![episode_id], |row| {
@@ -614,7 +628,8 @@ impl crate::store::GraphStore for SqliteGraphStore {
             let date_range_str: Option<String> = row.get(3)?;
             let agg_str: String = row.get(4)?;
             let topic_str: String = row.get(5)?;
-            let created_str: String = row.get(8)?;
+            let events_str: String = row.get(6)?;
+            let created_str: String = row.get(9)?;
             Ok(crate::note::EpisodeDigest {
                 id: row.get(0)?,
                 episode_id: row.get(1)?,
@@ -622,8 +637,9 @@ impl crate::store::GraphStore for SqliteGraphStore {
                 date_range: date_range_str.and_then(|s| serde_json::from_str(&s).ok()),
                 aggregations: serde_json::from_str(&agg_str).unwrap_or_default(),
                 topic_sequence: serde_json::from_str(&topic_str).unwrap_or_default(),
-                digest_text: row.get(6)?,
-                digest_note_id: row.get(7)?,
+                events: serde_json::from_str(&events_str).unwrap_or_default(),
+                digest_text: row.get(7)?,
+                digest_note_id: row.get(8)?,
                 created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
                     .unwrap_or_default().with_timezone(&chrono::Utc),
             })
@@ -639,7 +655,7 @@ impl crate::store::GraphStore for SqliteGraphStore {
     async fn get_all_episode_digests(&self) -> Result<Vec<crate::note::EpisodeDigest>> {
         let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn.prepare(
-            "SELECT id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, digest_text, digest_note_id, created_at FROM episode_digests ORDER BY created_at"
+            "SELECT id, episode_id, entities_json, date_range_json, aggregations_json, topic_sequence_json, events_json, digest_text, digest_note_id, created_at FROM episode_digests ORDER BY created_at"
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
 
         let digests = stmt.query_map([], |row| {
@@ -647,7 +663,8 @@ impl crate::store::GraphStore for SqliteGraphStore {
             let date_range_str: Option<String> = row.get(3)?;
             let agg_str: String = row.get(4)?;
             let topic_str: String = row.get(5)?;
-            let created_str: String = row.get(8)?;
+            let events_str: String = row.get(6)?;
+            let created_str: String = row.get(9)?;
             Ok(crate::note::EpisodeDigest {
                 id: row.get(0)?,
                 episode_id: row.get(1)?,
@@ -655,8 +672,9 @@ impl crate::store::GraphStore for SqliteGraphStore {
                 date_range: date_range_str.and_then(|s| serde_json::from_str(&s).ok()),
                 aggregations: serde_json::from_str(&agg_str).unwrap_or_default(),
                 topic_sequence: serde_json::from_str(&topic_str).unwrap_or_default(),
-                digest_text: row.get(6)?,
-                digest_note_id: row.get(7)?,
+                events: serde_json::from_str(&events_str).unwrap_or_default(),
+                digest_text: row.get(7)?,
+                digest_note_id: row.get(8)?,
                 created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
                     .unwrap_or_default().with_timezone(&chrono::Utc),
             })
@@ -676,26 +694,53 @@ impl crate::store::GraphStore for SqliteGraphStore {
         Ok(ids.filter_map(|r| r.ok()).collect())
     }
 
-    // --- Atomic Fact Metadata (Phase Next) ---
-
-    async fn record_fact(&self, fact_id: &str, source_note_id: &str, ordinal: u32, subject: Option<&str>) -> Result<()> {
+    async fn upsert_cross_episode_digest(&self, digest: &crate::note::CrossEpisodeDigest) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
+        let entity_timeline_json = serde_json::to_string(&digest.entity_timeline)?;
+        let cross_aggregations_json = serde_json::to_string(&digest.cross_aggregations)?;
+        let events_json = serde_json::to_string(&digest.events)?;
+        let topic_progression_json = serde_json::to_string(&digest.topic_progression)?;
         conn.execute(
-            "INSERT OR REPLACE INTO atomic_facts (id, source_note_id, ordinal, subject) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![fact_id, source_note_id, ordinal, subject],
+            "INSERT OR REPLACE INTO cross_episode_digests (id, scope_id, entity_timeline_json, cross_aggregations_json, events_json, topic_progression_json, digest_text, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![digest.id, digest.scope_id, entity_timeline_json, cross_aggregations_json, events_json, topic_progression_json, digest.digest_text, digest.created_at.to_rfc3339()],
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
         Ok(())
     }
 
-    async fn get_facts_by_subject(&self, subject: &str) -> Result<Vec<String>> {
+    async fn get_all_cross_episode_digests(&self) -> Result<Vec<crate::note::CrossEpisodeDigest>> {
         let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
         let mut stmt = conn.prepare(
-            "SELECT id FROM atomic_facts WHERE subject = ?1 ORDER BY created_at"
+            "SELECT id, scope_id, entity_timeline_json, cross_aggregations_json, events_json, topic_progression_json, digest_text, created_at FROM cross_episode_digests ORDER BY created_at"
         ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
-        let ids = stmt.query_map(rusqlite::params![subject], |row| row.get(0))
-            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
-        Ok(ids.filter_map(|r| r.ok()).collect())
+
+        let digests = stmt.query_map([], |row| {
+            let timeline_str: String = row.get(2)?;
+            let agg_str: String = row.get(3)?;
+            let events_str: String = row.get(4)?;
+            let topic_str: String = row.get(5)?;
+            let created_str: String = row.get(7)?;
+            Ok(crate::note::CrossEpisodeDigest {
+                id: row.get(0)?,
+                scope_id: row.get(1)?,
+                entity_timeline: serde_json::from_str(&timeline_str).unwrap_or_default(),
+                cross_aggregations: serde_json::from_str(&agg_str).unwrap_or_default(),
+                events: serde_json::from_str(&events_str).unwrap_or_default(),
+                topic_progression: serde_json::from_str(&topic_str).unwrap_or_default(),
+                digest_text: row.get(6)?,
+                created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                    .unwrap_or_default().with_timezone(&chrono::Utc),
+            })
+        }).map_err(|e| KartaError::GraphStore(e.to_string()))?;
+
+        Ok(digests.filter_map(|r| r.ok()).collect())
     }
+
+    // --- Atomic Fact Metadata ---
+    //
+    // `record_fact` and `get_facts_by_subject` fall back to the trait-default
+    // no-ops. The `atomic_facts` table is owned by SqliteVectorStore (see
+    // `sqlite_vec.rs`) and holds the canonical fact row. Shadowing it here
+    // would collide on the shared connection.
 
     // --- Episode Links (Phase Next) ---
 

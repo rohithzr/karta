@@ -47,18 +47,14 @@ impl Default for EpisodeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// Directory for embedded storage (SQLite graph store).
+    /// Directory for embedded storage (sqlite-vec + SQLite).
     pub data_dir: String,
-    /// Optional URI for LanceDB vector store (e.g. "gs://bucket/path").
-    /// If not set, defaults to "{data_dir}/lance".
-    pub lance_uri: Option<String>,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             data_dir: ".karta".into(),
-            lance_uri: None,
         }
     }
 }
@@ -167,11 +163,38 @@ pub struct WriteConfig {
     /// Max evolutions before a note is flagged for consolidation instead.
     pub max_evolutions_per_note: usize,
     /// Default TTL in days for foresight signals when no explicit expiry is extracted.
-    pub foresight_default_ttl_days: i64,
+    pub foresight_default_ttl_days: f64,
     /// Whether to extract and store atomic facts during note ingestion.
     pub extract_atomic_facts: bool,
     /// Maximum number of atomic facts to extract per note.
     pub max_facts_per_note: usize,
+    /// Drop foresights whose `valid_until` is within this window of
+    /// `ctx.reference_time()` at write time. Default 1.0 (24h).
+    #[serde(default = "default_foresight_doa_threshold_days")]
+    pub foresight_doa_threshold_days: f64,
+    /// Log a warning when ingest receives a `source_timestamp` more than
+    /// this many days ahead of `ctx.reference_time()`. Default 1.0.
+    #[serde(default = "default_future_skew_threshold_days")]
+    pub future_skew_threshold_days: f64,
+    /// Adaptive 2×-with-tiebreak voting for mutable-slot extraction: run the
+    /// templated extraction prompt twice and accept the agreeing tuples; on
+    /// disagreement, run a third time and keep the majority. Default false —
+    /// the 3-conv BEAM A/B (2026-07-08) showed voting is within noise on every
+    /// ability (worse on temporal) at +8% ingest cost, so it is opt-in only.
+    #[serde(default = "default_slot_voting")]
+    pub slot_voting: bool,
+}
+
+fn default_foresight_doa_threshold_days() -> f64 {
+    1.0
+}
+
+fn default_future_skew_threshold_days() -> f64 {
+    1.0
+}
+
+fn default_slot_voting() -> bool {
+    false
 }
 
 impl Default for WriteConfig {
@@ -181,9 +204,12 @@ impl Default for WriteConfig {
             similarity_threshold: 0.3,
             evolve_linked_notes: true,
             max_evolutions_per_note: 5,
-            foresight_default_ttl_days: 90,
+            foresight_default_ttl_days: 90.0,
             extract_atomic_facts: true,
             max_facts_per_note: 5,
+            foresight_doa_threshold_days: 1.0,
+            future_skew_threshold_days: 1.0,
+            slot_voting: false,
         }
     }
 }

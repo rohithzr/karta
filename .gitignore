@@ -5,6 +5,8 @@ Cargo.lock
 # Project data
 .karta/
 .amem-data/
+docs/superpowers/
+.superpowers
 
 # Environment & secrets
 .env
@@ -17,14 +19,15 @@ node_modules/
 # Claude Code / Agent tooling
 .claude/
 CLAUDE.md
+CLAUDE.local.md
 SKILL.md
 skill-lock.json
 skills-lock.json
-SKILL.md
 .agents/
+.context/
 
 # Test results
-.results/
+.results/*
 *.txt
 findings.md
 plan.md
@@ -43,6 +46,8 @@ Thumbs.db
 data/*.parquet
 data/*.json
 data/*_raw.json
+scripts/gpu-ctl.sh
+scripts/beam-poll.sh
 
 # Legacy PoC artifacts
 *.html
