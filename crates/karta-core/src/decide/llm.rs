@@ -31,10 +31,10 @@ fn answer_schema(questions: &[Question]) -> serde_json::Value {
                 "enum": options.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
             }),
             QuestionKind::YesNo => serde_json::json!({ "type": "boolean" }),
-            QuestionKind::Score { max } => serde_json::json!({
+            QuestionKind::Score { levels } => serde_json::json!({
                 "type": "integer",
                 "minimum": 0,
-                "maximum": max,
+                "maximum": levels.len().saturating_sub(1),
             }),
         };
         props.insert(q.name.clone(), prop);
@@ -63,8 +63,10 @@ fn render_prompt(state: &str, questions: &[Question]) -> String {
                 }
             }
             QuestionKind::YesNo => out.push_str("    (true or false)\n"),
-            QuestionKind::Score { max } => {
-                out.push_str(&format!("    (integer 0 to {})\n", max))
+            QuestionKind::Score { levels } => {
+                for (i, desc) in levels.iter().enumerate() {
+                    out.push_str(&format!("    {} = {}\n", i, desc));
+                }
             }
         }
     }
@@ -142,7 +144,11 @@ mod tests {
                 vec![("a".into(), "first".into()), ("b".into(), "second".into())],
             ),
             Question::yes_no("temporal", "Is it about time?"),
-            Question::score("relevance", "How relevant?", 5),
+            Question::score(
+                "relevance",
+                "How relevant?",
+                (0..6).map(|i| format!("level {}", i)).collect(),
+            ),
         ]
     }
 

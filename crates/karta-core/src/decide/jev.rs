@@ -5,13 +5,28 @@
 //! explicitly or via [`JevDecider::from_env`] (`JEV_API_KEY`, optional
 //! `JEV_BASE_URL`, `JEV_MODEL`).
 //!
-//! WIRE FORMAT IS UNVERIFIED. Jev launched in early access on 2026-09-15 and
-//! the public write-ups disagree on details (context window, option limits,
-//! response field names). The request/response mapping is isolated in
-//! `to_request` / `from_response` so it can be corrected in one place once we
-//! have API access; the response parser accepts the common field-name
-//! variants seen in third-party docs. Run the gated `decider_jev_live` test
-//! against the real API before relying on this backend.
+//! Wire format verified against the live API (model `jev-1.13.0`, 2026-10-02):
+//!
+//! ```text
+//! POST /v1/systemone
+//! { "model": "jev-latest", "state": "...",
+//!   "questions": {
+//!     "<name>": { "type": "choice", "instructions": "...", "criteria": { "<label>": "<description>", ... } },
+//!     "<name>": { "type": "noul",   "instructions": "..." },
+//!     "<name>": { "type": "score",  "instructions": "...", "criteria": ["<level 0>", "<level 1>", ...] } } }
+//! ->
+//! { "model": "jev-1.13.0",
+//!   "answers": {
+//!     "<name>": { "type": "choice", "choice": "<label>", "confidence": 0.95, "probabilities": { "<label>": 0.97, ... } },
+//!     "<name>": { "type": "noul",   "noul": 0.05 },
+//!     "<name>": { "type": "score",  "score": 1.6, "confidence": 0.0, "legend": {...}, "probabilities": {...} } },
+//!   "usage": { "input_tokens": 396, "output_tokens": 63 } }
+//! ```
+//!
+//! Score questions take at most 10 levels; the score is on `0..=levels-1`.
+//! Choice handled 20 options without complaint. Choice criteria are sent as a
+//! JSON object, so option order on the wire is serde_json's key order
+//! (alphabetical) — stable across calls, but not the order in `Question`.
 
 use async_trait::async_trait;
 
@@ -22,8 +37,8 @@ use crate::error::{KartaError, Result};
 /// `https://openrouter.ai/api/v1/systemone` with an OpenRouter key.
 pub const DEFAULT_JEV_URL: &str = "https://api.typesafe.ai/v1/systemone";
 pub const DEFAULT_JEV_MODEL: &str = "jev-latest";
-/// Jev's native score scale is 0–5; other `max` values are rescaled.
-const JEV_SCORE_MAX: f32 = 5.0;
+/// API limit on score levels.
+pub const MAX_SCORE_LEVELS: usize = 10;
 
 pub struct JevDecider {
     api_key: String,
@@ -56,40 +71,54 @@ impl JevDecider {
     }
 }
 
-pub(crate) fn to_request(model: &str, state: &str, questions: &[Question]) -> serde_json::Value {
+pub(crate) fn to_request(model: &str, state: &str, questions: &[Question]) -> Result<serde_json::Value> {
     let mut qmap = serde_json::Map::new();
     for q in questions {
         let body = match &q.kind {
-            QuestionKind::Choice { options } => serde_json::json!({
-                "type": "choice",
-                "instructions": q.instructions,
-                "options": options
+            QuestionKind::Choice { options } => {
+                let criteria: serde_json::Map<String, serde_json::Value> = options
                     .iter()
-                    .map(|(l, d)| serde_json::json!({ "label": l, "description": d }))
-                    .collect::<Vec<_>>(),
-            }),
+                    .map(|(l, d)| (l.clone(), serde_json::Value::String(d.clone())))
+                    .collect();
+                serde_json::json!({
+                    "type": "choice",
+                    "instructions": q.instructions,
+                    "criteria": criteria,
+                })
+            }
             QuestionKind::YesNo => serde_json::json!({
                 "type": "noul",
                 "instructions": q.instructions,
             }),
-            QuestionKind::Score { .. } => serde_json::json!({
-                "type": "score",
-                "instructions": q.instructions,
-            }),
+            QuestionKind::Score { levels } => {
+                if levels.len() < 2 || levels.len() > MAX_SCORE_LEVELS {
+                    return Err(KartaError::Config(format!(
+                        "Jev score question '{}' needs 2..={} levels, got {}",
+                        q.name,
+                        MAX_SCORE_LEVELS,
+                        levels.len()
+                    )));
+                }
+                serde_json::json!({
+                    "type": "score",
+                    "instructions": q.instructions,
+                    "criteria": levels,
+                })
+            }
         };
         qmap.insert(q.name.clone(), body);
     }
-    serde_json::json!({ "model": model, "state": state, "questions": qmap })
+    Ok(serde_json::json!({ "model": model, "state": state, "questions": qmap }))
 }
 
-fn first_f32(v: &serde_json::Value, keys: &[&str]) -> Option<f32> {
-    keys.iter().find_map(|k| v.get(*k).and_then(|x| x.as_f64())).map(|x| x as f32)
+fn get_f32(v: &serde_json::Value, key: &str) -> Option<f32> {
+    v.get(key).and_then(|x| x.as_f64()).map(|x| x as f32)
 }
 
 pub(crate) fn from_response(questions: &[Question], body: &serde_json::Value) -> Result<Decisions> {
-    let answers = ["answers", "decisions", "results"]
-        .iter()
-        .find_map(|k| body.get(*k).filter(|v| v.is_object()))
+    let answers = body
+        .get("answers")
+        .filter(|v| v.is_object())
         .ok_or_else(|| KartaError::Llm(format!("Jev: no answers object in response: {}", body)))?;
 
     let mut out = Decisions::new();
@@ -97,38 +126,31 @@ pub(crate) fn from_response(questions: &[Question], body: &serde_json::Value) ->
         let Some(a) = answers.get(&q.name) else { continue };
         let d = match &q.kind {
             QuestionKind::Choice { options } => {
-                let label = ["choice", "selected", "option", "label"]
-                    .iter()
-                    .find_map(|k| a.get(*k).and_then(|x| x.as_str()))
-                    .unwrap_or_default()
-                    .to_string();
-                let probs_obj = ["probabilities", "probs", "distribution"]
-                    .iter()
-                    .find_map(|k| a.get(*k));
+                let Some(label) = a.get("choice").and_then(|x| x.as_str()) else { continue };
                 let probs: Vec<(String, f32)> = options
                     .iter()
                     .map(|(l, _)| {
-                        let p = probs_obj
-                            .and_then(|p| p.get(l))
-                            .and_then(|x| x.as_f64())
-                            .map(|x| x as f32)
-                            .unwrap_or(if *l == label { 1.0 } else { 0.0 });
+                        let p = a
+                            .get("probabilities")
+                            .and_then(|p| get_f32(p, l))
+                            .unwrap_or(0.0);
                         (l.clone(), p)
                     })
                     .collect();
-                let confidence = first_f32(a, &["confidence"]).unwrap_or_else(|| {
-                    probs.iter().find(|(l, _)| *l == label).map(|(_, p)| *p).unwrap_or(0.0)
-                });
-                Decision::Choice { label, probs, confidence }
+                Decision::Choice {
+                    label: label.to_string(),
+                    probs,
+                    confidence: get_f32(a, "confidence").unwrap_or(0.0),
+                }
             }
-            QuestionKind::YesNo => match first_f32(a, &["probability", "p_yes", "p", "yes"]) {
+            QuestionKind::YesNo => match get_f32(a, "noul") {
                 Some(p_yes) => Decision::YesNo { p_yes },
                 None => continue,
             },
-            QuestionKind::Score { max } => match first_f32(a, &["value", "score", "position"]) {
-                Some(v) => Decision::Score {
-                    value: v * (*max as f32) / JEV_SCORE_MAX,
-                    confidence: first_f32(a, &["confidence"]).unwrap_or(0.0),
+            QuestionKind::Score { .. } => match get_f32(a, "score") {
+                Some(value) => Decision::Score {
+                    value,
+                    confidence: get_f32(a, "confidence").unwrap_or(0.0),
                 },
                 None => continue,
             },
@@ -149,7 +171,7 @@ impl Decider for JevDecider {
             .post(&self.url)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&to_request(&self.model, state, questions))
+            .json(&to_request(&self.model, state, questions)?)
             .send()
             .await
             .map_err(|e| KartaError::Llm(format!("Jev request failed: {}", e)))?;
@@ -178,6 +200,10 @@ impl Decider for JevDecider {
 mod tests {
     use super::*;
 
+    fn levels(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("level {}", i)).collect()
+    }
+
     fn qs() -> Vec<Question> {
         vec![
             Question::choice(
@@ -186,40 +212,62 @@ mod tests {
                 vec![("a".into(), "first".into()), ("b".into(), "second".into())],
             ),
             Question::yes_no("temporal", "Is it about time?"),
-            Question::score("relevance", "How relevant?", 10),
+            Question::score("relevance", "How relevant?", levels(6)),
         ]
     }
 
     #[test]
-    fn request_maps_question_kinds() {
-        let r = to_request("jev-latest", "state", &qs());
+    fn request_matches_live_wire_format() {
+        let r = to_request("jev-latest", "state", &qs()).unwrap();
         assert_eq!(r["model"], "jev-latest");
+        assert_eq!(r["state"], "state");
         assert_eq!(r["questions"]["mode"]["type"], "choice");
-        assert_eq!(r["questions"]["mode"]["options"][1]["label"], "b");
+        assert_eq!(r["questions"]["mode"]["criteria"]["b"], "second");
         assert_eq!(r["questions"]["temporal"]["type"], "noul");
         assert_eq!(r["questions"]["relevance"]["type"], "score");
+        assert_eq!(r["questions"]["relevance"]["criteria"][5], "level 5");
     }
 
     #[test]
-    fn response_parses_probabilities_and_rescales_score() {
+    fn request_rejects_too_many_score_levels() {
+        let q = [Question::score("s", "?", levels(MAX_SCORE_LEVELS + 1))];
+        assert!(to_request("jev-latest", "x", &q).is_err());
+    }
+
+    /// Body captured from the live API (jev-1.13.0), names adapted.
+    #[test]
+    fn response_parses_live_shape() {
         let body = serde_json::json!({
+            "model": "jev-1.13.0",
             "answers": {
-                "mode": { "choice": "b", "probabilities": { "a": 0.2, "b": 0.8 }, "confidence": 0.8 },
-                "temporal": { "probability": 0.9 },
-                "relevance": { "value": 2.5, "confidence": 0.6 }
-            }
+                "mode": { "type": "choice", "choice": "b", "confidence": 0.95,
+                          "probabilities": { "a": 0.03, "b": 0.97 } },
+                "temporal": { "type": "noul", "noul": 0.05 },
+                "relevance": { "type": "score", "score": 1.6, "confidence": 0.0,
+                               "legend": { "0": "level 0" },
+                               "probabilities": { "0": 0.34, "1": 0.16 } }
+            },
+            "usage": { "input_tokens": 396, "output_tokens": 63 }
         });
         let out = from_response(&qs(), &body).unwrap();
         validate(&qs(), &out).unwrap();
         assert_eq!(out["mode"].label(), Some("b"));
-        assert!((out["mode"].confidence() - 0.8).abs() < 1e-6);
-        assert_eq!(out["temporal"], Decision::YesNo { p_yes: 0.9 });
-        // 2.5 on Jev's 0–5 scale is 5.0 on a 0–10 question.
-        assert_eq!(out["relevance"], Decision::Score { value: 5.0, confidence: 0.6 });
+        assert!((out["mode"].confidence() - 0.95).abs() < 1e-6);
+        assert_eq!(
+            out["mode"],
+            Decision::Choice {
+                label: "b".into(),
+                probs: vec![("a".into(), 0.03), ("b".into(), 0.97)],
+                confidence: 0.95,
+            }
+        );
+        assert_eq!(out["temporal"], Decision::YesNo { p_yes: 0.05 });
+        assert_eq!(out["relevance"], Decision::Score { value: 1.6, confidence: 0.0 });
     }
 
     #[test]
     fn response_without_answers_object_is_an_error() {
-        assert!(from_response(&qs(), &serde_json::json!({ "error": "x" })).is_err());
+        let err = serde_json::json!({ "detail": "Too many score levels." });
+        assert!(from_response(&qs(), &err).is_err());
     }
 }

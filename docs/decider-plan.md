@@ -33,7 +33,7 @@ probabilities, in one forward pass, without generating text.
 | Item | Purpose |
 |---|---|
 | `Decider` trait | `decide(state, &[Question]) -> Decisions`. Several named questions per call, since batching is nearly free for Jev. |
-| `Question` / `QuestionKind` | `Choice { options: (label, description) }`, `YesNo`, `Score { max }` |
+| `Question` / `QuestionKind` | `Choice { options: (label, description) }`, `YesNo`, `Score { levels }` (2–10 level descriptions) |
 | `Decision` | chosen label + per-option probabilities, `p_yes`, or score; `confidence()` |
 | `LlmDecider` | Baseline. One structured-output call with an enum/bool/int schema. No new dependency. |
 | `JevDecider` | TypeSafe Jev System One API. `JevDecider::from_env()` reads `JEV_API_KEY`, `JEV_BASE_URL`, `JEV_MODEL`. |
@@ -41,18 +41,42 @@ probabilities, in one forward pass, without generating text.
 | `decide::questions` | `query_mode_question`, `query_predicate_question` (12 predicates + none), `query_temporal_question`, and mappers back to `QueryMode` / `Predicate`. |
 | `tests/decider_jev_live.rs` | Gated on `JEV_API_KEY`. Verifies the wire format and prints Jev vs keyword classifier on 18 hand-labeled queries. |
 
-**The Jev wire format is unverified.** Public write-ups disagree (context
-32K vs 64K, 2–16 vs up to 255 choice options, response field names). The
-mapping lives in `to_request` / `from_response` in `decide/jev.rs`; fix it
-there once the live test runs against a real key.
+**Wire format verified** against the live API (`jev-1.13.0`, 2026-10-02);
+the exact request/response shape is documented at the top of
+`decide/jev.rs`. Score questions take 2–10 level descriptions; choice
+handled 20 options.
+
+## First live result (2026-10-02)
+
+`tests/decider_jev_live.rs`, 18 hand-labeled queries, one `decide` call per
+query asking mode + predicate + temporal together:
+
+| Decision | Jev | Today's classifier |
+|---|---|---|
+| Query mode (6-way) | **17/18** | 11/18 (keyword fallback) |
+| Ledger predicate (13-way) | **17/18** | — |
+| Latency per call (3 questions) | ~150–250 ms | — |
+
+- The one mode miss ("I'm known for being punctual, right?" → standard,
+  want existence) came with confidence 0.62; every correct answer was
+  ≥ 0.74, most ≥ 0.92. A confidence fallback would have caught it.
+- The predicate "miss" ("How many days passed between…" → count) is
+  arguably right.
+- The temporal yes/no is not usable as worded: p_yes ranged 0.53–0.98 and
+  barely separated temporal from non-temporal queries. Reword or drop it.
+- Caveats: 18 queries written by us, not BEAM; compared against the
+  keyword classifier, not the embedding-centroid one used when embeddings
+  are available. The BEAM A/B in step 2 is the real test.
+- With uninformative options Jev picked the first option at 0.69 — it has
+  a position prior. Choice criteria go over the wire as a JSON object in
+  alphabetical key order, so order is stable.
 
 ## Rollout order
 
 Each step is behind a config flag defaulting to today's behavior, and is
 measured on BEAM 100K (±3pp is noise, single runs) before flipping the default.
 
-1. **Get access + verify wire format.** Run `decider_jev_live`, fix
-   `jev.rs` if needed. Record latency and per-query cost.
+1. ~~**Get access + verify wire format.**~~ Done 2026-10-02 (see above).
 2. **Query understanding (read path, one call per query).** Ask mode +
    predicate + temporal in a single `decide` call. Use the Decider answer
    when `confidence >= threshold`, else fall back to centroid / keywords.
@@ -62,7 +86,7 @@ measured on BEAM 100K (±3pp is noise, single runs) before flipping the default.
 3. **Answerability gate.** YesNo "does this context contain the answer?"
    before synthesis; targets false abstention (18% of failures) and gives a
    calibrated abstain signal (the reranker threshold is logged, not enforced).
-4. **Rerank scores.** `Score { max: 5 }` per candidate as an alternative
+4. **Rerank scores.** a 6-level `Score` per candidate as an alternative
    `Reranker` impl; compare to Jina on the same runs.
 5. **Write path.** Link / no-link and episode boundary as YesNo, replacing
    their LLM calls. Contradiction check on slot supersession and dream

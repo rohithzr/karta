@@ -41,8 +41,9 @@ pub enum QuestionKind {
     Choice { options: Vec<(String, String)> },
     /// Yes / no — answered as a probability that the statement holds.
     YesNo,
-    /// Ordinal score on `0..=max` (Jev's native scale is 0–5).
-    Score { max: u8 },
+    /// Ordinal score on `0..=levels.len()-1`; each entry describes one level,
+    /// lowest first. Jev accepts at most 10 levels.
+    Score { levels: Vec<String> },
 }
 
 /// One question to ask about a state.
@@ -72,11 +73,11 @@ impl Question {
         }
     }
 
-    pub fn score(name: &str, instructions: &str, max: u8) -> Self {
+    pub fn score(name: &str, instructions: &str, levels: Vec<String>) -> Self {
         Self {
             name: name.to_string(),
             instructions: instructions.to_string(),
-            kind: QuestionKind::Score { max },
+            kind: QuestionKind::Score { levels },
         }
     }
 }
@@ -93,7 +94,7 @@ pub enum Decision {
     },
     /// Probability that the statement holds.
     YesNo { p_yes: f32 },
-    /// Probability-weighted position on the scale, in `0..=max`.
+    /// Probability-weighted position on the scale, in `0..=levels.len()-1`.
     Score { value: f32, confidence: f32 },
 }
 
@@ -154,8 +155,9 @@ pub(crate) fn validate(questions: &[Question], decisions: &Decisions) -> Result<
                     )));
                 }
             }
-            (QuestionKind::Score { max }, Decision::Score { value, .. }) => {
-                if !(0.0..=*max as f32).contains(value) {
+            (QuestionKind::Score { levels }, Decision::Score { value, .. }) => {
+                let max = levels.len().saturating_sub(1);
+                if !(0.0..=max as f32).contains(value) {
                     return Err(KartaError::Llm(format!(
                         "decider score {} out of 0..={} for '{}'",
                         value, max, q.name
