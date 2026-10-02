@@ -84,7 +84,7 @@ fn apply_config_env(config: &mut KartaConfig) {
     config.reranker.enabled = env_bool("K_RERANKER", true);
     config.reranker.abstention_threshold = env_f32("K_ABSTENTION_THRESH", 0.01);
     config.reranker.max_rerank = env_usize("K_MAX_RERANK", 20);
-    config.write.foresight_default_ttl_days = env_usize("K_FORESIGHT_TTL", 90) as i64;
+    config.write.foresight_default_ttl_days = env_usize("K_FORESIGHT_TTL", 90) as f64;
     config.write.extract_atomic_facts = env_bool("K_EXTRACT_FACTS", true);
     config.read.fact_retrieval_enabled = env_bool("K_FACT_RETRIEVAL", true);
     config.read.fact_match_boost = env_f32("K_FACT_BOOST", 0.1);
@@ -114,8 +114,8 @@ fn find_latest_data_dir(conv_id: &str) -> Option<String> {
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
             let created = meta.created().ok().or_else(|| meta.modified().ok())?;
-            let lance_path = e.path().join("lance/notes.lance/data");
-            if lance_path.exists() {
+            let sqlite_path = e.path().join("karta.db");
+            if sqlite_path.exists() {
                 Some((e.path().to_string_lossy().to_string(), created))
             } else {
                 None

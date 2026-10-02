@@ -32,6 +32,10 @@ pub trait VectorStore: Send + Sync {
     /// Total note count.
     async fn count(&self) -> Result<usize>;
 
+    /// Return the next value of a persistent, monotonic global sequence counter.
+    /// Default (non-persistent stores) returns 0.
+    async fn next_seq(&self) -> Result<u64> { Ok(0) }
+
     // --- Atomic Facts (Phase Next) ---
 
     /// Insert or update an atomic fact with its embedding.
@@ -44,6 +48,26 @@ pub trait VectorStore: Send + Sync {
         _top_k: usize,
         _exclude_source_note_ids: &[&str],
     ) -> Result<Vec<(AtomicFact, f32)>> { Ok(Vec::new()) }
+
+    /// Find the top-K most similar atomic facts by embedding, restricted to
+    /// facts whose `[occurred_start, occurred_end)` interval overlaps
+    /// `[interval_start, interval_end)`. Null-bound facts are excluded — this
+    /// is by design, since a null-bound fact has no known when-it-happened
+    /// and cannot be proved to fall inside the query's window.
+    ///
+    /// The default returns `unimplemented!()` rather than delegating to
+    /// `find_similar_facts` because the caller MUST opt into interval-scoped
+    /// retrieval at the trait level — silent fall-through would leak
+    /// out-of-window facts into temporal answers.
+    async fn find_similar_facts_in_interval(
+        &self,
+        _embedding: &[f32],
+        _top_k: usize,
+        _interval_start: chrono::DateTime<chrono::Utc>,
+        _interval_end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<(AtomicFact, f32)>> {
+        unimplemented!("interval-scoped fact retrieval not supported by this store")
+    }
 
     /// Get all facts for a given source note.
     async fn get_facts_for_note(&self, _note_id: &str) -> Result<Vec<AtomicFact>> { Ok(Vec::new()) }

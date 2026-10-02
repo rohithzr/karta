@@ -119,16 +119,12 @@ impl crate::store::GraphStore for SqliteGraphStore {
             );
             CREATE INDEX IF NOT EXISTS idx_note_episodes_episode ON note_episodes(episode_id);
 
-            -- Atomic facts metadata (Phase Next)
-            CREATE TABLE IF NOT EXISTS atomic_facts (
-                id TEXT PRIMARY KEY,
-                source_note_id TEXT NOT NULL,
-                ordinal INTEGER NOT NULL DEFAULT 0,
-                subject TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_facts_source ON atomic_facts(source_note_id);
-            CREATE INDEX IF NOT EXISTS idx_facts_subject ON atomic_facts(subject);
+            -- `atomic_facts` is owned by SqliteVectorStore (sqlite_vec.rs) as of
+            -- STEP2 Task 5. The graph store no longer shadows its schema —
+            -- `record_fact` is a trait-default no-op here, and the canonical row
+            -- (including memory_kind/facet/entity_type/etc.) lives in the vector
+            -- store's table. Keeping the DDL here would silently collide with
+            -- the shared-connection setup and drop columns via INSERT OR REPLACE.
 
             -- Episode digests (Phase Next)
             CREATE TABLE IF NOT EXISTS episode_digests (
@@ -738,26 +734,12 @@ impl crate::store::GraphStore for SqliteGraphStore {
         Ok(digests.filter_map(|r| r.ok()).collect())
     }
 
-    // --- Atomic Fact Metadata (Phase Next) ---
-
-    async fn record_fact(&self, fact_id: &str, source_note_id: &str, ordinal: u32, subject: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO atomic_facts (id, source_note_id, ordinal, subject) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![fact_id, source_note_id, ordinal, subject],
-        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn get_facts_by_subject(&self, subject: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().map_err(|e| KartaError::GraphStore(e.to_string()))?;
-        let mut stmt = conn.prepare(
-            "SELECT id FROM atomic_facts WHERE subject = ?1 ORDER BY created_at"
-        ).map_err(|e| KartaError::GraphStore(e.to_string()))?;
-        let ids = stmt.query_map(rusqlite::params![subject], |row| row.get(0))
-            .map_err(|e| KartaError::GraphStore(e.to_string()))?;
-        Ok(ids.filter_map(|r| r.ok()).collect())
-    }
+    // --- Atomic Fact Metadata ---
+    //
+    // `record_fact` and `get_facts_by_subject` fall back to the trait-default
+    // no-ops. The `atomic_facts` table is owned by SqliteVectorStore (see
+    // `sqlite_vec.rs`) and holds the canonical fact row. Shadowing it here
+    // would collide on the shared connection.
 
     // --- Episode Links (Phase Next) ---
 

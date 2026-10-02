@@ -7,7 +7,6 @@ description = "Agentic memory system that thinks, not just stores"
 
 [features]
 default = ["sqlite-vec", "sqlite", "openai"]
-lance = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
 sqlite = ["dep:rusqlite"]
 sqlite-vec = ["dep:sqlite-vec", "dep:rusqlite"]
 openai = ["dep:async-openai"]
@@ -40,10 +39,8 @@ tracing = "0.1"
 # Env
 dotenvy = "0.15"
 
-# Vector store: LanceDB
-lancedb = { version = "0.27", optional = true }
-arrow-array = { version = "57", optional = true }
-arrow-schema = { version = "57", optional = true }
+# Regex (tier 1 temporal resolver)
+regex = "1"
 
 # Graph store: SQLite
 rusqlite = { version = "0.35", features = ["bundled"], optional = true }

@@ -1,15 +1,44 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use tracing::{debug, info};
 
+pub mod temporal;
+pub mod resolve;
+pub mod resolve_llm;
+
+use crate::clock::ClockContext;
 use crate::config::ReadConfig;
 use crate::error::Result;
+use crate::extract::slots::Predicate;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
 use crate::note::{AskResult, FetchedMemories, MemoryNote, Provenance, SearchResult};
 use crate::rerank::{Reranker, RerankerConfig};
+use crate::store::slot_ledger::{LedgerRow, SlotLedger};
 use crate::store::{GraphStore, VectorStore};
+
+/// Chronological ordering comparator for notes: seq (true global order) takes
+/// precedence over the legacy turn_index/source_timestamp heuristic. Notes
+/// with `seq == 0` (legacy/unsequenced) fall back to the original
+/// turn_index > source_timestamp ordering exactly, so existing behavior for
+/// pre-substrate data is unchanged.
+pub(crate) fn note_order_cmp(a: &MemoryNote, b: &MemoryNote) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.seq, b.seq) {
+        // Both unsequenced (legacy/synthetic notes): preserve the prior
+        // turn_index > source_timestamp ordering exactly.
+        (0, 0) => match (a.turn_index, b.turn_index) {
+            (Some(ai), Some(bi)) => ai.cmp(&bi),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => a.source_timestamp.cmp(&b.source_timestamp),
+        },
+        // At least one is sequenced: global seq is the true total order.
+        // Tie-break equal seq by source_timestamp for determinism.
+        _ => a.seq.cmp(&b.seq).then_with(|| a.source_timestamp.cmp(&b.source_timestamp)),
+    }
+}
 
 /// Query classification for mode-specific retrieval behavior.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -202,6 +231,193 @@ fn classify_query_keywords(query: &str) -> QueryMode {
     QueryMode::Standard
 }
 
+/// Lightweight regex/keyword pre-filter that flags queries containing temporal
+/// indicators (relative phrases, weekday/month names, year tokens, ISO dates).
+///
+/// Used by the query classifier to set [`QueryClassification::temporal`] which
+/// in turn enables interval-overlap SQL filtering at retrieval time. This is
+/// purely lexical — semantic temporal intent is captured separately by
+/// [`QueryMode::Temporal`] via embedding similarity.
+pub(crate) fn has_temporal_indicator(query: &str) -> bool {
+    let q = query.to_lowercase();
+
+    let keywords = [
+        "when", "last ", "next ", "yesterday", "today", "tomorrow",
+        "before", "after", "during", "recently", "this week",
+        "this month", "this year", "this quarter",
+    ];
+    if keywords.iter().any(|k| q.contains(k)) {
+        return true;
+    }
+
+    let months = [
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+    ];
+    if months.iter().any(|m| q.contains(m)) {
+        return true;
+    }
+
+    let days = [
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    ];
+    if days.iter().any(|d| q.contains(d)) {
+        return true;
+    }
+
+    // 4-digit year (1900–2099) — also catches ISO dates like 2024-03-15.
+    static YEAR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = YEAR_RE.get_or_init(|| regex::Regex::new(r"\b(19|20)\d{2}\b").unwrap());
+    re.is_match(&q)
+}
+
+/// Public, integration-test-visible wrapper around [`has_temporal_indicator`].
+///
+/// Crate-internal callers should prefer the `pub(crate)` helper; this wrapper
+/// exists so tests under `crates/karta-core/tests/` (which see only `pub` API)
+/// can verify the temporal pre-filter.
+pub fn query_is_temporal(q: &str) -> bool {
+    has_temporal_indicator(q)
+}
+
+/// Output of the query classifier: the mode bucket plus auxiliary flags that
+/// downstream retrieval uses to gate behavior (e.g. interval-overlap SQL).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueryClassification {
+    pub mode: QueryMode,
+    /// True when the query contains lexical temporal indicators (weekday/month
+    /// names, year/ISO dates, "yesterday/last week/before/after/...").
+    /// Set independently of `mode` — a query can be `QueryMode::Standard` and
+    /// still be temporal (e.g. "did I deploy on March 15").
+    pub temporal: bool,
+}
+
+/// Keyword-only classifier that returns the full [`QueryClassification`]
+/// (mode + `temporal` flag). Embedding-based callers compose this with the
+/// embedding-derived mode separately; see `ReadEngine::search_wide`.
+pub fn classify_query(query: &str) -> QueryClassification {
+    QueryClassification {
+        mode: classify_query_keywords(query),
+        temporal: has_temporal_indicator(query),
+    }
+}
+
+/// Map a free-text query to a mutable-slot [`Predicate`] via keyword
+/// matching, ordered so more-specific phrases are checked before more
+/// general ones. Returns `None` if nothing matches — the caller should
+/// then skip ledger injection entirely.
+fn query_predicate(query: &str) -> Option<Predicate> {
+    let q = query.to_lowercase();
+
+    if q.contains("deadline") || q.contains("due") {
+        return Some(Predicate::Deadline);
+    }
+    if q.contains("how many") || q.contains("count") || q.contains("number of") {
+        return Some(Predicate::Count);
+    }
+    if q.contains("role") || q.contains("title") || q.contains("job") {
+        return Some(Predicate::RoleTitle);
+    }
+    if q.contains("employer") || q.contains("work for") || q.contains("company") {
+        return Some(Predicate::Employer);
+    }
+    if q.contains("where") || q.contains("location") || q.contains("located") {
+        return Some(Predicate::Location);
+    }
+    if q.contains("status") {
+        return Some(Predicate::Status);
+    }
+    if q.contains("scheduled") || q.contains("when is") {
+        return Some(Predicate::ScheduledDate);
+    }
+    if q.contains("amount") || q.contains("salary") || q.contains("cost") || q.contains("price") {
+        return Some(Predicate::Amount);
+    }
+    if q.contains("using") || q.contains("tech") || q.contains("tool") || q.contains("stack") {
+        return Some(Predicate::TechChoice);
+    }
+    if q.contains("prefer") || q.contains("preference") || q.contains("favorite") {
+        return Some(Predicate::Preference);
+    }
+    if q.contains("own") || q.contains("owner") {
+        return Some(Predicate::Ownership);
+    }
+    if q.contains("metric") || q.contains("accuracy") || q.contains("latency") || q.contains("score") {
+        return Some(Predicate::MetricValue);
+    }
+    None
+}
+
+/// Render a Spike-4 style context block for mutable-slot ledger rows: one
+/// `[CURRENT] entity predicate = value (as of date)` line per row, or a
+/// `[CONFLICT] entity predicate: both "a" and "b" stated` line when 2+ rows
+/// share the same `conflict_group`. Pure and side-effect free.
+pub(crate) fn build_ledger_block(rows: &[LedgerRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    // Group rows by conflict_group (if any) while preserving encounter order.
+    let mut conflict_order: Vec<i64> = Vec::new();
+    let mut conflict_groups: std::collections::HashMap<i64, Vec<&LedgerRow>> =
+        std::collections::HashMap::new();
+    let mut singles: Vec<&LedgerRow> = Vec::new();
+
+    for row in rows {
+        match row.conflict_group {
+            Some(cg) => {
+                let entry = conflict_groups.entry(cg).or_insert_with(|| {
+                    conflict_order.push(cg);
+                    Vec::new()
+                });
+                entry.push(row);
+            }
+            None => singles.push(row),
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+
+    for cg in &conflict_order {
+        let group = &conflict_groups[cg];
+        if group.len() < 2 {
+            // Not actually a conflict (only one row tagged) — treat as CURRENT.
+            for row in group {
+                lines.push(render_current_line(row));
+            }
+            continue;
+        }
+        let first = group[0];
+        let values: Vec<String> = group.iter().map(|r| format!("\"{}\"", r.value)).collect();
+        let joined = if values.len() == 2 {
+            format!("{} and {}", values[0], values[1])
+        } else {
+            values.join(", ")
+        };
+        lines.push(format!(
+            "[CONFLICT] {} {}: both {} stated",
+            first.entity_key, first.predicate, joined
+        ));
+    }
+
+    for row in &singles {
+        lines.push(render_current_line(row));
+    }
+
+    lines.join("\n")
+}
+
+fn render_current_line(row: &LedgerRow) -> String {
+    let date = row
+        .valid_from
+        .unwrap_or(row.mention_time)
+        .format("%Y-%m-%d");
+    format!(
+        "[CURRENT] {} {} = {} (as of {})",
+        row.entity_key, row.predicate, row.value, date
+    )
+}
+
 /// Handles the read path: search, graph traversal, reranking, synthesis.
 pub struct ReadEngine {
     vector_store: Arc<dyn VectorStore>,
@@ -212,6 +428,8 @@ pub struct ReadEngine {
     config: ReadConfig,
     reranker_config: RerankerConfig,
     classifier: tokio::sync::OnceCell<QueryClassifier>,
+    slot_ledger: Option<Arc<SlotLedger>>,
+    entity_aliases: Option<Arc<Mutex<crate::extract::entity_key::EntityAliases>>>,
 }
 
 impl ReadEngine {
@@ -233,7 +451,24 @@ impl ReadEngine {
             config,
             reranker_config,
             classifier: tokio::sync::OnceCell::new(),
+            slot_ledger: None,
+            entity_aliases: None,
         }
+    }
+
+    /// Attach the shared mutable-slot ledger so synthesis can inject
+    /// [CURRENT]/[CONFLICT] context for queries about mutable facts.
+    pub(crate) fn attach_slot_ledger(&mut self, ledger: Arc<SlotLedger>) {
+        self.slot_ledger = Some(ledger);
+    }
+
+    /// Attach the shared write-time entity-alias table (read-only lookups
+    /// only — the read path never inserts new aliases).
+    pub(crate) fn set_entity_aliases(
+        &mut self,
+        aliases: Arc<Mutex<crate::extract::entity_key::EntityAliases>>,
+    ) {
+        self.entity_aliases = Some(aliases);
     }
 
     /// LLM used for the final answer-synthesis call. Defaults to `self.llm`
@@ -270,18 +505,18 @@ impl ReadEngine {
 
     /// Compute a recency score for a note using exponential decay.
     /// Returns 1.0 for brand new notes, decaying toward 0.0 for old notes.
-    /// Uses source_timestamp (real conversation date) when available,
-    /// falling back to updated_at (ingestion time).
-    fn recency_score(&self, note: &MemoryNote) -> f32 {
-        let reference_time = note.source_timestamp.unwrap_or(note.updated_at);
-        let age_days = Utc::now()
-            .signed_duration_since(reference_time)
+    /// Uses source_timestamp (the data's "now" at ingest) and the query's
+    /// reference_time, NOT Utc::now() — replays must age relative to the
+    /// query, not the wall clock.
+    fn recency_score(&self, note: &MemoryNote, ctx: ClockContext) -> f32 {
+        // Forward-date clamp (codex #2). If source_timestamp is past
+        // reference_time (clock skew, future-dated import, bug), age_days
+        // goes negative — clamp at 0.0 so recency = 1.0 (treated as
+        // fresh-as-possible). Better than producing decay > 1 or NaN.
+        let age_days = (ctx.reference_time() - note.source_timestamp)
             .num_seconds() as f64
             / 86400.0;
-
-        if age_days <= 0.0 {
-            return 1.0;
-        }
+        let age_days = age_days.max(0.0);
 
         // Exponential decay: score = 0.5^(age / half_life)
         let half_life = self.config.recency_half_life_days.max(1.0);
@@ -290,10 +525,48 @@ impl ReadEngine {
 
     /// Combine similarity score with recency to produce a final score.
     /// Accepts an explicit recency weight for mode-specific overrides.
-    fn blended_score_with_weight(&self, similarity: f32, note: &MemoryNote, recency_weight: f32) -> f32 {
+    fn blended_score_with_weight(
+        &self,
+        similarity: f32,
+        note: &MemoryNote,
+        recency_weight: f32,
+        ctx: ClockContext,
+    ) -> f32 {
         let w = recency_weight.clamp(0.0, 1.0);
-        let recency = self.recency_score(note);
+        let recency = self.recency_score(note, ctx);
         (1.0 - w) * similarity + w * recency
+    }
+
+    /// Fetch the last `n` user-turn notes from a session for tier 2
+    /// temporal-resolver context. Returns empty when session context is
+    /// unavailable (the common case on `search_wide` today) or on any
+    /// store error — the tier 2 resolver tolerates a missing recent-turn
+    /// list and anchors on `reference_time` instead.
+    ///
+    /// Plumbing a real session_id end-to-end is a follow-up; today's read
+    /// path doesn't thread one, so callers pass `None` and get an empty
+    /// vec.
+    async fn recent_user_turns_in_session(
+        &self,
+        session_id: Option<&str>,
+        n: usize,
+    ) -> Option<Vec<String>> {
+        let sid = session_id?;
+        let eps = self.graph_store.get_episodes_for_session(sid).await.ok()?;
+        let last_ep = eps.last()?;
+        let note_ids = self
+            .graph_store
+            .get_notes_for_episode(&last_ep.id)
+            .await
+            .ok()?;
+        let mut out = Vec::new();
+        for id in note_ids.iter().rev().take(n) {
+            if let Ok(Some(note)) = self.vector_store.get(id).await {
+                out.push(note.content);
+            }
+        }
+        out.reverse();
+        Some(out)
     }
 
     /// Drill into an episode: fetch constituent notes, filter active, sort chronologically.
@@ -312,20 +585,8 @@ impl ReadEngine {
             .filter(|n| n.is_active())
             .collect();
 
-        // Chronological order: prefer turn_index > source_timestamp > created_at
-        notes.sort_by(|a, b| {
-            match (a.turn_index, b.turn_index) {
-                (Some(ai), Some(bi)) => ai.cmp(&bi),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => match (a.source_timestamp, b.source_timestamp) {
-                    (Some(at), Some(bt)) => at.cmp(&bt),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.created_at.cmp(&b.created_at),
-                },
-            }
-        });
+        // Chronological order: seq (true order) > turn_index > source_timestamp
+        notes.sort_by(note_order_cmp);
         notes.truncate(self.config.max_notes_per_episode);
         Ok(notes)
     }
@@ -337,7 +598,7 @@ impl ReadEngine {
     /// Two-phase approach for latency: first traverse the graph (SQLite,
     /// sub-millisecond per hop) to collect all reachable IDs + weights,
     /// then fetch the notes in one batched vector-store call instead of
-    /// N individual get() calls (which are expensive on Lance).
+    /// N individual get() calls.
     async fn multi_hop_traverse(
         &self,
         seed_id: &str,
@@ -403,9 +664,20 @@ impl ReadEngine {
         Ok(weighted_notes.into_iter().map(|(n, _)| n).collect())
     }
 
-    /// Public search: returns exactly top_k results. For external callers.
+    /// Public search: returns exactly top_k results. Live default — anchors
+    /// recency to Utc::now() via ClockContext::now().
     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
-        let (mut results, _mode) = self.search_wide(query, top_k).await?;
+        self.search_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    /// Time-travel / replay query — recency anchored to ctx.reference_time().
+    pub async fn search_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<Vec<SearchResult>> {
+        let (mut results, _mode) = self.search_wide(query, top_k, ctx).await?;
         results.truncate(top_k);
 
         // Access tracking (fire-and-forget — don't block the read path)
@@ -426,7 +698,12 @@ impl ReadEngine {
     /// Internal search: returns the full expanded candidate pool (not truncated)
     /// plus the classified query mode. Used by ask() so the reranker can see the
     /// full pool before truncation, and ask() can use the same mode for top_k sizing.
-    async fn search_wide(&self, query: &str, top_k: usize) -> Result<(Vec<SearchResult>, QueryMode)> {
+    async fn search_wide(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<(Vec<SearchResult>, QueryMode)> {
         info!("Searching: \"{}\"", query);
 
         let embeddings = self.llm.embed(&[query]).await?;
@@ -454,14 +731,64 @@ impl ReadEngine {
             QueryMode::Recency => 0.60,
             _ => self.config.recency_weight,
         };
-        // Parallel search: notes + atomic facts (if enabled)
+        // Parallel search: notes + atomic facts (if enabled).
+        //
+        // Temporal gating: if the query carries a lexical temporal indicator
+        // AND tier 1 (Rust regex) resolves it to a concrete interval, we
+        // route fact retrieval through `find_similar_facts_in_interval` so
+        // out-of-window facts are filtered at the SQL layer. If tier 1 punts
+        // (ambiguous phrase like "last spring"), we fall back to tier 2
+        // (LLM resolver). Both resolvers' outputs pass through
+        // `validate_resolver_output`; schema violations degrade to
+        // unrestricted fact retrieval.
         let fact_k = fetch_k / 2;
+        let temporal_interval = if has_temporal_indicator(query) {
+            let ref_time = ctx.reference_time();
+            match resolve::resolve_temporal_phrase(query, ref_time) {
+                Some((interval, _conf)) => Some(interval),
+                None => {
+                    // Tier 2 fallback. Session context is not plumbed into
+                    // search_wide yet; pass empty recent_turns — the
+                    // resolver still handles self-anchored phrases like
+                    // "last spring" via reference_time alone.
+                    let recent = self
+                        .recent_user_turns_in_session(None, 3)
+                        .await
+                        .unwrap_or_default();
+                    let llm_resolver =
+                        resolve_llm::LlmResolver::new(Arc::clone(&self.llm));
+                    let ctx_r = resolve_llm::ResolverContext { recent_turns: recent };
+                    llm_resolver
+                        .resolve(query, ref_time, &ctx_r)
+                        .await
+                        .map(|(iv, _)| iv)
+                }
+            }
+        } else {
+            None
+        };
         let (direct, fact_hits) = if self.config.fact_retrieval_enabled {
-            let (direct_result, fact_hits_result) = tokio::join!(
-                self.vector_store.find_similar(&query_embedding, fetch_k, &[]),
-                self.vector_store.find_similar_facts(&query_embedding, fact_k, &[])
-            );
-            (direct_result?, fact_hits_result.unwrap_or_default())
+            match temporal_interval {
+                Some(interval) => {
+                    let (direct_result, fact_hits_result) = tokio::join!(
+                        self.vector_store.find_similar(&query_embedding, fetch_k, &[]),
+                        self.vector_store.find_similar_facts_in_interval(
+                            &query_embedding,
+                            fact_k,
+                            interval.start,
+                            interval.end,
+                        )
+                    );
+                    (direct_result?, fact_hits_result.unwrap_or_default())
+                }
+                None => {
+                    let (direct_result, fact_hits_result) = tokio::join!(
+                        self.vector_store.find_similar(&query_embedding, fetch_k, &[]),
+                        self.vector_store.find_similar_facts(&query_embedding, fact_k, &[])
+                    );
+                    (direct_result?, fact_hits_result.unwrap_or_default())
+                }
+            }
         } else {
             let direct = self.vector_store.find_similar(&query_embedding, fetch_k, &[]).await?;
             (direct, Vec::new())
@@ -528,7 +855,7 @@ impl ReadEngine {
                 _ => {}
             }
 
-            let mut final_score = self.blended_score_with_weight(sim, &note, effective_recency_weight);
+            let mut final_score = self.blended_score_with_weight(sim, &note, effective_recency_weight, ctx);
 
             // Graph-aware scoring: notes with more links score higher (PageRank-lite)
             let link_count = self.graph_store.get_link_count(&note.id).await?;
@@ -789,10 +1116,19 @@ impl ReadEngine {
     /// them to an agent, etc.). Use `ask()` if you want Karta to also
     /// compose an answer via its configured answer-LLM.
     pub async fn fetch_memories(&self, query: &str, top_k: usize) -> Result<FetchedMemories> {
+        self.fetch_memories_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    pub async fn fetch_memories_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<FetchedMemories> {
         let wide_k = top_k * self.config.summarization_top_k_multiplier.max(4);
         let mut reranker_best: Option<f32> = None;
 
-        let (mut results, mode) = self.search_wide(query, wide_k).await?;
+        let (mut results, mode) = self.search_wide(query, wide_k, ctx).await?;
 
         let effective_top_k = match mode {
             QueryMode::Breadth => top_k * self.config.summarization_top_k_multiplier,
@@ -882,18 +1218,8 @@ impl ReadEngine {
             });
         }
 
-        // Sort chronologically (turn_index > source_timestamp > created_at)
-        all_notes.sort_by(|a, b| match (a.turn_index, b.turn_index) {
-            (Some(ai), Some(bi)) => ai.cmp(&bi),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => match (a.source_timestamp, b.source_timestamp) {
-                (Some(at), Some(bt)) => at.cmp(&bt),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.created_at.cmp(&b.created_at),
-            },
-        });
+        // Sort chronologically: seq (true order) > turn_index > source_timestamp
+        all_notes.sort_by(note_order_cmp);
 
         // Contradiction force-retrieval
         let mut contradiction_inject_ids: HashSet<String> = HashSet::new();
@@ -997,7 +1323,7 @@ impl ReadEngine {
                 format!("DIGEST:{}", &episode_id[..8.min(episode_id.len())])
             }
         };
-        let display_time = note.source_timestamp.unwrap_or(note.created_at);
+        let display_time = note.source_timestamp;
         let age = Utc::now()
             .signed_duration_since(display_time)
             .num_days();
@@ -1029,13 +1355,23 @@ impl ReadEngine {
     /// Search + deduplicate + synthesize an answer with provenance markers.
     /// Includes abstention calibration: if no notes are sufficiently relevant, abstains.
     pub async fn ask(&self, query: &str, top_k: usize) -> Result<AskResult> {
+        self.ask_with_clock(query, top_k, ClockContext::now()).await
+    }
+
+    /// Time-travel ask — recency anchored to ctx.reference_time().
+    pub async fn ask_with_clock(
+        &self,
+        query: &str,
+        top_k: usize,
+        ctx: ClockContext,
+    ) -> Result<AskResult> {
         // Fetch a wide pool from search_wide(), which classifies the query using
         // the embedding classifier. We pass a generous top_k so the pool is large
         // enough for any mode, then truncate based on the actual classified mode.
         let wide_k = top_k * self.config.summarization_top_k_multiplier.max(4);
         let mut reranker_best: Option<f32> = None;
 
-        let (mut results, mode) = self.search_wide(query, wide_k).await?;
+        let (mut results, mode) = self.search_wide(query, wide_k, ctx).await?;
 
         let effective_top_k = match mode {
             QueryMode::Breadth => top_k * self.config.summarization_top_k_multiplier,
@@ -1161,21 +1497,9 @@ impl ReadEngine {
             });
         }
 
-        // Sort notes by conversation order (turn_index > source_timestamp > created_at).
+        // Sort notes by conversation order: seq (true order) > turn_index > source_timestamp.
         // LLMs perform better when notes arrive in chronological sequence, not relevance order.
-        all_notes.sort_by(|a, b| {
-            match (a.turn_index, b.turn_index) {
-                (Some(ai), Some(bi)) => ai.cmp(&bi),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => match (a.source_timestamp, b.source_timestamp) {
-                    (Some(at), Some(bt)) => at.cmp(&bt),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.created_at.cmp(&b.created_at),
-                },
-            }
-        });
+        all_notes.sort_by(|a, b| note_order_cmp(a, b));
 
         // --- Contradiction force-retrieval ---
         // When a contradiction dream is among results (or a result note is linked to one),
@@ -1250,7 +1574,7 @@ impl ReadEngine {
                 }
             };
             // Use source_timestamp (real conversation date) if available, fall back to created_at
-            let display_time = note.source_timestamp.unwrap_or(note.created_at);
+            let display_time = note.source_timestamp;
             let age = Utc::now()
                 .signed_duration_since(display_time)
                 .num_days();
@@ -1292,12 +1616,18 @@ impl ReadEngine {
         // digests. Dates in the digest are LLM-extracted from note content,
         // which is much more reliable than expecting the synthesis model to
         // pick dates out of scattered note excerpts at query time.
+        let ledger_block = self.build_ledger_context(query).await;
         let events_block = self.build_events_block(mode).await;
-        let notes_text = if events_block.is_empty() {
-            joined_notes
-        } else {
-            format!("{}\n\n{}", events_block, joined_notes)
-        };
+        let mut prefix = String::new();
+        if !ledger_block.is_empty() {
+            prefix.push_str(&ledger_block);
+            prefix.push_str("\n\n");
+        }
+        if !events_block.is_empty() {
+            prefix.push_str(&events_block);
+            prefix.push_str("\n\n");
+        }
+        let notes_text = format!("{}{}", prefix, joined_notes);
 
         let messages = vec![
             ChatMessage {
@@ -1392,31 +1722,24 @@ impl ReadEngine {
                     }
                 }
 
-                // Sort chronologically
-                retry_notes.sort_by(|a, b| {
-                    match (a.turn_index, b.turn_index) {
-                        (Some(ai), Some(bi)) => ai.cmp(&bi),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => match (a.source_timestamp, b.source_timestamp) {
-                            (Some(at), Some(bt)) => at.cmp(&bt),
-                            (Some(_), None) => std::cmp::Ordering::Less,
-                            (None, Some(_)) => std::cmp::Ordering::Greater,
-                            (None, None) => a.created_at.cmp(&b.created_at),
-                        },
-                    }
-                });
+                // Sort chronologically: seq (true order) > turn_index > source_timestamp
+                retry_notes.sort_by(|a, b| note_order_cmp(a, b));
 
                 let joined_retry: String = retry_notes.iter().enumerate()
                     .map(|(i, note)| format_note(i, note, false))
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 let retry_events_block = self.build_events_block(mode).await;
-                let retry_notes_text = if retry_events_block.is_empty() {
-                    joined_retry
-                } else {
-                    format!("{}\n\n{}", retry_events_block, joined_retry)
-                };
+                let mut retry_prefix = String::new();
+                if !ledger_block.is_empty() {
+                    retry_prefix.push_str(&ledger_block);
+                    retry_prefix.push_str("\n\n");
+                }
+                if !retry_events_block.is_empty() {
+                    retry_prefix.push_str(&retry_events_block);
+                    retry_prefix.push_str("\n\n");
+                }
+                let retry_notes_text = format!("{}{}", retry_prefix, joined_retry);
 
                 let retry_messages = vec![
                     ChatMessage {
@@ -1477,6 +1800,36 @@ impl ReadEngine {
             has_contradiction,
             reranker_best_score: reranker_best,
         })
+    }
+
+    /// Build a [CURRENT]/[CONFLICT] context block for mutable-slot queries by
+    /// resolving the query to a known entity + predicate and reading the
+    /// current ledger rows for that pair. Returns empty string unless a
+    /// ledger and alias table are attached and both an entity and predicate
+    /// can be resolved from the query — additive and side-effect free
+    /// (never mutates the shared alias table).
+    async fn build_ledger_context(&self, query: &str) -> String {
+        let Some(ledger) = &self.slot_ledger else { return String::new(); };
+        let Some(aliases) = &self.entity_aliases else { return String::new(); };
+        let Some(predicate) = query_predicate(query) else { return String::new(); };
+
+        let entity_key = {
+            let guard = match aliases.lock() {
+                Ok(g) => g,
+                Err(_) => return String::new(),
+            };
+            let nq = crate::extract::entity_key::normalize_entity(query);
+            guard
+                .keys()
+                .into_iter()
+                .find(|k| k.split_whitespace().all(|w| nq.contains(w)))
+        };
+        let Some(entity_key) = entity_key else { return String::new(); };
+
+        match ledger.current(&entity_key, predicate.as_str()) {
+            Ok(rows) if !rows.is_empty() => build_ledger_block(&rows),
+            _ => String::new(),
+        }
     }
 
     /// Build a structured EVENTS block from stored episode digests and the
@@ -1578,5 +1931,65 @@ impl ReadEngine {
             || lower.contains("not in the notes")
             || lower.contains("not provided in")
             || lower.contains("i don't see any note")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ledger_block_renders_current_and_conflict() {
+        use crate::store::slot_ledger::LedgerRow;
+        use chrono::{TimeZone, Utc};
+        let base = |value: &str, cg: Option<i64>| LedgerRow {
+            id: 1, entity_key: "first sprint".into(), predicate: "deadline".into(),
+            value: value.into(), value_norm: value.to_lowercase(), seq: 1,
+            valid_from: Some(Utc.with_ymd_and_hms(2024, 4, 5, 0, 0, 0).unwrap()),
+            mention_time: Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap(),
+            valid_to: None, superseded_by: None, conflict_group: cg,
+            note_id: "n1".into(), source_span: "s".into(),
+        };
+        // CURRENT
+        let cur = build_ledger_block(&[base("April 5", None)]);
+        assert_eq!(cur, "[CURRENT] first sprint deadline = April 5 (as of 2024-04-05)");
+        // CONFLICT (two rows, same conflict_group)
+        let mut r1 = base("April 5", Some(7));
+        let mut r2 = base("April 6", Some(7));
+        r2.id = 2;
+        let conf = build_ledger_block(&[r1.clone(), r2.clone()]);
+        assert_eq!(conf, "[CONFLICT] first sprint deadline: both \"April 5\" and \"April 6\" stated");
+        let _ = (&mut r1, &mut r2);
+    }
+
+    #[test]
+    fn orders_by_seq_over_timestamp() {
+        use chrono::{TimeZone, Utc};
+        let mk = |seq: u64, ts_day: u32| {
+            let mut n = crate::note::MemoryNote::new("x".to_string());
+            n.seq = seq;
+            n.source_timestamp = Utc.with_ymd_and_hms(2024, 1, ts_day, 0, 0, 0).unwrap();
+            n.turn_index = None;
+            n
+        };
+        // seq increasing but timestamps DECREASING — seq must win.
+        let mut v = vec![mk(3, 1), mk(1, 3), mk(2, 2)];
+        v.sort_by(note_order_cmp);
+        let seqs: Vec<u64> = v.iter().map(|n| n.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn legacy_zero_seq_falls_back_to_turn_index() {
+        let mk = |ti: Option<u32>| {
+            let mut n = crate::note::MemoryNote::new("x".to_string());
+            n.seq = 0;
+            n.turn_index = ti;
+            n
+        };
+        let mut v = vec![mk(Some(2)), mk(Some(0)), mk(Some(1))];
+        v.sort_by(note_order_cmp);
+        let tis: Vec<Option<u32>> = v.iter().map(|n| n.turn_index).collect();
+        assert_eq!(tis, vec![Some(0), Some(1), Some(2)]);
     }
 }
