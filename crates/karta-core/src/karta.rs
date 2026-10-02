@@ -102,6 +102,15 @@ impl Karta {
         self.slot_ledger = Some(ledger);
     }
 
+    /// Use a [`Decider`](crate::decide::Decider) (e.g. TypeSafe Jev) for query
+    /// understanding — retrieval mode and the mutable-slot predicate behind
+    /// the `[CURRENT]` ledger block. Its answers are used only when their
+    /// confidence is at least `config.read.decider_min_confidence`; otherwise
+    /// the built-in classifiers decide. Errors and timeouts fall back too.
+    pub fn attach_decider(&mut self, decider: Arc<dyn crate::decide::Decider>) {
+        self.read_engine.attach_decider(decider);
+    }
+
     /// Create with default embedded stores (sqlite-vec + SQLite) and OpenAI-compatible LLM.
     ///
     /// Loads `.env` file if present (via dotenvy). Backend is chosen in this order:

@@ -15,8 +15,11 @@ semantic versioning once we leave the experimental phase.
 - `karta_core::decide` — pluggable `Decider` trait for typed closed-set
   decisions (choice / yes-no / score) with an LLM baseline, an opt-in
   TypeSafe Jev backend (`JEV_API_KEY`), and ready-made query-mode,
-  ledger-predicate and temporal questions. Not wired into the pipeline
-  yet; see `docs/decider-plan.md`.
+  ledger-predicate and temporal questions. `Karta::attach_decider` opts
+  in to decider-driven query routing (retrieval mode + `[CURRENT]` ledger
+  predicate), used only above `read.decider_min_confidence` (default 0.7)
+  with fallback to the built-in classifiers. Off unless attached; see
+  `docs/decider-plan.md`.
 - `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `CHANGELOG.md`
 - `ClockContext` and `*_with_clock` variants on every public write/read
   entry point (`add_note`, `run_dreaming`, `search`, `ask`,

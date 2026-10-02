@@ -10,6 +10,11 @@ pub mod resolve_llm;
 
 use crate::clock::ClockContext;
 use crate::config::ReadConfig;
+use crate::decide::questions::{
+    query_mode_from, query_mode_question, query_predicate_from, query_predicate_question,
+    QUERY_MODE, QUERY_PREDICATE,
+};
+use crate::decide::{Decider, Decisions};
 use crate::error::Result;
 use crate::extract::slots::Predicate;
 use crate::llm::{ChatMessage, GenConfig, LlmProvider, Prompts, Role};
@@ -302,6 +307,37 @@ pub fn classify_query(query: &str) -> QueryClassification {
     }
 }
 
+/// Query understanding used by retrieval: the mode bucket plus, when an
+/// attached [`Decider`] answered confidently, its ledger-predicate choice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct QueryRoute {
+    pub mode: QueryMode,
+    /// `Some(p)` when the decider answered with enough confidence (`p` is
+    /// `None` for its "none" option); `None` means fall back to the keyword
+    /// [`query_predicate`].
+    pub decided_predicate: Option<Option<Predicate>>,
+}
+
+/// Combine decider answers with the built-in mode. Each answer is used only
+/// when its confidence is at least `min_confidence`; otherwise the built-in
+/// classifier's result stands. Pure, so the override rule is unit-testable.
+pub(crate) fn route_from_decisions(
+    decisions: Option<&Decisions>,
+    builtin_mode: QueryMode,
+    min_confidence: f32,
+) -> QueryRoute {
+    let confident = |name: &str| {
+        decisions
+            .and_then(|d| d.get(name))
+            .filter(|d| d.confidence() >= min_confidence)
+    };
+    let mode = confident(QUERY_MODE)
+        .and_then(query_mode_from)
+        .unwrap_or(builtin_mode);
+    let decided_predicate = confident(QUERY_PREDICATE).map(query_predicate_from);
+    QueryRoute { mode, decided_predicate }
+}
+
 /// Map a free-text query to a mutable-slot [`Predicate`] via keyword
 /// matching, ordered so more-specific phrases are checked before more
 /// general ones. Returns `None` if nothing matches — the caller should
@@ -430,6 +466,7 @@ pub struct ReadEngine {
     classifier: tokio::sync::OnceCell<QueryClassifier>,
     slot_ledger: Option<Arc<SlotLedger>>,
     entity_aliases: Option<Arc<Mutex<crate::extract::entity_key::EntityAliases>>>,
+    decider: Option<Arc<dyn Decider>>,
 }
 
 impl ReadEngine {
@@ -453,6 +490,7 @@ impl ReadEngine {
             classifier: tokio::sync::OnceCell::new(),
             slot_ledger: None,
             entity_aliases: None,
+            decider: None,
         }
     }
 
@@ -460,6 +498,37 @@ impl ReadEngine {
     /// [CURRENT]/[CONFLICT] context for queries about mutable facts.
     pub(crate) fn attach_slot_ledger(&mut self, ledger: Arc<SlotLedger>) {
         self.slot_ledger = Some(ledger);
+    }
+
+    /// Attach a [`Decider`] for query understanding (mode + ledger predicate).
+    /// Its answers override the built-in classifiers only when confident; see
+    /// [`ReadConfig::decider_min_confidence`].
+    pub(crate) fn attach_decider(&mut self, decider: Arc<dyn Decider>) {
+        self.decider = Some(decider);
+    }
+
+    /// Ask the attached decider for query mode + ledger predicate. Errors and
+    /// timeouts degrade to `None` (built-in classifiers) rather than failing
+    /// the query.
+    async fn decide_query(&self, query: &str) -> Option<Decisions> {
+        let decider = self.decider.as_ref()?;
+        let questions = [query_mode_question(), query_predicate_question()];
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            decider.decide(query, &questions),
+        )
+        .await
+        {
+            Ok(Ok(d)) => Some(d),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, decider = %decider.id(), "decider failed; using built-in classifiers");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(decider = %decider.id(), "decider timed out; using built-in classifiers");
+                None
+            }
+        }
     }
 
     /// Attach the shared write-time entity-alias table (read-only lookups
@@ -677,7 +746,7 @@ impl ReadEngine {
         top_k: usize,
         ctx: ClockContext,
     ) -> Result<Vec<SearchResult>> {
-        let (mut results, _mode) = self.search_wide(query, top_k, ctx).await?;
+        let (mut results, _route) = self.search_wide(query, top_k, ctx).await?;
         results.truncate(top_k);
 
         // Access tracking (fire-and-forget — don't block the read path)
@@ -703,19 +772,39 @@ impl ReadEngine {
         query: &str,
         top_k: usize,
         ctx: ClockContext,
-    ) -> Result<(Vec<SearchResult>, QueryMode)> {
+    ) -> Result<(Vec<SearchResult>, QueryRoute)> {
         info!("Searching: \"{}\"", query);
 
-        let embeddings = self.llm.embed(&[query]).await?;
-        let query_embedding = embeddings.into_iter().next().unwrap_or_default();
+        // The optional decider runs concurrently with the query embedding.
+        let query_texts = [query];
+        let (embeddings, decisions) =
+            tokio::join!(self.llm.embed(&query_texts), self.decide_query(query));
+        let query_embedding = embeddings?.into_iter().next().unwrap_or_default();
 
         // Embedding-based classification with keyword fallback
         let classifier = self.get_classifier().await;
-        let mode = if classifier.centroids.is_empty() {
+        let builtin_mode = if classifier.centroids.is_empty() {
             classify_query_keywords(query)
         } else {
             classifier.classify(&query_embedding)
         };
+        let route = route_from_decisions(
+            decisions.as_ref(),
+            builtin_mode,
+            self.config.decider_min_confidence,
+        );
+        let mode = route.mode;
+        if let Some(d) = &decisions {
+            info!(
+                builtin_mode = ?builtin_mode,
+                decided_mode = ?d.get(QUERY_MODE).and_then(query_mode_from),
+                mode_confidence = d.get(QUERY_MODE).map(|x| x.confidence()),
+                decided_predicate = ?d.get(QUERY_PREDICATE).and_then(|x| x.label()),
+                predicate_confidence = d.get(QUERY_PREDICATE).map(|x| x.confidence()),
+                final_mode = ?mode,
+                "Query routed with decider"
+            );
+        }
         debug!(query_mode = ?mode, "Query classified");
 
         // Mode-specific fetch_k: wide pool for reranker, but Computation stays tight (precision > recall)
@@ -1102,7 +1191,7 @@ impl ReadEngine {
             "Search complete"
         );
 
-        Ok((results, mode))
+        Ok((results, route))
     }
 
     /// Public retrieve-only API. Runs Karta's full retrieval pipeline —
@@ -1128,7 +1217,8 @@ impl ReadEngine {
         let wide_k = top_k * self.config.summarization_top_k_multiplier.max(4);
         let mut reranker_best: Option<f32> = None;
 
-        let (mut results, mode) = self.search_wide(query, wide_k, ctx).await?;
+        let (mut results, route) = self.search_wide(query, wide_k, ctx).await?;
+        let mode = route.mode;
 
         let effective_top_k = match mode {
             QueryMode::Breadth => top_k * self.config.summarization_top_k_multiplier,
@@ -1371,7 +1461,8 @@ impl ReadEngine {
         let wide_k = top_k * self.config.summarization_top_k_multiplier.max(4);
         let mut reranker_best: Option<f32> = None;
 
-        let (mut results, mode) = self.search_wide(query, wide_k, ctx).await?;
+        let (mut results, route) = self.search_wide(query, wide_k, ctx).await?;
+        let mode = route.mode;
 
         let effective_top_k = match mode {
             QueryMode::Breadth => top_k * self.config.summarization_top_k_multiplier,
@@ -1616,7 +1707,7 @@ impl ReadEngine {
         // digests. Dates in the digest are LLM-extracted from note content,
         // which is much more reliable than expecting the synthesis model to
         // pick dates out of scattered note excerpts at query time.
-        let ledger_block = self.build_ledger_context(query).await;
+        let ledger_block = self.build_ledger_context(query, route.decided_predicate).await;
         let events_block = self.build_events_block(mode).await;
         let mut prefix = String::new();
         if !ledger_block.is_empty() {
@@ -1808,10 +1899,18 @@ impl ReadEngine {
     /// ledger and alias table are attached and both an entity and predicate
     /// can be resolved from the query — additive and side-effect free
     /// (never mutates the shared alias table).
-    async fn build_ledger_context(&self, query: &str) -> String {
+    ///
+    /// `decided_predicate` is the decider's confident answer, if any (see
+    /// [`QueryRoute`]); otherwise the keyword [`query_predicate`] decides.
+    async fn build_ledger_context(
+        &self,
+        query: &str,
+        decided_predicate: Option<Option<Predicate>>,
+    ) -> String {
         let Some(ledger) = &self.slot_ledger else { return String::new(); };
         let Some(aliases) = &self.entity_aliases else { return String::new(); };
-        let Some(predicate) = query_predicate(query) else { return String::new(); };
+        let predicate = decided_predicate.unwrap_or_else(|| query_predicate(query));
+        let Some(predicate) = predicate else { return String::new(); };
 
         let entity_key = {
             let guard = match aliases.lock() {
@@ -1937,6 +2036,43 @@ impl ReadEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn choice(label: &str, confidence: f32) -> crate::decide::Decision {
+        crate::decide::Decision::Choice { label: label.into(), probs: vec![], confidence }
+    }
+
+    #[test]
+    fn route_uses_confident_decider_answers() {
+        let mut d = Decisions::new();
+        d.insert(QUERY_MODE.into(), choice("recency", 0.95));
+        d.insert(QUERY_PREDICATE.into(), choice("employer", 0.9));
+        let r = route_from_decisions(Some(&d), QueryMode::Standard, 0.8);
+        assert_eq!(r.mode, QueryMode::Recency);
+        assert_eq!(r.decided_predicate, Some(Some(Predicate::Employer)));
+    }
+
+    #[test]
+    fn route_keeps_builtin_below_threshold_or_without_decider() {
+        let mut d = Decisions::new();
+        d.insert(QUERY_MODE.into(), choice("existence", 0.62));
+        d.insert(QUERY_PREDICATE.into(), choice("employer", 0.5));
+        let r = route_from_decisions(Some(&d), QueryMode::Standard, 0.8);
+        assert_eq!(r.mode, QueryMode::Standard);
+        assert_eq!(r.decided_predicate, None);
+
+        let r = route_from_decisions(None, QueryMode::Breadth, 0.8);
+        assert_eq!(r, QueryRoute { mode: QueryMode::Breadth, decided_predicate: None });
+    }
+
+    #[test]
+    fn confident_none_predicate_suppresses_keyword_fallback() {
+        // "none" is a real answer: the ledger block must be skipped even if
+        // the keyword matcher would fire (e.g. "known" contains "own").
+        let mut d = Decisions::new();
+        d.insert(QUERY_PREDICATE.into(), choice("none", 0.9));
+        let r = route_from_decisions(Some(&d), QueryMode::Standard, 0.8);
+        assert_eq!(r.decided_predicate, Some(None));
+    }
 
     #[test]
     fn ledger_block_renders_current_and_conflict() {

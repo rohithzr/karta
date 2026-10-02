@@ -129,6 +129,15 @@ pub struct ReadConfig {
     pub fact_retrieval_enabled: bool,
     /// Score boost for notes found via fact match.
     pub fact_match_boost: f32,
+    /// Minimum confidence for an attached `Decider`'s query-mode / predicate
+    /// answer to override the built-in classifiers. Below it, the embedding
+    /// centroid (mode) and keyword list (predicate) decide as before.
+    #[serde(default = "default_decider_min_confidence")]
+    pub decider_min_confidence: f32,
+}
+
+fn default_decider_min_confidence() -> f32 {
+    0.7
 }
 
 impl Default for ReadConfig {
@@ -148,6 +157,7 @@ impl Default for ReadConfig {
             episode_drilldown_min_score: 0.25,
             fact_retrieval_enabled: true,
             fact_match_boost: 0.1,
+            decider_min_confidence: default_decider_min_confidence(),
         }
     }
 }

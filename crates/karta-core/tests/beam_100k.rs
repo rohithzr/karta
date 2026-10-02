@@ -385,6 +385,7 @@ fn apply_config_env(config: &mut KartaConfig) {
     config.write.slot_voting = env_bool("K_SLOT_VOTING", true);
     config.read.fact_retrieval_enabled = env_bool("K_FACT_RETRIEVAL", true);
     config.read.fact_match_boost = env_f32("K_FACT_BOOST", 0.1);
+    config.read.decider_min_confidence = env_f32("K_DECIDER_MIN_CONF", 0.7);
 
     let exp = std::env::var("K_EXPERIMENT").unwrap_or_else(|_| "default".to_string());
     println!("  Config [{}]: episode={}, ep_retrieval={}, graph={}, foresight={}, reranker={}, abstention_thresh={}, slot_voting={}",
@@ -429,7 +430,28 @@ fn find_latest_data_dir(conv_id: &str) -> Option<String> {
     dirs.into_iter().next().map(|(path, _)| path)
 }
 
+/// `K_DECIDER=jev` attaches the TypeSafe Jev decider (needs `JEV_API_KEY`)
+/// for query mode + ledger predicate. Read-side only, so it can be A/B'd on
+/// the same ingest via `BEAM_SKIP_INGEST`.
+fn attach_decider_from_env(mut karta: Karta) -> Karta {
+    match std::env::var("K_DECIDER").unwrap_or_default().as_str() {
+        "" | "none" => {}
+        "jev" => {
+            let jev = karta_core::decide::JevDecider::from_env()
+                .expect("K_DECIDER=jev requires JEV_API_KEY");
+            println!("  Decider: jev (min_conf={})", env_f32("K_DECIDER_MIN_CONF", 0.7));
+            karta.attach_decider(Arc::new(jev));
+        }
+        other => panic!("unknown K_DECIDER={:?} (expected jev|none)", other),
+    }
+    karta
+}
+
 async fn create_karta(conv_id: &str) -> Karta {
+    attach_decider_from_env(create_karta_inner(conv_id).await)
+}
+
+async fn create_karta_inner(conv_id: &str) -> Karta {
     // If BEAM_SKIP_INGEST is set, reuse the most recent data dir
     if env_bool("BEAM_SKIP_INGEST", false) {
         if let Some(existing_dir) = find_latest_data_dir(conv_id) {

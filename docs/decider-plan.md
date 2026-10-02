@@ -1,7 +1,8 @@
 # Decider plan — closed-set classifiers (Jev and friends)
 
-> Status: groundwork landed (`crates/karta-core/src/decide/`), nothing wired
-> into the read or write path yet. This doc is the rollout plan.
+> Status: step 2 (query understanding) is wired behind an opt-in
+> `Karta::attach_decider`; default behavior is unchanged. Routing is
+> evaluated on BEAM's 400 questions below; the end-to-end BEAM A/B is next.
 
 ## Why
 
@@ -63,7 +64,8 @@ query asking mode + predicate + temporal together:
 - The predicate "miss" ("How many days passed between…" → count) is
   arguably right.
 - The temporal yes/no is not usable as worded: p_yes ranged 0.53–0.98 and
-  barely separated temporal from non-temporal queries. Reword or drop it.
+  barely separated temporal from non-temporal queries. It is not used by
+  the read path; reword before relying on it.
 - Caveats: 18 queries written by us, not BEAM; compared against the
   keyword classifier, not the embedding-centroid one used when embeddings
   are available. The BEAM A/B in step 2 is the real test.
@@ -71,18 +73,60 @@ query asking mode + predicate + temporal together:
   a position prior. Choice criteria go over the wire as a JSON object in
   alphabetical key order, so order is stable.
 
+## BEAM routing eval (2026-10-02)
+
+`tests/decider_beam_routing.rs` runs Jev on all 400 BEAM 100K probing
+questions (text only, no ingest). 0 errors, ~11 s at 8 concurrent calls.
+BEAM has no mode labels, so four abilities with an obvious target mode are
+scored; "keyword" is the built-in fallback router (the embedding centroid
+needs a real embedding model, so it isn't in this table).
+
+| Ability (target mode) | Keyword | Jev | Routed (Jev if conf ≥ 0.7, else keyword) |
+|---|---|---|---|
+| contradiction_resolution (Existence) | 0% | 95% | 93% |
+| event_ordering (Temporal) | 98% | 100% | 100% |
+| summarization (Breadth) | 90% | 100% | 100% |
+| temporal_reasoning (Computation) | 90% | 98% | 98% |
+| **Scored total** | **69%** | **98%** | **98%** |
+
+Threshold sweep on the scored set: 0.5–0.7 → 98%, 0.8 → 95%, 0.9 → 91%.
+Default `decider_min_confidence` is 0.7; at that setting 79 of 400 queries
+get a different mode than the keyword router.
+
+**knowledge_update is a predicate problem, not a mode problem.** Its
+questions never say "current" ("How many sources are in my Zotero
+library?"), so neither router sends them to Recency (2%). What matters is
+whether the `[CURRENT]` ledger lookup fires:
+
+| Ledger lookup fires on | Keyword | Jev (conf ≥ 0.8) |
+|---|---|---|
+| knowledge_update (want: yes) | 26/40 | **34/40** |
+| abstention (want: no) | 7/40 | **0/40** |
+| preference_following (want: mostly no) | 10/40 | **2/40** |
+
+Keyword false fires are substring hits: "techniques" → tech_choice,
+"confusing" → "using" → tech_choice, "agenda … sessions where" → location.
+
+Open question for the A/B: Jev routes 17 knowledge_update questions to
+Computation (keyword: 15). Computation skips the reranker and narrows
+fetch_k, which may not suit "what is the latest count" questions.
+
 ## Rollout order
 
 Each step is behind a config flag defaulting to today's behavior, and is
 measured on BEAM 100K (±3pp is noise, single runs) before flipping the default.
 
 1. ~~**Get access + verify wire format.**~~ Done 2026-10-02 (see above).
-2. **Query understanding (read path, one call per query).** Ask mode +
-   predicate + temporal in a single `decide` call. Use the Decider answer
-   when `confidence >= threshold`, else fall back to centroid / keywords.
-   Wire via an `attach_decider` setter on `ReadEngine` (same pattern as
-   `attach_slot_ledger`) so constructors don't change. Log both answers into
-   the BEAM trace so disagreements can be inspected.
+2. **Query understanding (read path, one call per query).** *Wired.*
+   `Karta::attach_decider`; the BEAM harness enables it with
+   `K_DECIDER=jev` (+ `K_DECIDER_MIN_CONF`). Asks mode + predicate in a
+   single `decide` call, concurrently with the query embedding. Each answer
+   is used when `confidence >= decider_min_confidence` (default 0.7), else
+   the centroid / keyword classifiers decide; errors and a 10 s timeout fall
+   back too. Both answers are logged (`Query routed with decider`).
+   **Next:** BEAM 100K A/B — ingest once, then run the query phase twice on
+   the same data (`BEAM_SKIP_INGEST=true`, with and without `K_DECIDER=jev`).
+   Needs the Azure/OpenAI + Jina credentials.
 3. **Answerability gate.** YesNo "does this context contain the answer?"
    before synthesis; targets false abstention (18% of failures) and gives a
    calibrated abstain signal (the reranker threshold is logged, not enforced).
