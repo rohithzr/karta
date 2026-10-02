@@ -1,5 +1,6 @@
 pub mod clock;
 pub mod config;
+pub mod decide;
 pub mod dream;
 pub mod error;
 pub mod extract;

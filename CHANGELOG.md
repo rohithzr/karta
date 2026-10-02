@@ -12,6 +12,11 @@ semantic versioning once we leave the experimental phase.
   reproduction commands
 - `docs/landscape.md` — research survey of the AI memory space
 - `docs/retrieval-plan.md` — open retrieval experiment backlog
+- `karta_core::decide` — pluggable `Decider` trait for typed closed-set
+  decisions (choice / yes-no / score) with an LLM baseline, an opt-in
+  TypeSafe Jev backend (`JEV_API_KEY`), and ready-made query-mode,
+  ledger-predicate and temporal questions. Not wired into the pipeline
+  yet; see `docs/decider-plan.md`.
 - `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `CHANGELOG.md`
 - `ClockContext` and `*_with_clock` variants on every public write/read
   entry point (`add_note`, `run_dreaming`, `search`, `ask`,
