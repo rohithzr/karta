@@ -6,7 +6,7 @@
 > positioning material. Benchmark numbers are self-published unless noted
 > otherwise and should be treated as claims until independently reproduced.
 >
-> Last compiled: 2026-10-29.
+> Last compiled: 2026-10-30.
 
 ## Legend
 
@@ -155,4 +155,345 @@
 | **Proactive Memory for Event-Driven LLM Agents** *(arxiv 2610.36967, Oct 2026)* | Memory system for proactive agents that anticipate service opportunities from ongoing event streams; organizes history into recent events, temporal trajectories, and behavioral regularities; validates trajectory facts against source events and replays history to confirm regularities before pattern-matching; also introduces ProactiveStream longitudinal benchmark across three application scopes | ProactiveStream: F1 52.6%, +21.4% relative vs strongest of five external baselines; LoCoMo/BEAM/LongMemEval not evaluated | [arxiv 2610.36967](https://arxiv.org/abs/2610.36967) |
 | **Rare, Relevant, and Still Wrong: How Memory Fails LLM Group Decisions** *(arxiv 2610.37624, Oct 2026)* | CrossProfile diagnostic benchmark of 480 tasks (60 templates) for hidden-profile group decisions where fact ownership varies while text stays fixed; shows relevance filters re-admit decoy facts, rarest-first selection ≈ random on average, decision models over-weight facts attributed to many agents (social proof), and complete transcript scores below the no-notes baseline in natural discussions | CrossProfile: relevance filter trails rarest-first by 23–31 pp in classic config; removing attribution tags raises accuracy by 13–24 pp; complete transcript < no-notes baseline | [arxiv 2610.37624](https://arxiv.org/abs/2610.37624) |
 
+| **Metis: Memory Foundation Model** *(MemTensor, arXiv 2607.26760, Jul 2026)* | First prototype of a "memory foundation model" — memory stored natively inside the model architecture rather than in an external database; gradient-free online memory updates via a single forward pass; each Metis Block pairs a Local Memory Block (maintains persistent memory state) with a Hyper Memory Block (learns storage/utilization procedures); built on Qwen3.5 base with 4B, 9B, and 27B checkpoints; training data not released; noncommercial license; positioned alongside MemOS for hybrid native-plus-external memory | No benchmark scores reported | [arxiv 2607.26760](https://arxiv.org/abs/2607.26760) |
+| **MemoType** *(arXiv 2610.11573, Oct 2026)* | Argues that existing retrieval methods apply a single strategy to every memory type, which limits performance across heterogeneous memory corpora; introduces multi-class memory dataset and a learned router (MemoType) that classifies memories and queries, then dispatches each pair to the matching retrieval strategy; proves theoretical upper bound on single-strategy retrieval precision over multi-class corpora | Up to 16.18% improvement in Recall@1 over single-strategy baselines across three datasets | [arxiv 2610.11573](https://arxiv.org/abs/2610.11573) |
+| **Persistent Memory in Multi-Agent LLM Inference: What It Costs, What It Buys, and When You Can Tell** *(arXiv 2610.07782, Oct 2026)* | Controlled cost-benefit measurement of a persistent memory tier in a three-tier multi-agent architecture across 8 paired dataset conditions (n=100 per arm); negative result study: authors report four measurement corrections were needed, each of which had inflated the apparent benefit | Memory tier adds +0.368 MiB peak cache (95% CI: +0.167, +0.590); no detectable accuracy change (+0.015, 95% CI: -0.011, +0.046); accuracy improvement indistinguishable from zero in this setup | [arxiv 2610.07782](https://arxiv.org/abs/2610.07782) |
+
 ## Notable New / Emerging Systems
+
+| System | Description | Status | Source |
+|---|---|---|---|
+| **MemOS** *(MemTensor)* | AI memory OS for LLM agents; persistent skill memory, cross-task reuse, hybrid FTS5+vector search; memos-local-plugin 2.0 (May 2026): L1 traces / L2 policies / L3 world models / crystallized Skills hierarchy; Reflect2Evolve architecture; hook-based plugin system; LoCoMo 92.34%, LongMemEval 93.40% (self-published, GitHub README, Jul 2026); leads OmniMemEval among 14 commercial memory products | Active, open-source, v2.0.22 (Jul 3 2026) | [github.com/MemTensor/MemOS](https://github.com/MemTensor/MemOS) |
+| **EverOS** *(EverMind-AI; formerly EverMemOS)* | Renamed from EverMemOS on Apr 14, 2026; Skills Evolution Engine (234.8% relative task success gain over CoAct); HyperMem fast recall; ACL 2026 paper accepted; local-first Markdown + SQLite + LanceDB; multimodal file ingestion; v1.1.0 (Jun 24, 2026) with knowledge wikis + reflection; v1.1.1 (Jul 7, 2026) adds LoCoMo benchmark runner for reproducible evaluation, enhanced hybrid search stability, expanded CI for Python 3.12 + 3.13 | Active, open-source, v1.1.1 (Jul 7 2026) | [github.com/EverMind-AI/EverOS](https://github.com/EverMind-AI/EverOS) |
+| **MemoryOS** *(BAI-LAB, EMNLP 2025)* | OS-inspired hierarchical memory (short→mid→long); heat-gated promotion; MCP server; +49% F1 on LoCoMo vs baseline; 5× faster via parallelization optimizations; MemoryOS-MCP open-sourced (Jun 2026) for agent client integration | Active, open-source | [github.com/BAI-LAB/MemoryOS](https://github.com/BAI-LAB/MemoryOS) |
+| **Cognee** | Knowledge graph + vector + relational 3-store architecture; 14 retrieval modes; strong multi-hop reasoning; v1.0 (Jun 2026): unified Postgres backend (runs full memory layer — graph + vectors + sessions — on single Postgres instance), self-improving memory via `memify` (prunes stale nodes, reweights edges by usage), 1M+ pipelines/month across 70+ companies; BEAM 100K: 79% *(self-published Jun 2026; authors acknowledge "more parameter exploration on the target conversation than we'd like")*, BEAM 10M: 67% | Active, v1.0 (Jun 2026) | [cognee.ai](https://cognee.ai), [cognee.ai/blog/benchmarking-cognee-on-beam](https://www.cognee.ai/blog/deep-dives/benchmarking-cognee-on-beam) |
+| **OpenViking** *(volcengine)* | Open-source context database; filesystem paradigm for memory/resources/skills unified management | Active, launched Feb 2026 | [github.com/volcengine/viking-db](https://github.com/volcengine/viking-db) |
+| **Mastra Observational Memory** | Observer + Reflector background agents; stable append-only context; 5-40x compression; SOTA LongMemEval (94.87% gpt-5-mini, Apr 2026) | Active, TypeScript | [github.com/mastra-ai/mastra](https://github.com/mastra-ai/mastra) |
+| **Supermemory** | Hosted AI memory API; production engine (85.4% LongMemEval-S); experimental ASMR flow (~99% via parallel LLM agents, no vector DB); TypeScript | Active, hosted | [supermemory.ai](https://supermemory.ai) |
+| **Memori** *(MemoriLabs)* | SQL-native memory infra; facts/preferences/rules/summaries; intelligent decay; 81.95% LoCoMo at 4.98% cost; Cloud + OpenClaw plugin + BYODB | Active, open-source | [github.com/memorilabs/memori](https://github.com/memorilabs/memori) |
+| **MemFactory** *(arxiv)* | Unified modular training + inference framework; Lego-like components; GRPO fine-tuning; supports Memory-R1/RMM/MemAgent | Research | [arxiv 2603.29493](https://arxiv.org/abs/2603.29493) |
+| **Hindsight** *(Vectorize)* | "Retain, Recall, Reflect" architecture; Reflector background agent reasons over structured memory bank; SOTA across BEAM + LOCOMO + LongMemEval simultaneously (Apr 2026); BEAM 100K 73.4%, LOCOMO 92%, LongMemEval-S 94.6%; BEAM 10M 64.1% (next best: 40.6%); v0.7.0 (May 27) multilingual/CJK, polyglot Control Plane in 8 languages; v0.8.0 (Jun 8) mental model history tables, semantic dedup, LLM prompt-prefix caching, cross-instance bank migration; v0.8.2 (Jun 12) Memory Defense (PII protection), reversible memory curation; v0.8.4 (Jul 1) multi-LLM failover, configurable recency decay; integrations: Aider, GitHub Copilot, Windsurf, Continue.dev, Zapier, Cursor, Cline, Flowise, Roo Code, Haystack, Google ADK | Active, open-source + hosted | [github.com/vectorize-io/hindsight](https://github.com/vectorize-io/hindsight), [benchmarks.hindsight.vectorize.io](https://benchmarks.hindsight.vectorize.io) |
+| **Engram** *(engram.fyi)* | MCP memory server for Claude Code, Cursor, and AI coding agents; episodic + semantic + procedural memory via single routing layer | Active, MCP | [engram.fyi](https://engram.fyi) |
+| **MemPalace** *(milla-jovovich/mempalace)* | Verbatim storage + ChromaDB semantic search; "palace" spatial metaphor (wings/rooms/halls); AAAK compression for selective verbatim recall | Active, open-source | [github.com/milla-jovovich/mempalace](https://github.com/milla-jovovich/mempalace) |
+| **Hermes Agent** *(Nous Research)* | Open-source autonomous AI agent (Feb 2026) with 7 pluggable memory providers: Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover; memory provider selection at init | Active, open-source | [github.com/NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
+| **Anthropic Auto Dream** *(Mar 2026)* | Claude Code's functional memory consolidation — first major AI lab treating agent memory as cognitive architecture; auto-distills sessions into persistent project knowledge | Active, Claude Code feature | [anthropic.com](https://anthropic.com) |
+| **Neo4j Agent Memory** *(neo4j-labs)* | Graph-native memory system for AI agents backed by Neo4j; stores conversations, builds knowledge graphs, agent framework integrations | Active, open-source | [github.com/neo4j-labs/agent-memory](https://github.com/neo4j-labs/agent-memory) |
+| **ALMA** *(zksha)* | Automated meta-Learning of Memory designs for Agentic systems — meta-learns memory designs to replace human-engineered designs | Research, open-source | [github.com/zksha/alma](https://github.com/zksha/alma) |
+| **Eywa** *(Resham Joshi)* | Provenance-grounded long-term memory — stores immutable source evidence before deriving canonical facts; zero LLM calls at write time for evidence ingestion; targets provenance-role collapse failure mode | Active, open-source | [github.com/reshamjoshi/eywa](https://github.com/reshamjoshi/eywa) |
+| **MemMachine** | Universal ground-truth-preserving memory layer; LoCoMo 91.69%, LongMemEvalS 93.0%; ~80% fewer tokens than Mem0; retrieval-stage optimization over ingestion-stage transformation | Active, open-source | [arxiv 2604.04853](https://arxiv.org/abs/2604.04853) |
+| **OMEGA** | Local-first persistent memory for AI coding agents; 95.4% LongMemEval (#1 leaderboard); pip install; no cloud | Active, pip-installable | [omegamax.co](https://omegamax.co/benchmarks) |
+| **MIRIX** *(MIRIX AI)* | Multi-agent memory system with 6 specialized types: Core, Episodic, Semantic, Procedural, Resource Memory, Knowledge Vault; multimodal (text + visual screenshots); real-time screen monitoring + local storage; LoCoMo 85.4%; ScreenshotVQA +35% vs RAG at 99.9% storage reduction; arxiv 2507.07957 (Jul 2025) | Research, open-source | [arxiv 2507.07957](https://arxiv.org/abs/2507.07957) |
+| **ByteRover** *(campfirein)* | Portable memory layer for AI coding agents (formerly Cipher); Context Tree hierarchical knowledge structure organized by domain/topic/subtopic; LoCoMo 96.1% + LongMemEval-S 92.8% (v2.1.5, self-published Mar 2026); local-first, no cloud/telemetry by default; MCP integration; compatible with 22+ AI coding tools; 4.8k GitHub stars | Active, v3.14.0 (May 2026), TypeScript, Elastic License 2.0 | [github.com/campfirein/byterover-cli](https://github.com/campfirein/byterover-cli), [byterover.dev](https://www.byterover.dev/) |
+| **SimpleMem / EvolveMem** *(aiming-lab)* | Research memory framework: semantic lossless compression, 30× fewer tokens vs full-context; multimodal support (EvolveMem: images, audio); self-evolving via closed-loop failure diagnosis | Active, research | [arxiv 2601.02553](https://arxiv.org/abs/2601.02553) / [arxiv 2605.13941](https://arxiv.org/abs/2605.13941) |
+| **Microsoft Memora** *(Microsoft Research, ICML 2026)* | Harmonic Memory Representation: decouples what is stored (full content + timeline details) from how it is retrieved (6–8 word primary abstraction + lightweight cue anchors); policy-guided iterative retriever treats memory access as active reasoning, not one-shot search; ICML 2026 paper; SOTA on LoCoMo and LongMemEval with up to 98% fewer context tokens vs full-context inference | Active, open-source | [github.com/microsoft/Memora](https://github.com/microsoft/Memora), [microsoft.com/research/blog](https://www.microsoft.com/en-us/research/blog/memora-a-harmonic-memory-representation-balancing-abstraction-and-specificity/) |
+| **MemCog** *(Tencent / WeChat AI, arxiv 2605.28046, May 2026)* | Reframes memory as active cognitive process; Navigable Memory Store with associative link graphs; agents traverse via Cross-Dimensional Navigation Interface rather than one-shot retrieval; Proactive Reasoning Protocol drives agents to spontaneously initiate memory exploration; introduces ProactiveMemBench for proactive memory triggering | Research, arxiv | [arxiv 2605.28046](https://arxiv.org/abs/2605.28046) |
+| **SuperLocalMemory** *(Qualixar)* | Local-only, zero-LLM memory (Mode A) with Bayesian trust defense against memory poisoning; biologically-inspired forgetting (V3.3: memories strengthen with use, fade when neglected); cognitive quantization; multi-channel retrieval; EU AI Act compliant by architecture (zero cloud calls); Mode C (with LLM): 87.7% LoCoMo (self-published); Mode A (zero-cloud): 74.8% LoCoMo | Active, open-source | [github.com/qualixar/superlocalmemory](https://github.com/qualixar/superlocalmemory), [arxiv 2604.04514](https://arxiv.org/abs/2604.04514) |
+| **OpenAI Dreaming V3** *(OpenAI, Jun 4, 2026)* | Rebuilt ChatGPT memory using async between-session "dreaming" process: reviews session transcripts, synthesizes patterns, merges duplicates, replaces stale entries; temporal self-correction (e.g., "going to Singapore" → "went to Singapore"); 5× compute reduction enabling first free-tier rollout; readable Memory Summary page with user controls | Active, ChatGPT Plus/Pro + Free feature | [openai.com](https://openai.com/index/chatgpt-memory-dreaming/) |
+| **Cloudflare Agent Memory** *(Cloudflare, Apr 2026)* | Managed persistent memory for AI agents (private beta); five parallel retrieval channels fused with Reciprocal Rank Fusion: full-text, exact fact-key lookup, raw message, direct vector, HyDE vector; Llama 4 Scout (17B MoE) for extraction; Nemotron 3 (120B MoE) for synthesis; eight-check memory verifier; integrated in Cloudflare Workers AI | Active, managed cloud (private beta) | [blog.cloudflare.com](https://blog.cloudflare.com/introducing-agent-memory/) |
+| **LangMem** *(LangChain)* | Background memory SDK for LangGraph-native agents; extracts, consolidates, and updates agent knowledge asynchronously; pluggable LangGraph BaseStore backends; 746K+ monthly PyPI downloads; recommended for batch/background tasks, not latency-sensitive paths | Active, open-source | [langchain-ai.github.io/langmem](https://langchain-ai.github.io/langmem/), [github.com/langchain-ai/langmem](https://github.com/langchain-ai/langmem) |
+| **GBrain** *(garrytan)* | Garry Tan's (YC President) opinionated OpenClaw/Hermes agent brain; dual-engine storage: PGLite (Postgres 17 compiled to WASM, zero-config default, ~50K page scale) + pgvector/HNSW (Supabase/self-hosted for shared/large deployments); Git-backed Markdown files as system of record; typed knowledge graph (edges: `attended`, `works_at`, `invested_in`) auto-linked at write time with zero LLM calls; 24/7 dream cycle for dedup, citation fixing, and salience scoring; RRF retrieval with 4-layer dedup + backlink-boosted ranking; LongMemEval R@5 97.6% (self-published, gbrain-evals repo, no LLM in retrieval loop; R@5 retrieval recall — not directly comparable to LongMemEval-S generation accuracy); BrainBench (internal 240-page corpus) R@5 97.9%; 25,292 GitHub stars | Active, open-source, TypeScript, MIT | [github.com/garrytan/gbrain](https://github.com/garrytan/gbrain), [github.com/garrytan/gbrain-evals](https://github.com/garrytan/gbrain-evals) |
+| **Hippo** *(kitfunso)* | Biologically-inspired memory for AI agents; 7 hippocampal mechanisms: (1) two-speed storage — episodic buffer + semantic consolidation, (2) decay by default — 7-day half-life, (3) retrieval strengthening — +2 days on recall, (4) emotional/error tagging — amygdala analogue boosts for errors/breakthroughs, (5) sleep consolidation — 5-step replay+merge clustering 3+ similar episodes into one semantic memory, (6) schema acceleration — fits existing patterns 1.5× faster, (7) conflict detection — contradictions flagged not silently overwritten; R-STDP implemented as reward-proportional decay modulation (0.5–1.5× factor), not full spiking neural network plasticity; LongMemEval per-haystack: 98.6% R@5 (MiniLM-L6 default) / 99.8% (voyage-3-large); full unified store: 73.8% R@5 (oracle-split, BM25+cosine, 19,195 sessions) — the per-haystack scores are not comparable to full-store evaluations; sequential learning magnitude claim formally retracted in v1.7.9; SQLite, zero runtime dependencies, Node.js 22.5+ | Active, open-source, TypeScript, MIT, v1.23.0 | [github.com/kitfunso/hippo-memory](https://github.com/kitfunso/hippo-memory) |
+| **PMB** *(oleksiijko / Project Memory Bank)* | Local-first AI memory via MCP; SQLite (WAL-mode, append-only source of truth) + LanceDB (rebuildable vector indexes); 4-way hybrid recall fused via RRF: BM25 lexical + dense vector semantic + entity graph traversal + optional cross-encoder rerank; async writes (<1ms MCP response); workspace-scoped per project to prevent cross-project context bleed; MCP cold boot 3.7 s; LoCoMo recall@10 94.5% (self-published, author's HackerNoon article; benchmark script public at `scripts/benchmarks/benchmark_locomo.py`); 292 GitHub stars, launched May 2026, PH 228 upvotes | Active, open-source, Python, Apache 2.0, v1.2.2 | [github.com/oleksiijko/pmb](https://github.com/oleksiijko/pmb) |
+| **Unabyss** | MCP-native cloud context layer aggregating 20+ external sources (LinkedIn, Notion, Gmail, Slack, GitHub, Google Drive, meeting tools); segmentation engine scores context by topic, confidence, sensitivity, personal/professional axes before injecting into AI tools; structured markdown output (persona.md, voice.md, company.md); three refresh mechanisms: source-change detection, daily scheduled refresh, manual override; claims "10x fewer tokens than RAG" (unsubstantiated, no published methodology); #1 Product Hunt Product of Day May 25, 2026 (807 upvotes); proprietary cloud SaaS, two public GitHub repos contain only thin integration plugins | Active, cloud SaaS (proprietary) | [unabyss.com](https://unabyss.com/) |
+| **Exabase M-1** *(Exabase AI)* | Agent memory engine claiming SOTA on BEAM at every evaluated scale using Gemini 3 Flash (6× cheaper and faster than Gemini 3 Pro used by other leading systems); PRNewswire press release Jul 28, 2026; ~20% fewer tokens per query than next best; BEAM 100K 76.9%, BEAM 1M 75.0%, BEAM 10M 68.0% — all self-published | Active, announced Jul 2026 | [prnewswire.com (Jul 28, 2026)](https://www.prnewswire.com/news-releases/exabase-achieves-state-of-the-art-on-beam-memory-benchmark-at-every-scale-using-a-smaller-cheaper-model-302835412.html) |
+| **CortexDB** | Long-term memory layer built by Apache Cassandra co-creator Prashant Malik; lossless event-sourced architecture; 4-channel hybrid retrieval (HNSW + Tantivy/BM25 + graph traversal + cross-encoder rerank) fused via Reciprocal Rank Fusion; type-routed prompts + self-consistency voting; LongMemEval-S 93.8% (469/500), LoCoMo 91.8% *(self-published, May 2, 2026 blog post; single run, production server)* | Active, announced May 2026 | [cortexdb.ai/blog/longmemeval-93-8-percent](https://cortexdb.ai/blog/longmemeval-93-8-percent) |
+| **Redis Remis** *(Redis)* | Redis's agent memory product; "Remis + Instruct" combined strategy scores 86.5% task-averaged accuracy on LongMemEval across a common GPT-4o backbone — top result among production systems reproduced in Redis's Sep 21, 2026 benchmark report; "fraction of the cost" vs other top systems; separate managed-service comparison (Oracle, with stronger answer model) within 0.5 pp | Active, Sep 2026 benchmark report | [redis.io/resources/agent-memory-benchmark-report](https://redis.io/resources/agent-memory-benchmark-report/) |
+| **Couchbase Agent Memory** *(Couchbase)* | Managed agent memory server on Couchbase Capella; allows AI agents to store and recall user context across sessions; v1.1 (Oct 19, 2026): adds multi-node scaling and Hermes Agent plug-in | Active, managed cloud (Capella), v1.1 Oct 2026 | [docs.couchbase.com/agent-mem](https://docs.couchbase.com/agent-mem/current/reference/release-notes-agent-mem.md) |
+
+## Change Log
+
+| Date | Change | Source |
+|---|---|---|
+| 2026-04-02 | EverMemOS LOCOMO updated 92.3% → 93.05%; LongMemEval 82% → 83.00%; HaluMem 90.04% added; Feb 2026 product release as source | [evermemory.ai](https://evermemory.ai) |
+| 2026-04-02 | Honcho updated: v3.0.4 RC released (2026-04-02); MCP server improvements (inspect_workspace, list_workspaces tools added); BEAM 100K confirmed 63%; working on BEAM 10M | [github.com/plastic-labs/honcho](https://github.com/plastic-labs/honcho) |
+| 2026-04-02 | Letta LOCOMO 74.0% added (Letta Filesystem: simple file storage + grep beats specialized tools) | [letta.com](https://letta.com) |
+| 2026-04-02 | Added MemoryOS (BAI-LAB, EMNLP 2025 Oral) as new row: OS-inspired hierarchical memory, +49% F1 on LoCoMo, MCP server, Python/SQLite | [github.com/BAI-LAB/MemoryOS](https://github.com/BAI-LAB/MemoryOS) |
+| 2026-04-02 | Added new systems table: MemOS (MemTensor), MemoryOS (BAI-LAB), Cognee, OpenViking | GitHub search |
+| 2026-04-02 | Added new benchmarks table: HaluMem, AMB (Vectorize), two arxiv papers (Mar 2026) | Web search |
+| 2026-04-02 | Added Letta baseline threat note; LOCOMO table updated | — |
+| 2026-04-02 | Mem0: very active development (Codex plugin support, CLI improvements, purple branding); v1.0.3 current | [github.com/mem0ai/mem0](https://github.com/mem0ai/mem0) |
+| 2026-04-03 | Added Mastra Observational Memory: SOTA LongMemEval 84.23% (gpt-4o) / 94.87% (gpt-5-mini); Observer+Reflector architecture | [github.com/mastra-ai/mastra](https://github.com/mastra-ai/mastra) |
+| 2026-04-03 | Added Supermemory: 85.4% LongMemEval-S (production), ~99% experimental ASMR (parallel LLM agents, no vector DB) | [supermemory.ai](https://supermemory.ai) |
+| 2026-04-03 | Added Memori (MemoriLabs): 81.95% LoCoMo at 4.98% cost of full context; SQL-native; Cloud + OpenClaw plugin | [github.com/memorilabs/memori](https://github.com/memorilabs/memori) |
+| 2026-04-03 | Added new papers: MemFactory (2603.29493), AgeMem (2601.01885), A-MAC (2603.04549), LifeBench (2603.03781), Memory-R1 (2603.26035), LongRewardBench (2604.12406) | arxiv |
+| 2026-04-03 | Honcho: v3.0.4 RC (Apr 2) — external vector store for message search, dialectic connection fix, MCP server active; LOCOMO 89.9% confirmed LLM-judge | [github.com/plastic-labs/honcho](https://github.com/plastic-labs/honcho) |
+| 2026-04-03 | Updated gap analysis: added LongMemEval trailing note, context efficiency dimension, Memori to LoCoMo list | — |
+| 2026-04-06 | **Added Hindsight (Vectorize) to matrix** — new BEAM 100K leader at 75% (since corrected to 73.4%), LOCOMO 92% (#1 on AMB), LongMemEval-S 94.6% (#1 on AMB). BEAM 10M 64.1% — next best is 40.6%, a 58% relative margin. | [hindsight.vectorize.io](https://hindsight.vectorize.io/blog/2026/04/02/introducing-hindsight) |
+| 2026-04-06 | **Added OMEGA**: 95.4% LongMemEval (#1 on leaderboard), local-first pip install, no cloud | [omegamax.co](https://omegamax.co/benchmarks) |
+| 2026-04-06 | **Added MemMachine**: 91.69% LoCoMo, 93.0% LongMemEval-S; retrieval-stage-only approach; ~80% fewer tokens than Mem0 | [arxiv 2604.04853](https://arxiv.org/abs/2604.04853) |
+| 2026-04-06 | **Added new papers**: MemMachine (2604.04853), SuperLocalMemory V3.3 (2604.04514), LongRewardBench (2604.12406) | arxiv |
+| 2026-04-06 | **Added Hermes Agent** (Nous Research) to notable systems — 7-provider pluggable memory aggregator (Honcho, OpenViking, Mem0, Hindsight, etc.), launched Feb 2026 | [github.com/NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
+| 2026-04-06 | Hindsight noted as new BEAM 100K leader (originally 75%, since corrected to 73.4%). Updated LOCOMO/LongMemEval lists to include Hindsight and Engram. | Web search |
+| 2026-04-07 | **Added MemU** — file-system hierarchy memory with explicit LLM CRUD; LOCOMO 92.09% self-published | [arxiv/GitHub] |
+| 2026-04-07 | **Added ByteRover** (campfirein) to matrix and notable systems — Context Tree architecture; LoCoMo 92.2% (v2.0 best run Feb 2026); LongMemEval 89.4%; local-first; 22+ tool integrations | [github.com/campfirein/byterover-cli](https://github.com/campfirein/byterover-cli) |
+| 2026-04-07 | **Added Engram** (engram.fyi) to notable systems — MCP memory server for Claude Code, Cursor; episodic+semantic+procedural via single MCP route | [engram.fyi](https://engram.fyi) |
+| 2026-04-07 | **Added Anthropic Auto Dream** to notable systems — Claude Code functional memory consolidation (Mar 2026) | [anthropic.com](https://anthropic.com) |
+| 2026-04-07 | **Added Neo4j Agent Memory** to notable systems — graph-native memory backed by Neo4j | [github.com/neo4j-labs/agent-memory](https://github.com/neo4j-labs/agent-memory) |
+| 2026-04-07 | **Added ALMA** (zksha) to notable systems — automated meta-learning of memory designs | [github.com/zksha/alma](https://github.com/zksha/alma) |
+| 2026-04-07 | **Added MemPalace** (milla-jovovich) to matrix and notable systems — verbatim storage; BEAM 100K 49% (independently tested); LongMemEval R@5 96.6% (self-reported retrieval recall) | [github.com/milla-jovovich/mempalace](https://github.com/milla-jovovich/mempalace) |
+| 2026-04-08 | **Hindsight now native Hermes Agent memory provider** (Apr 6 blog post). VentureBeat coverage: "91% accuracy" on LongMemEval. Growing ecosystem integration. | [hindsight.vectorize.io/blog/2026/04/06](https://hindsight.vectorize.io/blog/2026/04/06) |
+| 2026-04-10 | **Supermemory claims ~99% LongMemEval** via agent swarm approach; Hindsight BEAM 10M 64.1% confirmed as massive lead (next: 40.6%, 58% margin) | [aihola.com](https://aihola.com/article/supermemory-99-longmemeval) |
+| 2026-04-10 | Updated gap analysis: OMEGA now LongMemEval #1 (95.4%), MemMachine enters LoCoMo top tier, ByteRover LoCoMo/LongMemEval noted | — |
+| 2026-04-14 | **Hindsight BEAM 100K corrected 75% → 73.4%**: primary source is the Vectorize blog post dated 2026-04-02, which reports 73.4% as the hard number. The 75% figure in earlier entries was a rounded/approximated figure. All matrix entries updated. | [hindsight.vectorize.io/blog/2026/04/02](https://hindsight.vectorize.io/blog/2026/04/02) |
+| 2026-04-14 | **BEAM methodology note**: Honcho 63.0% and Hindsight 73.4% are both arithmetic mean of per-question BEAM rubric scores across 400 questions, single run, using BEAM's nugget-based LLM judge. | [BEAM paper](https://arxiv.org/abs/2503.24129) |
+| 2026-04-14 | Added Memori (MemoriLabs) to competitive matrix. | [github.com/memorilabs/memori](https://github.com/memorilabs/memori) |
+| 2026-04-14 | Added MemPalace BEAM 100K (49.0%, independently tested, raw mode + GPT-5.4-mini synthesis) and LongMemEval R@5 (96.6%, self-reported retrieval recall). | [github.com/milla-jovovich/mempalace](https://github.com/milla-jovovich/mempalace) |
+| 2026-05-18 | **ByteRover updated**: LoCoMo corrected 92.2% → 96.1% (v2.1.5, self-published Mar 2026 on byterover.dev); LongMemEval updated 89.4% → 92.8% (v2.1.5); v3.14.0 (May 2026) current; 4.8k GitHub stars. | [byterover.dev](https://www.byterover.dev/blog/byterover-v2) |
+| 2026-05-18 | **Honcho LongMemEval clarified**: evals.honcho.dev shows 90.4% on LongMem-S (personal assistant, 500 sessions); 88.8% on LongMem-M (500 sessions). Source: evals.honcho.dev (self-published, May 2026). | [evals.honcho.dev](https://evals.honcho.dev) |
+| 2026-05-18 | **Added EverOS rename note**: EverMemOS → EverOS on Apr 14, 2026 brand upgrade. New GitHub: EverMind-AI/EverOS. Added ACL 2026 acceptance. | [github.com/EverMind-AI/EverOS](https://github.com/EverMind-AI/EverOS) |
+| 2026-05-18 | **Added Eywa to notable systems and papers table** — provenance-grounded long-term memory (arxiv 2605.30771, May 2026); immutable evidence-before-belief; zero LLM calls at write time | [arxiv 2605.30771](https://arxiv.org/abs/2605.30771) |
+| 2026-05-18 | **Added SimpleMem/EvolveMem to notable systems and papers table** — SimpleMem (arxiv 2601.02553, Jan 2026): 30× fewer tokens, multimodal, zero retrieval LLM; EvolveMem (arxiv 2605.13941, May 2026): self-evolving closed-loop diagnosis | [arxiv 2601.02553](https://arxiv.org/abs/2601.02553) |
+| 2026-05-18 | **Added 2 new survey papers**: "From Storage to Experience" (arxiv 2605.06716, May 2026) — 3-stage memory evolution framework (Storage→Retrieval→Experience); Mnemonic Sovereignty (arxiv 2604.16548, Apr 2026) — first LLM memory security survey | arxiv |
+| 2026-05-18 | **MemOS v2.0.15 released** (May 11, 2026) — hook-based plugin system for extensible memory processing; Reflect2Evolve architecture in multi-turn capture; LoCoMo 92.34%, LongMemEval 93.40% self-published | [github.com/MemTensor/MemOS](https://github.com/MemTensor/MemOS) |
+| 2026-05-18 | **Hindsight v0.6.2 released** (May 14, 2026) — bugfix: timestamp not reaching retain API; openclaw v0.7.7, claude-code v0.6.5 integration releases (May 15) | [github.com/vectorize-io/hindsight](https://github.com/vectorize-io/hindsight) |
+| 2026-05-18 | **Letta v0.16.8 released** (May 14, 2026) — security fix: JSON instead of pickle for sandbox→server tool result transport | [github.com/letta-ai/letta](https://github.com/letta-ai/letta) |
+| 2026-05-18 | Honcho active development (Apr–May 2026): embeddings configurable (#678), deriver custom instructions (#609), dialectic N+1 query fix (#707), better SDK compatibility | [github.com/plastic-labs/honcho](https://github.com/plastic-labs/honcho) |
+| 2026-05-18 | Mem0 May 2026: Agent Mode bootstrap + claim flow CLI (May 14); TypeScript latestOnly on hosted memory reads; hosted Qdrant migration scripts; Composio integration | [github.com/mem0ai/mem0](https://github.com/mem0ai/mem0) |
+| 2026-05-18 | Memori v0.1.5 (May 15, 2026): Hermes integration skill file (#499), improved MCP docs, OpenAI multimodal array parsing fix, recall filter bugfix | [github.com/memorilabs/memori](https://github.com/memorilabs/memori) |
+| 2026-07-04 | **EverMemOS officially renamed EverOS** (Apr 14, 2026 brand upgrade + global public beta). New GitHub: EverMind-AI/EverOS. New features: knowledge wikis, reflection, v1.1.0 (Jun 24, 2026). | [github.com/EverMind-AI/EverOS](https://github.com/EverMind-AI/EverOS) |
+| 2026-07-04 | **Honcho LongMemEval-S updated 88.8% (LongMem-M) → 90.4% (LongMem-S)** per evals.honcho.dev (self-published, May 2026). BEAM 10M corrected from "SOTA" to 40.9% (0.409); Hindsight holds BEAM 10M lead at 64.1%. | [evals.honcho.dev](https://evals.honcho.dev) |
+| 2026-07-04 | **Mem0 v3 algorithm** (self-published, mem0.ai/research, Apr 2026): LoCoMo 92.5%, LongMemEval 94.4%, BEAM 1M 64.1%, BEAM 10M 48.6% — all self-published; BEAM 10M 48.6% now second-best behind Hindsight 64.1% | [mem0.ai/research](https://mem0.ai/research) |
+| 2026-07-04 | **Mem0 releases** — SDK v2.0.11 (Jul 1, 2026): Pi Agent Plugin (pre-fetches memories before agent execution), OpenCode Plugin v0.2.1, support for Gemini 2.5 Flash + Pro; TypeScript SDK v2.1.6 (Jul 2) | [github.com/mem0ai/mem0](https://github.com/mem0ai/mem0) |
+| 2026-07-04 | **MemOS v2.0.22 released** (Jul 3, 2026); LoCoMo 92.34%, LongMemEval 93.40% (self-published, GitHub README); leads OmniMemEval among 14 commercial memory products | [github.com/MemTensor/MemOS](https://github.com/MemTensor/MemOS) |
+| 2026-07-04 | **Added Eywa to notable systems and papers table** — provenance-grounded memory; immutable evidence-before-belief design; zero LLM calls at write time for evidence ingestion | [arxiv 2605.30771](https://arxiv.org/abs/2605.30771) |
+| 2026-07-04 | **Added 4 new papers**: LongMemEval-V2 (arxiv 2605.12493, May 2026 — web-agent memory benchmark, 451 questions, 115M token trajectories); Portable Agent Memory Protocol (arxiv 2605.11032, May 2026 — interoperability standard); Are We Ready? (arxiv 2606.24775, Jun 2026 — 12-system evaluation, 4-property framework); EvolveMem (arxiv 2605.13941, May 2026 — self-evolving SimpleMem follow-up) | arxiv |
+| 2026-07-05 | **Added MemOS (MemTensor) to competitive matrix**: LoCoMo 92.34%, LongMemEval 93.40% (self-published, v2.0.22, Jul 2026); Reflect2Evolve architecture; multi-modal; leads OmniMemEval among 14 commercial memory products (10 datasets); Local Plugin v2.0 self-evolving memory (L1/L2/L3 tiers). | [github.com/MemTensor/MemOS](https://github.com/MemTensor/MemOS) |
+| 2026-07-05 | **Hindsight v0.7.0–v0.8.4 (May–Jul 2026)**: v0.7.0 (May 27) multilingual/CJK, polyglot Control Plane in 8 languages; v0.8.0 (Jun 8) mental model history tables, semantic dedup, LLM prompt-prefix caching, cross-instance bank migration; v0.8.2 (Jun 12) Memory Defense (PII protection), reversible memory curation; v0.8.4 (Jul 1) multi-LLM failover, configurable recency decay. New integrations: Aider, GitHub Copilot, Windsurf, Continue.dev, Zapier, Cursor, Cline, Flowise, Roo Code, Haystack, Google ADK. | [hindsight.vectorize.io/blog](https://hindsight.vectorize.io/blog) |
+| 2026-07-05 | **BAI-LAB MemoryOS**: 5× faster via parallelization optimizations; MemoryOS-MCP open-sourced (Jun 2026) for agent client integration. | [github.com/BAI-LAB/MemoryOS](https://github.com/BAI-LAB/MemoryOS) |
+| 2026-07-05 | **Added MIRIX to notable systems**: 6-type multi-agent memory (Jul 2025 paper, not previously tracked); LoCoMo 85.4%; multimodal with real-time screen monitoring; 99.9% storage reduction vs RAG on ScreenshotVQA. | [arxiv 2507.07957](https://arxiv.org/abs/2507.07957) |
+| 2026-07-05 | **Added 5 new papers**: MemIR (arxiv 2605.25869, typed provenance memory), RecMem (arxiv 2605.16045, ACL 2026, 87% token reduction), MemFail (arxiv 2605.26667, failure-mode diagnostics), MemPro (arxiv 2606.00619, evolvable pipelines), MIRIX (arxiv 2507.07957, multimodal multi-agent). | arxiv |
+| 2026-07-06 | **Honcho v3.0.10 RC (Jun 15) and v3.0.11 RC (Jun 24, 2026)**: CloudEvents + Langfuse tracing projections over captured LLM stream, OpenRouter header attribution, deriver batch flushing improvements, surprisal tree parameter fixes, JWT scope fixes. | [github.com/plastic-labs/honcho](https://github.com/plastic-labs/honcho) |
+| 2026-07-06 | **Hindsight Eve v0.2.0 (Jul 3, 2026)**: New auto-memory mode that requires no model tool-calling; enables passive memory retention for models without function-calling support. | [github.com/vectorize-io/hindsight](https://github.com/vectorize-io/hindsight) |
+| 2026-07-06 | **Added 4 new papers (Jun 2026)**: T-Mem (arxiv 2606.15405 — write-time rehearsal triggers, LoCoMo SOTA claimed), MemRefine (arxiv 2606.13177 — LLM-guided compression within fixed storage budgets), AutoMEM/Cross-Scenario (arxiv 2606.04315 — agentic harness outperforms passive pipelines across 5 scenarios), Metis (arxiv 2606.24151 — dual text+code memory for self-evolving agents). | arxiv |
+| 2026-07-07 | **EverOS v1.1.1 released (Jul 7, 2026)**: adds reproducible LoCoMo benchmark runner, enhanced hybrid search stability, expanded CI for Python 3.12 + 3.13; release notes say hybrid search "stably targets around 91%, agentic search around 93%" on LoCoMo (approximate, not a hard benchmark figure). | [github.com/EverMind-AI/EverOS](https://github.com/EverMind-AI/EverOS) |
+| 2026-07-07 | **Mem0 security fixes (Jul 7, 2026)**: patched SQL and Cypher injection vulnerabilities in PGVector, Azure MySQL, and Neptune backends; URL path encoding fix; TypeScript SDK expanded with MongoDB, Elasticsearch, OpenSearch, xAI/Grok providers merged same day. | [github.com/mem0ai/mem0](https://github.com/mem0ai/mem0) |
+| 2026-07-07 | **Hindsight Eve v0.2.1 (Jul 6, 2026)**: patch adding assistant-reply retention by default in Eve auto-memory mode; timestamps unconfirmed whether before or after prior run cutoff. | [github.com/vectorize-io/hindsight](https://github.com/vectorize-io/hindsight) |
+| 2026-07-07 | **Added 13 new papers** to papers table (Apr–Jul 2026 backfill): Omni-SimpleMem (2604.01007 — AutoResearch-guided multimodal memory, LoCoMo F1 +411%), ZenBrain (2604.23878 — 7-layer neuroscience architecture, LongMemEval-500 91.3% oracle-match at 1/106th token cost), StructMem (2604.21748 — ACL 2026 main, temporal anchoring + semantic consolidation), EvoMemBench (2605.18421 — evaluates 15 methods across in/cross-episode and knowledge/execution axes), HAGE (2605.09942 — RL-driven graph memory traversal), MemForest (2605.23986 — temporal hierarchical indexing, 6× throughput vs EverOS, VLDB submission), SaliMory (2606.04120 — Meta, process-reward trained cognitive memory, 2× personalization rate), TOKI (2606.06240 — bitemporal operator algebra for contradiction resolution), RaMem (2606.22844 — contextual reinstatement, F1 +10%), MemSyco-Bench (2607.01071 — sycophancy benchmark), Forged Reasoning Attacks (2607.05029 — adversarial memory manipulation + defenses), MRMS (2607.04617 — multi-resolution memory substrate). | arxiv |
+| 2026-07-07 | **Added 6 notable systems**: Microsoft Memora (ICML 2026, harmonic memory representation, SOTA LoCoMo + LongMemEval, 98% fewer tokens, github.com/microsoft/Memora); MemCog (Tencent/WeChat, arxiv 2605.28046, 95.8% LongMemEval + 92.98% LoCoMo self-published, proactive memory navigation); SuperLocalMemory (Qualixar, zero-LLM Mode A, EU AI Act compliance, 87.7% LoCoMo Mode C); OpenAI Dreaming V3 (Jun 4, async synthesis, temporal self-correction, 5× compute reduction, free-tier rollout); Cloudflare Agent Memory (private beta Apr 2026, 5-channel RRF retrieval); LangMem (LangChain, 746K monthly downloads, background memory for LangGraph). | [github.com/microsoft/Memora](https://github.com/microsoft/Memora), [arxiv 2605.28046](https://arxiv.org/abs/2605.28046), [blog.cloudflare.com](https://blog.cloudflare.com/introducing-agent-memory/), [openai.com](https://openai.com/index/chatgpt-memory-dreaming/), [langchain-ai.github.io/langmem](https://langchain-ai.github.io/langmem/) |
+| 2026-07-07 | **Cognee updated v0.5.2 → v1.0** (Jun 2026): unified Postgres backend replaces split graph+vector stores; self-improving memory via `memify`; 1M+ pipelines/month at 70+ companies. | [cognee.ai/blog](https://www.cognee.ai/blog/guides/building-an-ai-agent-best-persistent-memory-layer) |
+| 2026-07-07 | **Added GBrain** (garrytan/gbrain, 25,292 stars, Garry Tan/YC President): zero-LLM typed knowledge graph, dual PGLite WASM + pgvector/HNSW engine, Git-backed Markdown system of record, dream-cycle dedup; LongMemEval R@5 97.6% (self-published, gbrain-evals repo; retrieval recall metric — not comparable to LongMemEval-S generation accuracy); BrainBench internal 97.9%. | [github.com/garrytan/gbrain](https://github.com/garrytan/gbrain) |
+| 2026-07-07 | **Added Hippo** (kitfunso/hippo-memory, 709 stars, v1.23.0): 7 biologically-inspired hippocampal mechanisms; R-STDP as reward-proportional decay modulation; LongMemEval per-haystack 98.6%/99.8% R@5, but 73.8% on full unified 19k-session store; sequential learning magnitude claim formally retracted in v1.7.9 after pre-registered evaluation failure. | [github.com/kitfunso/hippo-memory](https://github.com/kitfunso/hippo-memory) |
+| 2026-07-07 | **Added PMB** (oleksiijko/pmb, 292 stars, Apache 2.0, v1.2.2): local-first 4-way hybrid retrieval (SQLite+LanceDB BM25+vector+entity graph+RRF); LoCoMo recall@10 94.5% (self-published, public benchmark script). | [github.com/oleksiijko/pmb](https://github.com/oleksiijko/pmb) |
+| 2026-07-07 | **Added Unabyss** (cloud SaaS, 807 PH upvotes, #1 PH Product of Day May 25, 2026): MCP-native personal data aggregator connecting 20+ external sources; segmentation engine; no published benchmarks; proprietary cloud, not open-source. | [unabyss.com](https://unabyss.com/) |
+| 2026-07-07 | **Added 9 new papers** to papers table: LoCoMo-Plus (2602.10715 — cognitive memory with cue–trigger semantic disconnect benchmark), GEM/MemState (2605.26252 — governed evolving memory framework, 4 state-level operators), BeliefMem (2605.05583 — probabilistic multi-hypothesis memory, ALFWorld +11%), DeMem (2605.10870 — decision-centric rate-distortion, 83% gold evidence), TriMem (2605.19952 — three-granularity + TextGrad optimization), R²-Mem (2605.13486 — reflective experience for search agents, F1 +22.6%), Mem-π (2605.21463 — RL-trained on-demand guidance generation, >20% improvement), DCPM (2606.09483 — dual-process belief chains + schema induction, LongMemEval 85.17%), PROJECTMEM (2606.12329 — event-sourced memory-as-governance for coding agents). | arxiv |
+| 2026-07-08 | **Added 7 new papers** backfilled from Apr–Jul 2026 sweep: Hippocampus (2602.13594 — Dynamic Wavelet Matrix, 31× latency reduction, 14× fewer tokens), GAM (2604.12285 — hierarchical graph-based agentic memory, event progression + topic associative network), HMO (2604.01670 — 3-tier hierarchical memory orchestration, OpenClaw deployed), Cognis (2604.19771 — context-aware memory, BM25+Matryoshka+RRF+BGE-2, SOTA claimed on LoCoMo + LongMemEval across 8 models, OSS in production), MemTrace (2605.28732 — error tracing via executable memory evolution graphs, +7.62% performance via fault attribution, tests Mem0 + EverMemOS), User as Code (2606.16707 — executable Python typed memory, 78.8% LoCoMo recall, 99% aggregate queries vs 6–43% for retrieval-based), AgenticSTS (2607.02255 — Slay the Spire 2 bounded-memory testbed, 298 trajectories, Claude A0 baseline 3/10 → 6/10 with skill memory). | [arxiv 2602.13594](https://arxiv.org/abs/2602.13594), [arxiv 2604.12285](https://arxiv.org/abs/2604.12285), [arxiv 2604.01670](https://arxiv.org/abs/2604.01670), [arxiv 2604.19771](https://arxiv.org/abs/2604.19771), [arxiv 2605.28732](https://arxiv.org/abs/2605.28732), [arxiv 2606.16707](https://arxiv.org/abs/2606.16707), [arxiv 2607.02255](https://arxiv.org/abs/2607.02255) |
+| 2026-07-09 | **MemOS v2.0.23 released** (Jul 9, 2026): bug fixes for system parser initialization, JSON response handling, and cube sharing validation; adds configurable CJK keyword tokenization, embedding input routing by usage type, and a data export endpoint for memos-local; fixes OpenClaw plugin registration blocking, skill crystallization retries, and SQLite native binding quarantine. | [github.com/MemTensor/MemOS/releases](https://github.com/MemTensor/MemOS/releases) |
+| 2026-07-09 | **Added ByteRover paper** (arxiv 2604.01599, Apr 2, 2026) to papers table — arxiv paper for the ByteRover system already tracked in the matrix; LLM-curated hierarchical Context Tree; LoCoMo 96.1% and LongMemEval-S 92.8% (v2.1.5, self-published). | [arxiv 2604.01599](https://arxiv.org/abs/2604.01599) |
+| 2026-07-10 | No significant changes detected in tracked sources. EverMemOS LanceDB FTS crash + disk-bloat fix merged (Jul 10, github.com/EverMind-AI/EverMemOS). All other findings from today's research sweep already covered by prior runs. | Scheduled run |
+| 2026-10-02 | **Added Exabase M-1** to notable systems — new BEAM SOTA at every scale (Jul 28, 2026 PRNewswire): BEAM 100K 76.9%, 1M 75.0%, 10M 68.0%; uses Gemini 3 Flash (6× cheaper than Gemini 3 Pro); ~20% fewer tokens/query than Hindsight; surpasses prior BEAM 100K leader Hindsight by 3.5 pp | [prnewswire.com](https://www.prnewswire.com/news-releases/exabase-achieves-state-of-the-art-on-beam-memory-benchmark-at-every-scale-using-a-smaller-cheaper-model-302835412.html) |
+| 2026-10-02 | **Added CortexDB** to notable systems — new LongMemEval-S 93.8% + LoCoMo 91.8% (May 2, 2026 blog); 4-channel hybrid retrieval; built by Apache Cassandra co-creator; lossless event-sourced architecture | [cortexdb.ai/blog/longmemeval-93-8-percent](https://cortexdb.ai/blog/longmemeval-93-8-percent) |
+| 2026-10-02 | **Cognee BEAM score added**: BEAM 100K 79%, BEAM 10M 67% (self-published Jun 26, 2026, updated Sep 3, 2026); authors note "more parameter exploration on the target conversation than we'd like" — treat as directional | [cognee.ai/blog/deep-dives/benchmarking-cognee-on-beam](https://www.cognee.ai/blog/deep-dives/benchmarking-cognee-on-beam) |
+| 2026-10-02 | **Added 6 new papers**: Agent Memory Characterization (arxiv 2606.06448 — first systems-level characterization, 10 systems, 4-axis taxonomy), Governed Shared Memory (arxiv 2606.24535 — multi-agent shared memory governance, MemClaw prototype), SelfMem (arxiv 2607.03726 — self-optimizing memory strategies, BEAM +48.7% improvement at 100K over baseline), Agent Zero Memory (arxiv 2608.29606 — provenance-locked 3-store memory, LongMemEval 95.60% + LoCoMo 93.60% self-published), REALM (arxiv 2609.16053 — retrieval-driven memory reconsolidation, LoCoMo 75.97% + LongMemEval 65.11%) | arxiv |
+| 2026-10-03 | **Added Redis Remis** to notable systems — Redis's agent memory product; "Remis + Instruct" strategy scores 86.5% task-averaged accuracy on LongMemEval across common GPT-4o backbone (top result among production systems in Redis benchmark report, Sep 21, 2026) | [redis.io/resources/agent-memory-benchmark-report](https://redis.io/resources/agent-memory-benchmark-report/) |
+| 2026-10-03 | **Added 2 new papers**: MemChain (arxiv 2607.24097, Jul 2026 — trainable post-retrieval memory policy generating structured evidence traces; TMPO RL objective; SOTA on LoCoMo + LongMemEval-S with reduced context); When Does Memory Help? (arxiv 2609.05441, Sep 2026 — cost-aware evaluation; full replay never economical; CAMU metric introduced) | [arxiv 2607.24097](https://arxiv.org/abs/2607.24097), [arxiv 2609.05441](https://arxiv.org/abs/2609.05441) |
+| 2026-10-04 | **Added 5 new papers**: MemoryArena (arxiv 2602.16313, ICML 2026 — multi-session agentic eval gym; near-SOTA LoCoMo systems fail in agentic settings, exposing the QA-memorization/decision-grounded gap); Filesystem-Based Memory (arxiv 2607.26637, Jul 2026 — first systematic study of markdown-filesystem memory; organized stores halve retrieval cost but organization erodes for weak management agents); Router-Mem (arxiv 2608.01285, Aug 2026 — evidence-conditioned early termination, −27% inference time, AMA-Bench 55.17% / BEAM 38.77%); DreamBench-SWE (arxiv 2608.20664, Aug 2026 — SWE agent memory benchmark with executable oracle scoring; best system 97/180 = 53.9%); LightMem (arxiv 2604.07798, ACL 2026 Long — SLM-driven 3-tier memory, +2.5 F1 over A-MEM on LoCoMo, 83 ms retrieval) | [arxiv 2602.16313](https://arxiv.org/abs/2602.16313), [arxiv 2607.26637](https://arxiv.org/abs/2607.26637), [arxiv 2608.01285](https://arxiv.org/abs/2608.01285), [arxiv 2608.20664](https://arxiv.org/abs/2608.20664), [arxiv 2604.07798](https://arxiv.org/abs/2604.07798) |
+| 2026-10-04 | **Exabase LongMemEval retrieval score noted**: Exabase's Jul 28, 2026 press release reports M-1 scored 96.4% at top-50 retrieval on LongMemEval — this is R@50 retrieval recall (no LLM generation), not generation accuracy, and is not directly comparable to LongMemEval-S generation scores (e.g. OMEGA 95.4%, Agent Zero Memory 95.60%) | [prnewswire.com](https://www.prnewswire.com/news-releases/exabase-achieves-state-of-the-art-on-beam-memory-benchmark-at-every-scale-using-a-smaller-cheaper-model-302835412.html) |
+| 2026-10-30 | **Added Metis: Memory Foundation Model** (arXiv 2607.26760, Jul 29, 2026; missed by prior runs) — MemTensor's first prototype of a native memory foundation model; gradient-free memory updates via forward pass only; Local+Hyper Memory Blocks per layer; 4B/9B/27B checkpoints on Qwen3.5 base; noncommercial license; no benchmark scores reported | [arxiv 2607.26760](https://arxiv.org/abs/2607.26760) |
+| 2026-10-30 | **Added 3 new papers**: Metis Memory Foundation Model (arxiv 2607.26760 — MemTensor native-memory LLM, missed by prior runs); MemoType (arxiv 2610.11573 — multi-class memory type routing, up to 16.18% Recall@1 gain); Persistent Memory in Multi-Agent Inference (arxiv 2610.07782 — controlled negative result: memory tier adds cache cost but no measurable accuracy improvement) | arxiv |
+| 2026-10-30 | **Added Couchbase Agent Memory** to notable systems — managed memory server on Couchbase Capella; v1.1 (Oct 19, 2026) adds multi-node scaling and Hermes Agent plug-in | [docs.couchbase.com/agent-mem](https://docs.couchbase.com/agent-mem/current/reference/release-notes-agent-mem.md) |
+
+---
+
+# Appendix: Hindsight Deep Dive
+
+## 1. What Is It
+
+Hindsight is an open-source agent memory system built by Vectorize. It implements the "Retain, Recall, Reflect" architecture: three distinct operations that together handle the full memory lifecycle for LLM agents.
+
+## 2. Core Architecture
+
+### 2.1 The Four Memory Networks
+
+```
+Conversation → [Retain] → Structured Memory Bank
+                               ↓
+Query      ← [Recall]  ← Relevant Memories
+                               ↓
+                          [Reflect]
+                               ↓
+                          Updated Bank
+```
+
+The Memory Bank stores: **entities**, **relationships**, **preferences**, **events**, **summaries**.
+
+### 2.2 TEMPR — Temporal Entity Memory Priming Retrieval
+
+TEMPR is Hindsight's retrieval algorithm:
+1. **T**emporal: recency-weighted scoring
+2. **E**ntity: entity-level matching
+3. **M**emory: semantic similarity
+4. **P**riming: working memory priming
+5. **R**etrieval: ranked result fusion
+
+### 2.3 CARA — Coherent Adaptive Reasoning Agents
+
+CARA is Hindsight's framework for multi-agent coordination with shared memory banks. Multiple agents read/write the same bank; coherence maintained via versioned writes.
+
+### 2.4 Storage Backend
+
+Hindsight supports pluggable backends:
+- **Default**: in-memory (zero infra)
+- **Persistent**: PostgreSQL + pgvector, Qdrant, Weaviate, Pinecone
+- **Hosted**: Vectorize cloud (managed)
+
+### 2.5 LLM Provider Configuration
+
+```yaml
+memory:
+  llm:
+    provider: openai  # or anthropic, azure, together, fireworks
+    model: gpt-4o-mini
+    api_key: ${OPENAI_API_KEY}
+```
+
+# Supported providers
+# openai, anthropic, azure, together, fireworks, litellm
+
+## 3. The Three Operations in Practice
+
+### Retain
+
+```python
+from hindsight import Hindsight
+
+hd = Hindsight(api_key="...")
+hd.retain(
+    messages=[{"role": "user", "content": "I prefer dark mode"}],
+    user_id="alice"
+)
+```
+
+### Recall
+
+```python
+memories = hd.recall(
+    query="user interface preferences",
+    user_id="alice"
+)
+# Returns: [{"memory": "Prefers dark mode", "score": 0.94, ...}]
+```
+
+### Reflect
+
+```python
+hd.reflect(user_id="alice")  # background; usually scheduled
+# Consolidates memories, resolves contradictions, updates summaries
+```
+
+### LLM Wrapper (2-line integration)
+
+```python
+from hindsight import HindsightLLM
+
+llm = HindsightLLM(base_llm=openai_client, user_id="alice")
+response = llm.chat(messages)  # retain + recall happen automatically
+```
+
+# All subsequent LLM calls automatically retain/recall memories
+
+## 4. Benchmark Results
+
+### 4.1 LongMemEval (S) — Per-Category Breakdown
+
+| Category | Score |
+|---|---|
+| Single-session QA | 96.2% |
+| Cross-session QA | 93.1% |
+| Temporal reasoning | 92.4% |
+| Preference tracking | 97.8% |
+| Entity tracking | 94.6% |
+| **Overall (S)** | **94.6%** |
+
+### 4.2 LoCoMo — Full Table
+
+LoCoMo10 (10-session) results from the AMB leaderboard (self-reported by Vectorize):
+
+| System | F1 | BLEU-1 | ROUGE-1 | METEOR | **Avg** |
+|---|---|---|---|---|---|
+| **Hindsight (GPT-4o-mini)** | 94.33 | 88.77 | 96.26 | 91.80 | **92.79%** |
+| **Hindsight (GPT-4o)** | 94.14 | 87.00 | 97.19 | 91.05 | **92.35%** |
+| **Hindsight (Claude 3.5 Sonnet)** | 93.60 | 87.29 | 96.59 | 89.48 | **91.74%** |
+| **Hindsight (OSS-20B)** | 95.7% | 66.7% | 84.6% | 79.7% | 79.7% | **83.6%** |
+| **Hindsight (OSS-120B)** | — | — | — | — | — | **89.0%** |
+| **Hindsight (Gemini-3 Pro)** | — | — | — | — | — | **91.4%** |
+
+### 4.3 Agent Memory Benchmark (AMB) — All Datasets
+
+| Dataset | Hindsight Score | Notes |
+|---|---|---|
+| LoCoMo10 (GPT-4o-mini) | 92.79% | #1 on AMB |
+| LoCoMo10 (GPT-4o) | 92.35% | |
+| LongMemEval-S | 94.6% | #1 on AMB |
+| BEAM 100K | 73.4% | #1 on AMB; corrected from 75% |
+| BEAM 10M | 64.1% | Next best: 40.6% |
+
+### 4.4 BEAM Benchmark Deep Dive
+
+| System | BEAM 100K | BEAM 500K | BEAM 1M | BEAM 10M | **Avg (BEAM)** |
+|---|---|---|---|---|---|
+| **Hindsight** | 73.4% | — | — | 64.1% | — |
+| **Honcho** | 63.0% | — | — | 40.9% | — |
+| **Mem0 v3** | — | — | 64.1% | 48.6% | — |
+| **Hindsight (OSS-20B)** | 74.11 | 64.58 | 90.96 | 76.32 | **83.18%** |
+| **Hindsight (OSS-120B)** | 76.79 | 62.50 | 93.68 | 79.44 | **85.67%** |
+| **Hindsight (Gemini-3 Pro)** | 86.17 | 70.83 | 95.12 | 83.80 | **89.61%** |
+
+## 5. Benchmark Validity Assessment
+
+### 5.1 LongMemEval — Most Credible
+
+- Independent benchmark (not run by Vectorize)
+- Standardized eval harness
+- Multiple systems benchmarked
+- Hindsight score: 94.6% (self-run against public benchmark)
+
+### 5.2 LoCoMo — Questionable
+
+- AMB leaderboard run by Vectorize (conflict of interest)
+- Other systems' LoCoMo scores come from their own papers, not AMB
+- Comparison is apples-to-oranges: different LLMs, configs, dates
+
+| System | LoCoMo Score | Source | LLM Used |
+|---|---|---|---|
+| ByteRover | 96.1% | byterover.dev (self-pub, v2.1.5, Mar 2026) | Not disclosed |
+| EverOS | 93.05% | evermemory.ai (self-pub, Feb 2026) | Not disclosed |
+| MemOS | 92.34% | github.com/MemTensor/MemOS (self-pub, Jul 2026) | Not disclosed |
+| Mem0 v3 | 92.5% | mem0.ai/research (self-pub, Apr 2026) | Not disclosed |
+| Hindsight | 92% | AMB (Vectorize, conflict of interest) | GPT-4o-mini |
+| Memori | 81.95% | memorilabs (self-pub) | Not disclosed |
+| Honcho | 89.9% | Honcho blog (LLM-judge, not standard metrics) | Not disclosed |
+| MemU | 92.09% | self-pub | Not disclosed |
+| Letta | 74.0% | EMNLP 2025 paper (Letta Filesystem) | gpt-4o-mini |
+| Zep | 75% | disputed config | Not disclosed |
+| A-MEM | ~60% | NeurIPS 2025 paper | Not disclosed |
+| LoCoMo (AMB) | Independent dataset | Partial | Medium | ⚠️ Medium — Hindsight itself disclaims |
+
+### 5.3 AMB (Agent Memory Benchmark) — Conflict of Interest
+
+- Built and run by Vectorize (Hindsight's creator)
+- Hindsight tops every dataset it's on
+- Cannot be treated as independent validation
+
+### 5.4 Summary Validity Table
+
+| Benchmark | Independence | Hindsight Score | Caution Level |
+|---|---|---|---|
+| LongMemEval-S | High — Stanford/independent | 94.6% | Low |
+| BEAM 100K | High — ICLR 2026 paper | 73.4% | Low |
+| BEAM 10M | High | 64.1% | Low |
+| LoCoMo (AMB) | Low — Vectorize-run | 92% | High |
+
+## 6. Paper Summary
+
+Hindsight does not have an arxiv paper. The primary references are:
+- [Vectorize blog: Introducing Hindsight](https://hindsight.vectorize.io/blog/introducing-hindsight)
+- [BEAM benchmark paper](https://arxiv.org/abs/2503.24129)
+- [AMB leaderboard](https://agentmemory.fyi)
+
+## 7. Sources
+
+- [hindsight.vectorize.io](https://hindsight.vectorize.io)
+- [github.com/vectorize-io/hindsight](https://github.com/vectorize-io/hindsight)
+- [benchmarks.hindsight.vectorize.io](https://benchmarks.hindsight.vectorize.io)
+- [agentmemory.fyi](https://agentmemory.fyi)
+- [vectorize.io/blog/introducing-hindsight](https://vectorize.io/blog/introducing-hindsight-agent-memory-that-works-like-human-memory)
