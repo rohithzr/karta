@@ -6,7 +6,7 @@
 > positioning material. Benchmark numbers are self-published unless noted
 > otherwise and should be treated as claims until independently reproduced.
 >
-> Last compiled: 2026-11-01.
+> Last compiled: 2026-11-02.
 
 ## Legend
 
@@ -164,6 +164,8 @@
 | **MemoryTax: The Bitter Lesson of Agent Memory** *(arxiv 2610.29823, Oct 2026)* | Small empirical study (one LoCoMo conversation, one run per cell) comparing full context, BM25, Mem0, and Zep across three coding agents and three models; finds Mem0 only beats full context with weak models; with Claude Opus 5.5, "Pi" agent achieves 99% accuracy at <half the cost of full context | Pi + Claude Opus 5.5: 99% on one LoCoMo conversation (single conversation, single run per cell — scope is limited) | [arxiv 2610.29823](https://arxiv.org/abs/2610.29823) |
 | **Memory-Centric Continual Learning for AI Agents** *(arxiv 2610.29357, Oct 2026)* | Proposes evaluating memory by whether it improves future agent actions rather than what it retrieves; argues retrieval-accuracy metrics do not capture the downstream behavioral utility of memory | — (position/framework paper) | [arxiv 2610.29357](https://arxiv.org/abs/2610.29357) |
 | **Long-Term Agent Memory through Complementary Curation and Consolidation** *(arxiv 2610.39790, Oct 2026)* | Hybrid memory architecture pairing episodic memories with structured relational memories; consolidation mechanism keeps the system efficient; the two memory types shown to be consistently complementary — combining them outperforms state-of-the-art single-type frameworks | LoCoMo: 90.2%; LongMemEval-S: 85.5% | [arxiv 2610.39790](https://arxiv.org/abs/2610.39790) |
+| **More Memory, Worse Agents: Error Reproduction and Anti-Persistence in LLM Agents** *(arxiv 2610.27406, Oct 19, 2026)* | Diagnoses systematic failure where accumulated memories reproduce past errors; Anti-Persistence approach stores task trajectories and outcomes and rebuilds task-specific guidance on demand; avoids long raw-memory accumulation | Highest held-out success rate and lowest average LLM-call cost among evaluated memory designs *(self-reported)* | [arxiv 2610.27406](https://arxiv.org/abs/2610.27406) |
+| **Accept Changes, Reject Attacks: Robust Memory Management for LLM Agents** *(arxiv 2610.41056, Oct 29, 2026; cs.CR)* | Security-focused memory management; identifies two orthogonal failure modes: storing outdated facts (stale accepts) and storing adversarially planted instructions (malicious accepts); finds that existing memory managers and defenses are no more robust than an untuned baseline manager on its test sets | — (security taxonomy and evaluation) | [arxiv 2610.41056](https://arxiv.org/abs/2610.41056) |
 
 ## Notable New / Emerging Systems
 
@@ -307,6 +309,7 @@
 | 2026-10-31 | **Added 5 new October 2026 papers** (not captured by prior runs): Capability-Driven Self-Evolution (2610.06361), Multimodal Agent Memory survey (2610.19366), Beyond Downstream QA / FEB-30 benchmark (2610.22209 — 20% operation classification accuracy), MemoryTax (2610.29823 — Pi + Claude Opus 5.5: 99% on one LoCoMo conversation, single run), Memory-Centric Continual Learning (2610.29357) | arxiv |
 | 2026-11-01 | **Added past.dev** to matrix and notable systems — new hosted memory API claiming #1 on BEAM at all scales (Oct 6, 2026 PRNewswire announcement): BEAM 100K 92.08%, 500K 89.63%, 1M 90.65%, 10M 85.03% (self-published Sep 29, 2026 run; the benchmark page explicitly notes vendor comparisons use separate runs with different models, judges, and configurations — not a controlled harness; prior best at each scale per past.dev's page: 86.2% / 80.1% / 79.1% / 68.0%) | [prnewswire.com (Oct 6, 2026)](https://www.prnewswire.com/news-releases/pastdev-introduces-frontier-memory-for-ai-agents-1-on-beam-the-largest-public-memory-benchmark-302899770.html), [past.dev/benchmarks](https://past.dev/benchmarks) |
 | 2026-11-01 | **Added 2 new October 2026 papers**: Agent Memory as Recommendation (arxiv 2610.34673, Oct 26 2026 — AgentMemRec treats memory selection as budgeted slate recommendation; zero LLM calls; outperforms A-Mem/HippoRAG 2/DynamicRAG/T-Mem by 10–31 pp on LongMemEval; beats Mem0/Zep on LoCoMo); Long-Term Agent Memory through Complementary Curation and Consolidation (arxiv 2610.39790, Oct 29 2026 — hybrid episodic + structured relational memory; LoCoMo 90.2%, LongMemEval-S 85.5%) | [arxiv 2610.34673](https://arxiv.org/abs/2610.34673), [arxiv 2610.39790](https://arxiv.org/abs/2610.39790) |
+| 2026-11-02 | **Added 2 new October 2026 papers**: More Memory, Worse Agents (arxiv 2610.27406, Oct 19 — Anti-Persistence stores task trajectories and rebuilds task-specific guidance on demand; lowest LLM-call cost among evaluated designs, self-reported); Accept Changes, Reject Attacks (arxiv 2610.41056, Oct 29 — security study showing existing memory defenses no more robust than an untuned baseline manager) | [arxiv 2610.27406](https://arxiv.org/abs/2610.27406), [arxiv 2610.41056](https://arxiv.org/abs/2610.41056) |
 
 ---
 
