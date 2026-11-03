@@ -6,7 +6,7 @@
 > positioning material. Benchmark numbers are self-published unless noted
 > otherwise and should be treated as claims until independently reproduced.
 >
-> Last compiled: 2026-11-02.
+> Last compiled: 2026-11-03.
 
 ## Legend
 
@@ -310,6 +310,8 @@
 | 2026-11-01 | **Added past.dev** to matrix and notable systems — new hosted memory API claiming #1 on BEAM at all scales (Oct 6, 2026 PRNewswire announcement): BEAM 100K 92.08%, 500K 89.63%, 1M 90.65%, 10M 85.03% (self-published Sep 29, 2026 run; the benchmark page explicitly notes vendor comparisons use separate runs with different models, judges, and configurations — not a controlled harness; prior best at each scale per past.dev's page: 86.2% / 80.1% / 79.1% / 68.0%) | [prnewswire.com (Oct 6, 2026)](https://www.prnewswire.com/news-releases/pastdev-introduces-frontier-memory-for-ai-agents-1-on-beam-the-largest-public-memory-benchmark-302899770.html), [past.dev/benchmarks](https://past.dev/benchmarks) |
 | 2026-11-01 | **Added 2 new October 2026 papers**: Agent Memory as Recommendation (arxiv 2610.34673, Oct 26 2026 — AgentMemRec treats memory selection as budgeted slate recommendation; zero LLM calls; outperforms A-Mem/HippoRAG 2/DynamicRAG/T-Mem by 10–31 pp on LongMemEval; beats Mem0/Zep on LoCoMo); Long-Term Agent Memory through Complementary Curation and Consolidation (arxiv 2610.39790, Oct 29 2026 — hybrid episodic + structured relational memory; LoCoMo 90.2%, LongMemEval-S 85.5%) | [arxiv 2610.34673](https://arxiv.org/abs/2610.34673), [arxiv 2610.39790](https://arxiv.org/abs/2610.39790) |
 | 2026-11-02 | **Added 2 new October 2026 papers**: More Memory, Worse Agents (arxiv 2610.27406, Oct 19 — Anti-Persistence stores task trajectories and rebuilds task-specific guidance on demand; lowest LLM-call cost among evaluated designs, self-reported); Accept Changes, Reject Attacks (arxiv 2610.41056, Oct 29 — security study showing existing memory defenses no more robust than an untuned baseline manager) | [arxiv 2610.27406](https://arxiv.org/abs/2610.27406), [arxiv 2610.41056](https://arxiv.org/abs/2610.41056) |
+| 2026-11-03 | **Hindsight v1.2.0 released (Nov 3, 2026)**: model-call extension records each LLM call's input and output; operation runs surface wall-time breakdown per operation; OpenClaw cron, heartbeat, and subagent sessions can now opt into memory; Hindsight knowledge-base tools added to OpenClaw agent tools; fixes across consolidation, reflect, Docker, and integrations. Notable systems entry already updated by 2026-11-02 run (release date was visible on GitHub ahead of tag). | [github.com/vectorize-io/hindsight/releases](https://github.com/vectorize-io/hindsight/releases) |
+| 2026-11-03 | No additional significant changes detected beyond Hindsight v1.2.0 above; all other tracked repos, benchmarks, and Oct 2026 papers already captured by prior runs. | Scheduled run |
 
 ---
 
