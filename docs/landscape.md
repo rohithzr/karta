@@ -6,7 +6,7 @@
 > positioning material. Benchmark numbers are self-published unless noted
 > otherwise and should be treated as claims until independently reproduced.
 >
-> Last compiled: 2026-11-03.
+> Last compiled: 2026-11-04.
 
 ## Legend
 
@@ -166,6 +166,9 @@
 | **Long-Term Agent Memory through Complementary Curation and Consolidation** *(arxiv 2610.39790, Oct 2026)* | Hybrid memory architecture pairing episodic memories with structured relational memories; consolidation mechanism keeps the system efficient; the two memory types shown to be consistently complementary — combining them outperforms state-of-the-art single-type frameworks | LoCoMo: 90.2%; LongMemEval-S: 85.5% | [arxiv 2610.39790](https://arxiv.org/abs/2610.39790) |
 | **More Memory, Worse Agents: Error Reproduction and Anti-Persistence in LLM Agents** *(arxiv 2610.27406, Oct 19, 2026)* | Diagnoses systematic failure where accumulated memories reproduce past errors; Anti-Persistence approach stores task trajectories and outcomes and rebuilds task-specific guidance on demand; avoids long raw-memory accumulation | Highest held-out success rate and lowest average LLM-call cost among evaluated memory designs *(self-reported)* | [arxiv 2610.27406](https://arxiv.org/abs/2610.27406) |
 | **Accept Changes, Reject Attacks: Robust Memory Management for LLM Agents** *(arxiv 2610.41056, Oct 29, 2026; cs.CR)* | Security-focused memory management; identifies two orthogonal failure modes: storing outdated facts (stale accepts) and storing adversarially planted instructions (malicious accepts); finds that existing memory managers and defenses are no more robust than an untuned baseline manager on its test sets | — (security taxonomy and evaluation) | [arxiv 2610.41056](https://arxiv.org/abs/2610.41056) |
+| **AtomMem: Atomic Fact-Based Episodic and Profile Memory** *(arxiv 2606.19847, Jun 18, 2026; USTC)* | Decomposes conversation history into atomic facts stored in episodic (event) and profile (persona) memory banks; fine-grained retrieval via atomic granularity reduces over-retrieval noise | 61.4% token reduction vs raw history storage; LoCoMo SOTA claimed (self-reported) | [arxiv 2606.19847](https://arxiv.org/abs/2606.19847), [github.com/MINE-USTC/AtomMem](https://github.com/MINE-USTC/AtomMem) |
+| **MOSAIC: Conflict-Aware Structured Memory** *(arxiv 2607.16211, Jul 2026)* | Structured memory with explicit conflict detection; isolates and resolves contradictory or outdated facts before storage; targets hallucination and stale-fact failure modes | 66% conflict detection rate (4.7× best baseline at 14%); HaluMem-Medium 0.58 s avg latency; LoCoMo tested | [arxiv 2607.16211](https://arxiv.org/abs/2607.16211) |
+| **LeanMem: Simple and Efficient Long-Term Memory** *(arxiv 2608.03463, Aug 2026)* | Lightweight memory approach emphasising simplicity and efficiency over complex multi-stage pipelines; competitive accuracy on small-to-mid-scale LLMs | +15.1 pts on LoCoMo/LongMemEval-S with GPT-4.1-mini and Qwen3-8B (self-reported) | [arxiv 2608.03463](https://arxiv.org/abs/2608.03463) |
 
 ## Notable New / Emerging Systems
 
@@ -312,6 +315,7 @@
 | 2026-11-02 | **Added 2 new October 2026 papers**: More Memory, Worse Agents (arxiv 2610.27406, Oct 19 — Anti-Persistence stores task trajectories and rebuilds task-specific guidance on demand; lowest LLM-call cost among evaluated designs, self-reported); Accept Changes, Reject Attacks (arxiv 2610.41056, Oct 29 — security study showing existing memory defenses no more robust than an untuned baseline manager) | [arxiv 2610.27406](https://arxiv.org/abs/2610.27406), [arxiv 2610.41056](https://arxiv.org/abs/2610.41056) |
 | 2026-11-03 | **Hindsight v1.2.0 released (Nov 3, 2026)**: model-call extension records each LLM call's input and output; operation runs surface wall-time breakdown per operation; OpenClaw cron, heartbeat, and subagent sessions can now opt into memory; Hindsight knowledge-base tools added to OpenClaw agent tools; fixes across consolidation, reflect, Docker, and integrations. Notable systems entry already updated by 2026-11-02 run (release date was visible on GitHub ahead of tag). | [github.com/vectorize-io/hindsight/releases](https://github.com/vectorize-io/hindsight/releases) |
 | 2026-11-03 | No additional significant changes detected beyond Hindsight v1.2.0 above; all other tracked repos, benchmarks, and Oct 2026 papers already captured by prior runs. | Scheduled run |
+| 2026-11-04 | **Added 3 backfilled papers**: AtomMem (arxiv 2606.19847, Jun 2026 — atomic-fact episodic+profile memory, 61.4% token reduction vs raw history, LoCoMo SOTA claimed); MOSAIC (arxiv 2607.16211, Jul 2026 — conflict-aware structured memory, 66% conflict detection vs 14% baseline, 0.58 s HaluMem-Medium latency); LeanMem (arxiv 2608.03463, Aug 2026 — simple+efficient, +15.1 pts on LoCoMo/LongMemEval-S). No new Nov 4 announcements detected beyond prior runs. | [arxiv 2606.19847](https://arxiv.org/abs/2606.19847), [arxiv 2607.16211](https://arxiv.org/abs/2607.16211), [arxiv 2608.03463](https://arxiv.org/abs/2608.03463) |
 
 ---
 
