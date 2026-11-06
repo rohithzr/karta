@@ -6,7 +6,7 @@
 > positioning material. Benchmark numbers are self-published unless noted
 > otherwise and should be treated as claims until independently reproduced.
 >
-> Last compiled: 2026-11-05.
+> Last compiled: 2026-11-06.
 
 ## Legend
 
@@ -171,6 +171,8 @@
 | **LeanMem: Simple and Efficient Long-Term Memory** *(arxiv 2608.03463, Aug 2026)* | Lightweight memory approach emphasising simplicity and efficiency over complex multi-stage pipelines; competitive accuracy on small-to-mid-scale LLMs | +15.1 pts on LoCoMo/LongMemEval-S with GPT-4.1-mini and Qwen3-8B (self-reported) | [arxiv 2608.03463](https://arxiv.org/abs/2608.03463) |
 | **DolphinBench** *(arxiv 2609.24971, Sep 21, 2026; NeurIPS 2026; Mem0)* | Action-graded agent memory benchmark testing memory through task completion rather than QA; 3 knowledge-work personas, 200 tasks each (~600 total); every task verified solvable with memory and unsolvable without; graded on tool selected, target chosen, and content produced; also measures cost and latency alongside accuracy; published by Mem0 (conflict of interest noted) | Mem0 + Hermes + GPT-5.6-Luna: ~47.83% (Mem0 self-published, blog); best reported ~70.67% (secondary source; not confirmed from primary) | [arxiv 2609.24971](https://arxiv.org/abs/2609.24971) |
 | **Route to Remember: Adaptive Memory Selection for LLM Agents** *(arxiv 2611.05636, NeurIPS 2026)* | Adaptive routing between weight-based (parametric) memory and text-based (retrieval-augmented) memory using a teacher-student router; argues production agent memory is a bottleneck and weight memory is an underutilized complement to text retrieval | — | [arxiv 2611.05636](https://arxiv.org/abs/2611.05636) |
+| **Ground Truth First: A Longitudinal Evaluation Instrument for Agent Memory, and the Tenure Crossover in Memory-Architecture Rankings** *(arxiv 2607.21962, Jul 2026; ACL 2026 Findings)* | Critiques standard benchmark construction (conversations first → answer keys extracted later); audits LoCoMo and finds 6.4% label-error rate; builds a ground-truth-first longitudinal instrument with validity intervals, volatility classes, trust distinctions, and injection probes; benchmarks five architectures — rankings invert with history length, budgeted curated-map leads at three weeks, no-memory baseline ties or beats memory systems at short horizons; two-stage curated writer produces ~2× cleaner memories than single-call extraction; released as Veracium, an open-source pip-installable evaluation library | — (evaluation methodology study) | [arxiv 2607.21962](https://arxiv.org/abs/2607.21962) |
+| **MemTools: A Unified Research Framework for Interoperable Agent Memory** *(arxiv 2607.21404, Jul 2026)* | Addresses memory-pipeline fragmentation across systems; decouples memory lifecycle stages from deployment environments via declarative data contracts; coordination layer handles symbolic, neural, and multimodal memory representations; enables cross-system component integration, evaluation reconfiguration, and heterogeneous memory coordination; research tool (work in progress), not a production system | — (framework paper; no benchmark scores) | [arxiv 2607.21404](https://arxiv.org/abs/2607.21404) |
 
 ## Notable New / Emerging Systems
 
@@ -322,6 +324,7 @@
 | 2026-11-05 | **MemOS notable systems row updated**: v2.0.22 → v2.0.34 (Sep 23, 2026); Local Plugin v2.0.21 (Oct 29, 2026). | [github.com/MemTensor/MemOS/releases](https://github.com/MemTensor/MemOS/releases) |
 | 2026-11-05 | **Added PhoenixAI Contextbase** to notable systems: context infrastructure for AI agents covering semantics, knowledge, memory, traces, and evaluations in one system; private preview launched Nov 4, 2026. | [prnewswire.com](https://prnewswire.com/news-releases/phoenixai-launches-contextbase-the-context-infrastructure-for-ai-agents-302929251.html) |
 | 2026-11-05 | **Added 2 new papers**: DolphinBench (arxiv 2609.24971, NeurIPS 2026 — action-graded benchmark testing memory via task completion, ~600 tasks, cost+latency also scored; published by Mem0); Route to Remember (arxiv 2611.05636, NeurIPS 2026 — adaptive router between weight-based and text-based memory via teacher-student setup). | [arxiv 2609.24971](https://arxiv.org/abs/2609.24971), [arxiv 2611.05636](https://arxiv.org/abs/2611.05636) |
+| 2026-11-06 | **Added 2 backfilled papers**: Ground Truth First (arxiv 2607.21962, Jul 2026, ACL 2026 Findings — longitudinal eval instrument; audits LoCoMo and finds 6.4% label-error rate; rankings invert with history length; releases Veracium pip-installable library); MemTools (arxiv 2607.21404, Jul 2026 — unified interoperable memory research framework with declarative data contracts across symbolic/neural/multimodal representations). No new system launches, benchmark results, or tracked-repo releases detected beyond prior runs. | [arxiv 2607.21962](https://arxiv.org/abs/2607.21962), [arxiv 2607.21404](https://arxiv.org/abs/2607.21404) |
 
 ---
 
