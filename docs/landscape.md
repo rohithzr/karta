@@ -6,7 +6,7 @@
 > positioning material. Benchmark numbers are self-published unless noted
 > otherwise and should be treated as claims until independently reproduced.
 >
-> Last compiled: 2026-11-19.
+> Last compiled: 2026-11-20.
 
 ## Legend
 
@@ -200,6 +200,7 @@
 | **MemoWM: How World Models Change What Agents Need to Remember** *(arxiv 2610.10778, Oct 2026)* | Proposes world-model-conditioned memory allocation: retains information whose downstream value exceeds what the shared world model can predict; task-aware allocation balances reconstruction error against per-experience storage cost; stronger world models reduce per-experience storage while preserving task quality | 42.42% average answer accuracy across 5 long-term memory benchmarks (+2.62 pp over strongest baseline); 53.9% reduction in per-experience storage vs MIRIX | [arxiv 2610.10778](https://arxiv.org/abs/2610.10778) |
 | **Memorilla: Latent Semantic Memory for LLMs** *(arxiv 2610.21375, Oct 15, 2026; Stanford SNAP + Toronto/Penn/MIT)* | Trainable 194M-parameter module reads a document collection and outputs 16 query-dependent memory tokens injected into a frozen LLM; model weights unchanged; always outputs exactly 16 tokens regardless of collection size; NarrativeQA: 16 tokens replace 67,385 — 4,212× compression; code/checkpoints under Apache 2.0; memory.stanford.edu | FactKG: 84.33% vs 80.43% full-context (Qwen3-8B frozen); best on 5 of 8 benchmarks vs Mem0 and MemoRAG; PubMedQA: 59.00% vs 67.0% full-context (not a win everywhere) | [arxiv 2610.21375](https://arxiv.org/abs/2610.21375) |
 | **MIRIX-2.0: Multi-Agent Memory System** *(arxiv 2611.12068, Nov 17, 2026)* | Successor to MIRIX (arxiv 2507.07957); provenance hypergraph indexing all 6 memory types; AutoDream consolidates duplicate anchors outside the write path and converts sessions to reusable skills; PostgreSQL-native BM25 + optional Neo4j; multimodal (text, images, voice, screen); no fine-tuning | LoCoMo 91.4% (+14.3 pp over prior baseline); LongMemEval-S 72.6% (+14.3 pp); MetaClaw-Bench procedural 49.2% vs 44.0% MetaClaw skill library | [arxiv 2611.12068](https://arxiv.org/abs/2611.12068) |
+| **LLM Agent Memory: A Survey from a Unified Representation-Management Perspective** *(ACL Anthology 2026.aacl-long.169, Nov 2026)* | Survey of LLM agent memory approaches from a unified representation-management perspective; covers KV caches through external structured stores; proposes unified taxonomy of memory representations and management operations; outlines future research directions for long-context memory design | — (survey, no benchmark scores) | [aclanthology.org/2026.aacl-long.169](https://aclanthology.org/2026.aacl-long.169/) |
 
 ## Notable New / Emerging Systems
 
@@ -380,6 +381,7 @@
 | 2026-11-18 | **Added 3 new papers (Nov 17, 2026)**: Multi-Agent Memory Inconsistency (arxiv 2611.22245 — delegation raises retrieval of conflicting claims 50.2%→68.7% but lowers conflict detection 16.2%→13.2%; worker-to-lead handoff identified as key failure point); EvoDisco (arxiv 2611.22102 — bilevel evolutionary strategy discovery for memory operators; ALFWorld +8.8/+12.9 pts over MemP); RAG in a Trenchcoat (arxiv 2611.22179 — minimal RAG baseline BRIDGE matches prior SOTA on LongMemEval-S and BEAM within bootstrap CI; 5 adversarial probes identify where complex memory is actually needed) | [arxiv 2611.22245](https://arxiv.org/abs/2611.22245), [arxiv 2611.22102](https://arxiv.org/abs/2611.22102), [arxiv 2611.22179](https://arxiv.org/abs/2611.22179) |
 | 2026-11-19 | **Added MIRIX-2.0** (arxiv 2611.12068, Nov 17, 2026) to notable systems and papers table — successor to MIRIX; provenance hypergraph + AutoDream skill consolidation; LoCoMo 91.4%, LongMemEval-S 72.6%, MetaClaw-Bench 49.2% (all self-published) | [arxiv 2611.12068](https://arxiv.org/abs/2611.12068) |
 | 2026-11-19 | **Added 2 new papers** (Oct 2026, not captured by prior runs): MemoWM (arxiv 2610.10778 — world-model-conditioned memory allocation, 42.42% avg across 5 benchmarks, −53.9% per-experience storage vs MIRIX); Memorilla (arxiv 2610.21375 — Stanford SNAP, 16 memory tokens for frozen LLM, 4,212× NarrativeQA compression, FactKG 84.33% vs 80.43% full-context) | [arxiv 2610.10778](https://arxiv.org/abs/2610.10778), [arxiv 2610.21375](https://arxiv.org/abs/2610.21375) |
+| 2026-11-20 | **Added ACL survey on LLM agent memory** (2026.aacl-long.169, Nov 2026): unified representation-management taxonomy; covers KV cache through external stores; not captured by prior runs. | [aclanthology.org/2026.aacl-long.169](https://aclanthology.org/2026.aacl-long.169/) |
 
 ---
 
