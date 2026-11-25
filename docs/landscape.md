@@ -6,7 +6,7 @@
 > positioning material. Benchmark numbers are self-published unless noted
 > otherwise and should be treated as claims until independently reproduced.
 >
-> Last compiled: 2026-11-24.
+> Last compiled: 2026-11-25.
 
 ## Legend
 
@@ -400,6 +400,7 @@
 | 2026-11-23 | **Added 3 new papers**: SoMem (arxiv 2611.11929, Nov 9 — document-organized LLM agent memory, +2.66 pp LoCoMo / +3.10 pp BEAM-100K / +2.00 pp LongMemEval-S over strongest baseline, self-reported; CityU + Tencent Jarvis Lab); Reglos (arxiv 2611.06049 — two-loop self-evolving personal memory, BEAM-500K 65.0% vs MemOS 61.3% self-reported, frozen 27B model); How Much Should an Agent Remember? (arxiv 2611.26361, Nov 19 — optimal memory is model-dependent; altk-evolve library; deployed in IBM CUGA + Watsonx Orchestrate) | [arxiv 2611.11929](https://arxiv.org/abs/2611.11929), [arxiv 2611.06049](https://arxiv.org/abs/2611.06049), [arxiv 2611.26361](https://arxiv.org/abs/2611.26361) |
 | 2026-11-23 | **Hindsight appendix section 6 updated**: added ACL 2026 Demo paper "Hindsight: Structured Agent Memory that Retains, Recalls, and Reflects" (2026.acl-demo.27, pp. 275–285); prior text said "Hindsight does not have an arxiv paper" | [aclanthology.org/2026.acl-demo.27](https://aclanthology.org/2026.acl-demo.27/) |
 | 2026-11-24 | **Added 3 new papers**: Is Complex Agentic Memory Always Needed? Naive RAG Is Stronger Than We Thought (arxiv 2610.30755, NeurIPS 2026 — Raw-RAG beats 12 dedicated systems on 6/7 benchmark-model settings; 30.4× faster ingestion than EverMemOS; NeurIPS 2026); Mem++ (arxiv 2610.02002, Oct 2 — non-destructive verbatim storage + read-time selection; OrgMemBench +8–13 pp over baseline; best LoCoMo LLM-judge); Do Conversational Agents Need Explicit Memory? (arxiv 2610.24671, EMNLP 2026 Findings — raw-history RAG competitive on LongMemEval-S and BEAM-100K; construction information loss identified via oracle tests) | [arxiv 2610.30755](https://arxiv.org/abs/2610.30755), [arxiv 2610.02002](https://arxiv.org/abs/2610.02002), [arxiv 2610.24671](https://arxiv.org/abs/2610.24671) |
+| 2026-11-25 | No significant changes detected in tracked sources. All findings from today's research sweep already captured by prior runs (through 2026-11-24). | Scheduled run |
 
 ---
 
